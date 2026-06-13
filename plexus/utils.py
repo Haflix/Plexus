@@ -1729,7 +1729,13 @@ class Plugin(ABC):
 
     # ── Notifier: subscription management ─────────────────────────────
 
-    @async_log_errors
+    # NOTE (B-064): deliberately NOT decorated with @async_log_errors.
+    # The ValueError raised by _validate_subscription_topic / _normalize_*
+    # for a bad topic or target must propagate to the caller unaltered;
+    # wrapping it in the error-logging decorator would log a caller-side
+    # validation error as a framework ERROR (noise) and re-raise it under
+    # a confusing source location. Keep subscribe / subscribe_sync
+    # decorator-free so validation errors surface cleanly at the call site.
     async def subscribe(
         self,
         topic: str,
