@@ -620,8 +620,35 @@ class TestRemoteSuite(Plugin):
             )
 
         async def body_find_endpoints_by_tag(c):
+            # Unmatched tag -> empty list (never None).
             r = await self._plexus.find_endpoints_by_tag("nonexistent")
             assert isinstance(r, list)
+            assert r == []
+
+            if not self._remote_available:
+                c.skip(UNAVAILABLE_REASON)
+
+            # TestRemoteTarget.r_open on the subnode is tagged "r_probe".
+            # Discover it over the wire and assert the merged entry shape.
+            res = await self._plexus.find_endpoints_by_tag("r_probe")
+            assert isinstance(res, list)
+            entry = next(
+                (e for e in res if e.get("access_name") == "r_open"), None
+            )
+            assert entry is not None, f"r_open not discovered remotely: {res}"
+            assert entry["plugin_name"] == "TestRemoteTarget"
+            assert isinstance(entry["endpoint"], dict)
+            assert "plugin_version" in entry
+            # remote-eligibility recoverable from the endpoint dict
+            assert entry["endpoint"].get("remote") is True
+            # the subnode shows up as a non-local host with a real uuid
+            remote_instances = [
+                i for i in entry["instances"] if i["host"] != "local"
+            ]
+            assert remote_instances, f"no remote instance: {entry['instances']}"
+            assert all(i.get("plugin_uuid") for i in remote_instances)
+            peer_host = self._peer_info["hostname"]
+            assert peer_host in entry["hosts"], (peer_host, entry["hosts"])
 
         # C-128: Session 4 (v0.27.0) ack-protocol coverage variants.
         # Each helper mutates the LOCAL NM's _outbound_adverts state

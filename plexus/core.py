@@ -5762,40 +5762,60 @@ class Plexus:
             raise
 
     @async_log_errors
-    async def find_endpoints_by_tag(self, tag: str) -> Optional[List[Dict[str, Any]]]:
+    async def find_endpoints_by_tag(self, tag: str) -> List[Dict[str, Any]]:
         """
-        Finds all endpoints by a tag.
+        Find all endpoints carrying a tag, across local + remote nodes.
 
-        Args:
-            tag: The tag to search for
+        Returns a list of dicts, one per (plugin_name, access_name,
+        plugin_version) capability. Same version across hosts is merged;
+        different versions are separate entries (so each entry's spec is
+        internally consistent and honest for every host in it). Each entry::
 
-        Returns:
-            List of endpoints
-            For local: (Plugin, endpoint, endpoint_description, endpoint_arguments)
-            For remote: (RemotePlugin, endpoint, endpoint_description, endpoint_arguments)
+            {
+              "access_name": str,
+              "plugin_name": str,
+              "plugin_version": str,
+              "description": Any, "arguments": Any, "tags": Any,
+              "endpoint": dict,          # shallow copy of the endpoint config
+              "hosts": [str, ...],       # "local" and/or node hostnames
+              "instances": [{"host": str, "plugin_uuid": str}, ...],
+            }
+
+        Returns [] when nothing matches. `hosts` reflects where a matching
+        endpoint was OBSERVED, not reachability; remote-eligibility is
+        recoverable from ``entry["endpoint"]["remote"]``. An enabled node
+        that errors is silently omitted (best-effort).
         """
-        endpoints = []
+
+        def _ver(v):
+            return str(v) if v is not None else "unknown"
+
+        # Collect raw matches (one per physical endpoint) then merge.
+        raw = []
         for plugin in self.plugins.values():
             plugin: Plugin
             if plugin.enabled:
-                for endpoint in plugin.endpoints.values():
+                for ep_key, endpoint in plugin.endpoints.items():
                     if tag in (endpoint.get("tags") or []):
-                        endpoints.append(
-                            (
-                                plugin,
-                                endpoint,
-                                endpoint.get("description"),
-                                endpoint.get("arguments"),
-                            )
+                        raw.append(
+                            {
+                                "access_name": ep_key,
+                                "plugin_name": plugin.plugin_name,
+                                "plugin_uuid": plugin.plugin_uuid,
+                                "plugin_version": _ver(
+                                    getattr(plugin, "version", "unknown")
+                                ),
+                                "endpoint": dict(endpoint),
+                                "host": "local",
+                            }
                         )
 
         # Snapshot self.network once. Per Commit 2b cycle 3 HIGH-A:
         # during a hot-reload rebuild, self.network is set to None for
         # the entire rebuild duration; per cycle 2 MED-B: a mid-block
         # swap would otherwise leak calls onto a stopped NM. Both
-        # conditions resolve cleanly here — None falls through to
-        # return the local-only endpoints list (existing no-match path
-        # for "no remote nodes available").
+        # conditions resolve cleanly here — None falls through to the
+        # local-only path.
         nm = self.network
         if (
             self.networking_enabled
@@ -5807,8 +5827,86 @@ class Plexus:
                 if node.enabled:
                     result = await nm.node_get_tagged_endpoints(node.IP, tag)
                     if result:
-                        endpoints.extend(result)
-        return endpoints
+                        for entry in result:
+                            access_name = entry.get("access_name")
+                            plugin_name = entry.get("plugin_name")
+                            plugin_uuid = entry.get("plugin_uuid")
+                            ep = entry.get("endpoint")
+                            # An old node predating the access_name wire field,
+                            # or any malformed entry missing a required field,
+                            # cannot be keyed safely -> skip+warn rather than
+                            # guess (a wrong name would misroute) or KeyError
+                            # (which would abort the whole call, losing every
+                            # result collected so far).
+                            if not access_name or not plugin_name or (
+                                not plugin_uuid
+                            ) or ep is None:
+                                self._logger.warning(
+                                    "[TAG_SEARCH] remote endpoint from %s "
+                                    "missing a required field (old/malformed "
+                                    "node?); skipping",
+                                    entry.get("host") or node.IP,
+                                )
+                                continue
+                            raw.append(
+                                {
+                                    "access_name": access_name,
+                                    "plugin_name": plugin_name,
+                                    "plugin_uuid": plugin_uuid,
+                                    "plugin_version": _ver(
+                                        entry.get("plugin_version", "unknown")
+                                    ),
+                                    "endpoint": dict(ep),
+                                    "host": entry.get("host") or node.IP,
+                                }
+                            )
+
+        # Merge by (plugin_name, access_name, plugin_version). Local-preferred
+        # canonical spec; instances deduped by plugin_uuid; any host equal to
+        # self.hostname normalized to "local" (core treats them as aliases).
+        merged = {}
+        for r in raw:
+            host = "local" if r["host"] == self.hostname else r["host"]
+            key = (r["plugin_name"], r["access_name"], r["plugin_version"])
+            entry = merged.get(key)
+            if entry is None:
+                entry = merged[key] = {
+                    "access_name": r["access_name"],
+                    "plugin_name": r["plugin_name"],
+                    "plugin_version": r["plugin_version"],
+                    "description": r["endpoint"].get("description"),
+                    "arguments": r["endpoint"].get("arguments"),
+                    "tags": r["endpoint"].get("tags"),
+                    "endpoint": r["endpoint"],
+                    "_instances": {},
+                }
+            if host == "local":
+                entry["description"] = r["endpoint"].get("description")
+                entry["arguments"] = r["endpoint"].get("arguments")
+                entry["tags"] = r["endpoint"].get("tags")
+                entry["endpoint"] = r["endpoint"]
+            entry["_instances"][r["plugin_uuid"]] = host
+
+        out = []
+        for entry in merged.values():
+            instances = [
+                {"host": h, "plugin_uuid": u}
+                for u, h in entry.pop("_instances").items()
+            ]
+            instances.sort(
+                key=lambda i: (i["host"] != "local", i["host"], i["plugin_uuid"])
+            )
+            entry["instances"] = instances
+            hosts = []
+            for i in instances:
+                if i["host"] not in hosts:
+                    hosts.append(i["host"])
+            entry["hosts"] = hosts
+            out.append(entry)
+        out.sort(
+            key=lambda e: (e["plugin_name"], e["access_name"], e["plugin_version"])
+        )
+        return out
 
     @async_log_errors
     async def find_endpoint(

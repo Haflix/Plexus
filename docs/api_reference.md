@@ -442,7 +442,7 @@ The methods below are on `Plexus` itself. Plugin authors use the `Plugin` wrappe
 | `await plx.get_plugin_endpoints(plugin_name) -> Optional[List[dict]]` | Per-endpoint metadata. |
 | `await plx.list_plugins_state() -> List[dict]` | name/enabled/description for every plugin. |
 | `await plx.find_endpoint(access_name, hosts, blocked_hosts, plugin_uuid, requester_id, target_plugin)` | Endpoint lookup with access control. Returns `(plugin, endpoint, node)` or `(None, None, None)`. |
-| `await plx.find_endpoints_by_tag(tag) -> Optional[List]` | Tag-based discovery (local + remote). |
+| `await plx.find_endpoints_by_tag(tag) -> List[dict]` | Tag-based discovery (local + remote). One dict per `(plugin_name, access_name, plugin_version)`: `access_name`, `plugin_name`, `plugin_version`, `description`, `arguments`, `tags`, `endpoint`, `hosts` (list), `instances` (`[{host, plugin_uuid}]`). Same version across hosts merges; `[]` when none. |
 
 ### Events and subscriptions (low-level)
 

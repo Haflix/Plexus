@@ -2300,16 +2300,20 @@ class NetworkManager:
                     continue
                 if not getattr(plugin, "remote", False):
                     continue
-                for endpoint in plugin.endpoints.values():
+                for ep_key, endpoint in plugin.endpoints.items():
                     if not endpoint.get("remote", False):
                         continue
-                    if tag in endpoint.get("tags", []):
+                    # None-safe (a null `tags:` -> None, and `tag in None`
+                    # would raise). Mirrors the local path in core.py.
+                    if tag in (endpoint.get("tags") or []):
+                        _v = getattr(plugin, "version", "unknown")
                         endpoints.append(
                             {
+                                "access_name": ep_key,
                                 "plugin_name": plugin.plugin_name,
                                 "plugin_uuid": plugin.plugin_uuid,
-                                "plugin_version": getattr(
-                                    plugin, "version", "unknown"
+                                "plugin_version": (
+                                    str(_v) if _v is not None else "unknown"
                                 ),
                                 "plugin_description": getattr(
                                     plugin, "description", ""
@@ -6722,9 +6726,9 @@ class NetworkManager:
             tag: The tag to search for.
 
         Returns:
-            List of tuples (RemotePlugin, endpoint_dict, description, arguments)
-            matching the format used by Plexus.find_endpoints_by_tag,
-            or None on error.
+            List of dicts {access_name, plugin_name, plugin_uuid,
+            plugin_version, endpoint, host} matching the per-host entry shape
+            Plexus.find_endpoints_by_tag merges, or None on error.
         """
         reader = None
         writer = None
@@ -6743,19 +6747,17 @@ class NetworkManager:
                 remote_endpoints = []
                 hostname = data.get("hostname", IP)
                 for entry in data.get("endpoints", []):
-                    rp = RemotePlugin(
-                        name=entry["plugin_name"],
-                        version=entry.get("plugin_version", "unknown"),
-                        uuid=entry["plugin_uuid"],
-                        enabled=True,
-                        remote=True,
-                        description=entry.get("plugin_description", ""),
-                        arguments=[],
-                        hostname=hostname,
-                    )
-                    ep = entry["endpoint"]
                     remote_endpoints.append(
-                        (rp, ep, ep.get("description"), ep.get("arguments"))
+                        {
+                            "access_name": entry.get("access_name"),
+                            "plugin_name": entry["plugin_name"],
+                            "plugin_uuid": entry["plugin_uuid"],
+                            "plugin_version": entry.get(
+                                "plugin_version", "unknown"
+                            ),
+                            "endpoint": entry["endpoint"],
+                            "host": hostname,
+                        }
                     )
 
                 self._logger.info(

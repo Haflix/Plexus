@@ -1,5 +1,5 @@
 description: Phase 5 fixture — remote=True endpoints + topic handlers used by TestRemoteSuite cases
-version: 0.3.1
+version: 0.3.2
 remote: True
 arguments:
 subscriptions:
@@ -15,6 +15,7 @@ endpoints:
   r_open:
     internal_name: r_open
     tags:
+      - r_probe
     remote: True
     accessible_by_other_plugins: True
     description: Plain remote-callable endpoint
