@@ -1503,8 +1503,8 @@ class Plugin(ABC):
         blocked_hosts: Union[
             str, list, None
         ] = None,  # blocked hosts (str keyword, list, or None)
-        author: str = "system",
-        author_id: str = "system",
+        author: str = None,
+        author_id: str = None,
         timeout: Optional[float] = None,
     ) -> Any:
         """
@@ -1555,8 +1555,8 @@ class Plugin(ABC):
         blocked_hosts: Union[
             str, list, None
         ] = None,  # blocked hosts (str keyword, list, or None)
-        author: str = "system",
-        author_id: str = "system",
+        author: str = None,
+        author_id: str = None,
         timeout: Optional[float] = None,
     ) -> Any:
         """
@@ -1612,8 +1612,8 @@ class Plugin(ABC):
         blocked_hosts: Union[
             str, list, None
         ] = None,  # blocked hosts (str keyword, list, or None)
-        author: str = "system",
-        author_id: str = "system",
+        author: str = None,
+        author_id: str = None,
         timeout: Optional[float] = None,
     ) -> Any:
         """
@@ -1659,8 +1659,8 @@ class Plugin(ABC):
         blocked_hosts: Union[
             str, list, None
         ] = None,  # blocked hosts (str keyword, list, or None)
-        author: str = "system",
-        author_id: str = "system",
+        author: str = None,
+        author_id: str = None,
         timeout: Optional[float] = None,
     ) -> Any:
         """
