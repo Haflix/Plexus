@@ -1,5 +1,5 @@
 description: PR3 event API suite — comprehensive PLAN J coverage (Stage E)
-version: "0.2.2"
+version: "0.2.3"
 remote: false
 verbose_notifier: true
 prefix: "PSuite"
@@ -225,11 +225,13 @@ subscriptions:
     hosts: "local"
 
   # ── access control ──────────────────────────────────────────────────
-  access_priv_remote_sub:
-    topic: "test_event/private/topic"
-    target_plugin: TestEventTarget
-    target_access_name: priv_endpoint
-    hosts: "local"
+  # NOTE: the cross-plugin sub to TestEventTarget.priv_endpoint (a private
+  # endpoint) is deliberately NOT declared here. W5-Q5 now rejects a
+  # declarative YAML sub targeting a non-accessible endpoint at enable
+  # time (ConfigException), which would abort the whole suite's enable.
+  # body_cross_plugin_denied creates that sub at RUNTIME instead (runtime
+  # subscribe_event is not W5-Q5-checked; the cross-plugin call is still
+  # denied at dispatch by C18, which is what the case verifies).
   access_priv_self_sub:
     topic: "test_event/access/self_priv/topic"
     target_access_name: handle_self_priv

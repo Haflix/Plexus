@@ -948,27 +948,41 @@ class TestEventSuite(Plugin):
 
     async def _basic_access(self, rec: CaseRecorder, kw: Dict) -> None:
         async def body_cross_plugin_denied(c):
-            # access_priv_remote_event (topic test_event/private/topic)
-            # has TWO matching subs:
-            #   - TestEventTarget's own private_endpoint_sub
-            #     (target=self, accessible_by_other_plugins=False) → ALLOWED
-            #     (self-targeted bypass — locked decision area).
-            #   - TestEventSuite's access_priv_remote_sub
-            #     (target_plugin=TestEventTarget, target_access_name=
-            #     priv_endpoint, sub OWNER=TestEventSuite) → DENIED by C18.
-            # publish_event count returns 2 (both survivors at topic match)
+            # access_priv_remote_event (topic test_event/private/topic).
+            # TestEventTarget's own private_endpoint_sub (target=self,
+            # accessible_by_other_plugins=False) is ALLOWED (self-targeted
+            # bypass — locked decision area). We add a RUNTIME cross-plugin
+            # sub OWNED by the suite targeting TestEventTarget.priv_endpoint.
+            #
+            # A cross-plugin YAML sub to a private endpoint is now a
+            # load-time W5-Q5 ConfigException (it would abort the suite's
+            # enable), so it can no longer be declared in plugin_config.yml.
+            # A runtime subscribe_event registers fine (W5-Q5 is YAML-only)
+            # but C18 still DENIES the cross-plugin call at dispatch — which
+            # is exactly what this case verifies. With both subs present,
+            # publish_event count returns 2 (both survive the topic match)
             # but only the self-targeted one actually fires the handler.
             await self._reset_target_state()
-            count = await self.publish_event(
-                "access_priv_remote_event", payload={"x": 1},
+            cross_sub_id = await self._plexus.subscribe_event(
+                "test_event/private/topic",
+                self.plugin_name,
+                self.plugin_uuid,
+                target_plugin="TestEventTarget",
+                target_access_name="priv_endpoint",
             )
-            await self._settle(0.1)
-            state = await self.execute(TARGET, "get_state")
-            # The self-targeted (private endpoint own-plugin) call must
-            # have fired exactly once. The cross-plugin call must NOT
-            # have fired: priv_call_count remains 1.
-            c.expect(count, 2)
-            c.expect(state["priv_call_count"], 1)
+            try:
+                count = await self.publish_event(
+                    "access_priv_remote_event", payload={"x": 1},
+                )
+                await self._settle(0.1)
+                state = await self.execute(TARGET, "get_state")
+                # The self-targeted (private endpoint own-plugin) call must
+                # have fired exactly once. The cross-plugin call must NOT
+                # have fired: priv_call_count remains 1.
+                c.expect(count, 2)
+                c.expect(state["priv_call_count"], 1)
+            finally:
+                await self._plexus.unsubscribe_event(cross_sub_id)
 
         async def body_self_target_passes(c):
             # access_priv_self_event publishes to topic
