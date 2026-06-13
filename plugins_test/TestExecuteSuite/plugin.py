@@ -494,8 +494,11 @@ class TestExecuteSuite(Plugin):
             c.expect(r, "ok")
 
         async def body_block_any_blocks_everything(c):
-            # blocked_hosts="any" blocks both local and remote.
-            c.expect_exception(RequestException, match=r"not found")
+            # blocked_hosts="any" is rejected at normalization: blocking
+            # "any" would exclude every peer including local, which is a
+            # config error rather than a useful filter. Raises ValueError
+            # before dispatch (not a "not found" RequestException).
+            c.expect_exception(ValueError, match=r"not a valid blocked-host")
             await self.execute(
                 TARGET, "ea_no_args",
                 hosts="any", blocked_hosts="any",
