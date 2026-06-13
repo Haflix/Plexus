@@ -46,7 +46,7 @@ class SyncDispatcher:
 
     def __init__(
         self,
-        workers: int = 4,
+        workers: int = 12,
         logger: Optional[logging.Logger] = None,
     ) -> None:
         self._workers = max(1, int(workers))
