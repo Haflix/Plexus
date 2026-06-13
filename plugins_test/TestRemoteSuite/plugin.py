@@ -925,9 +925,12 @@ class TestRemoteSuite(Plugin):
             # a future deletion of the gate is caught here.
             import ast
             import inspect
+            import textwrap
             from plexus.networking import NetworkManager
             src = inspect.getsource(NetworkManager._handle_sub_advertise)
-            tree = ast.parse(src)
+            # getsource of a method preserves its class-level indentation;
+            # ast.parse rejects leading indent, so dedent before parsing.
+            tree = ast.parse(textwrap.dedent(src))
             mentions = sum(
                 1 for n in ast.walk(tree)
                 if isinstance(n, ast.Name)
