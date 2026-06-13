@@ -274,6 +274,13 @@ class NetworkManager:
         # the same IP but different ports (e.g. parent + subnode on the same
         # machine) get separate pools. _pool_key(IP) resolves the port.
         self.connection_pools: dict[tuple[str, int], asyncio.Queue] = {}
+        # R4-VV-3 (revised): per-(ip,port) connection generation. Bumped by
+        # _drop_peer_advert_state on a transient peer drop so an in-flight
+        # writer created before the drop is refused re-pooling by
+        # _return_connection — WITHOUT evicting the static config peer from
+        # peers_by_endpoint (which would permanently unpin it).
+        # _create_connection stamps the current generation on each writer.
+        self._pool_generation: dict[tuple[str, int], int] = {}
 
         # Server state
         self.server = None
@@ -4738,6 +4745,21 @@ class NetworkManager:
             for (cfg_ip, cfg_port), peer_cfg in self.peers_by_endpoint.items()
             if getattr(peer_cfg, "hostname", None) == peer_hostname
         ]
+        # R4-VV-3 (revised): bump the per-key connection generation BEFORE
+        # draining the pool. The bump is synchronous (no await), so any
+        # _return_connection / _get_connection that interleaves with the
+        # drain below already observes the new generation and refuses the
+        # pre-drop writers — closing the drain-then-bump race where a stale
+        # writer could be re-pooled during the drain's wait_closed() await.
+        # peers_by_endpoint is the STATIC, config-derived pin table and is
+        # deliberately NOT evicted here (only revoke_peer may): a configured
+        # peer that merely flaps must stay pinned, or every future outbound
+        # connection to it fails the pin check ("not in peers config") and
+        # the peer becomes permanently unreachable.
+        for pool_key in pool_keys:
+            self._pool_generation[pool_key] = (
+                self._pool_generation.get(pool_key, 0) + 1
+            )
         for pool_key in pool_keys:
             pool = self.connection_pools.pop(pool_key, None)
             if pool is None:
@@ -4760,14 +4782,6 @@ class NetworkManager:
                         "_drop_peer_advert_state pool close error for %s: %s — continuing drain",
                         pool_key, e,
                     )
-        # R4-VV-3: also evict the matching peers_by_endpoint entries.
-        # Without this, a concurrent _return_connection sees
-        # peers_by_endpoint still holds the key (bypassing the early-close
-        # guard at "if key not in self.peers_by_endpoint"), then finds
-        # connection_pools key absent and recreates the queue — pooling
-        # the stale writer and resurrecting the dropped peer's slot.
-        for pool_key in pool_keys:
-            self.peers_by_endpoint.pop(pool_key, None)
         async with self._adverts_struct_lock:
             self._inbound_adverts.pop(peer_hostname, None)
             self._inbound_global_order = {
@@ -5174,6 +5188,10 @@ class NetworkManager:
         # dict.get without dict-literal allocation per call.
         writer._aio_peer_hostname = peer_cfg.hostname
         reader._aio_peer_hostname = peer_cfg.hostname
+        # R4-VV-3 (revised): stamp the current pool generation so a drop that
+        # happens while this writer is checked out invalidates it on return
+        # (see _return_connection / _drop_peer_advert_state).
+        writer._aio_pool_generation = self._pool_generation.get((IP, port), 0)
         self.peer_stats.setdefault(peer_cfg.hostname, {
             "bytes_sent": 0, "bytes_recv": 0,
             "msgs_sent": 0, "msgs_recv": 0,
@@ -5207,6 +5225,9 @@ class NetworkManager:
             return 0
         self.peers_by_endpoint.pop((spec.ip, spec.port), None)
         self.peers_by_fingerprint.pop(spec.fingerprint, None)
+        # R4-VV-3 (revised): reclaim the per-key connection generation for the
+        # permanently-removed peer (transient drops only ever increment it).
+        self._pool_generation.pop((spec.ip, spec.port), None)
         self.peers = [p for p in self.peers if p.fingerprint != fingerprint]
         # C-045: drop advert state for the revoked peer. This also
         # cancels any pending _inflight_publishes for the hostname
@@ -5320,41 +5341,61 @@ class NetworkManager:
                 self._logger.debug(
                     f"[CONNECTION] Retrieved connection from pool for {IP}, performing health check"
                 )
-                # Health check - try a ping
-                try:
-                    await self._send_message(writer, MSG_PING, {})
-                    msg_type, _ = await asyncio.wait_for(
-                        self._receive_message(reader), timeout=2.0
-                    )
-                    if msg_type == MSG_RESULT:
-                        self._logger.debug(
-                            f"[CONNECTION] Pooled connection to {IP} is healthy"
-                        )
-                        # C-043: track checked-out writer for stop()
-                        # drain coverage. getattr defensive against
-                        # test scaffolds that bypass __init__.
-                        co = getattr(self, "_checked_out_writers", None)
-                        if co is not None:
-                            co.add(writer)
-                        return reader, writer
-                    else:
-                        # Connection is bad, close it
-                        self._logger.warning(
-                            f"[CONNECTION] Pooled connection to {IP} failed health check "
-                            f"(msg_type={msg_type}), closing"
-                        )
-                        writer.close()
-                        await writer.wait_closed()
-                except Exception as e:
-                    # Connection is bad, close it and create new
-                    self._logger.warning(
-                        f"[CONNECTION] Pooled connection to {IP} failed health check: {e}, closing"
+                # R4-VV-3 (revised): reject a writer pooled before the most
+                # recent _drop_peer_advert_state for this key. Its stamped
+                # generation is stale (socket may be to a now-flapped peer);
+                # close it and fall through to create a fresh connection
+                # rather than handing it out. Validated here (pull side) AND
+                # in _return_connection (return side).
+                if getattr(writer, "_aio_pool_generation", 0) != (
+                    self._pool_generation.get(key, 0)
+                ):
+                    self._logger.debug(
+                        f"[CONNECTION] Pooled connection to {IP} is stale "
+                        f"(peer drop bumped generation); discarding"
                     )
                     try:
                         writer.close()
                         await writer.wait_closed()
                     except Exception:
                         pass
+                    # fall through to "Create new connection" below
+                else:
+                    # Health check - try a ping
+                    try:
+                        await self._send_message(writer, MSG_PING, {})
+                        msg_type, _ = await asyncio.wait_for(
+                            self._receive_message(reader), timeout=2.0
+                        )
+                        if msg_type == MSG_RESULT:
+                            self._logger.debug(
+                                f"[CONNECTION] Pooled connection to {IP} is healthy"
+                            )
+                            # C-043: track checked-out writer for stop()
+                            # drain coverage. getattr defensive against
+                            # test scaffolds that bypass __init__.
+                            co = getattr(self, "_checked_out_writers", None)
+                            if co is not None:
+                                co.add(writer)
+                            return reader, writer
+                        else:
+                            # Connection is bad, close it
+                            self._logger.warning(
+                                f"[CONNECTION] Pooled connection to {IP} failed health check "
+                                f"(msg_type={msg_type}), closing"
+                            )
+                            writer.close()
+                            await writer.wait_closed()
+                    except Exception as e:
+                        # Connection is bad, close it and create new
+                        self._logger.warning(
+                            f"[CONNECTION] Pooled connection to {IP} failed health check: {e}, closing"
+                        )
+                        try:
+                            writer.close()
+                            await writer.wait_closed()
+                        except Exception:
+                            pass
             except asyncio.TimeoutError:
                 self._logger.debug(
                     f"[CONNECTION] Timeout getting connection from pool for {IP}"
@@ -5402,6 +5443,25 @@ class NetworkManager:
         # revoked peer's slot for the next caller. Close instead.
         if key not in self.peers_by_endpoint:
             # C-043: also discard from checked-out tracking before close.
+            co = getattr(self, "_checked_out_writers", None)
+            if co is not None:
+                co.discard(writer)
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+            return
+
+        # R4-VV-3 (revised): refuse to re-pool a writer that predates the most
+        # recent _drop_peer_advert_state for this key. The drop bumped the
+        # generation; this writer still carries the old one, so its socket may
+        # be to a now-flapped/closed peer. Close it instead of resurrecting it
+        # into the pool. (Replaces the old peers_by_endpoint eviction, which
+        # permanently unpinned static config peers.)
+        if getattr(writer, "_aio_pool_generation", 0) != self._pool_generation.get(
+            key, 0
+        ):
             co = getattr(self, "_checked_out_writers", None)
             if co is not None:
                 co.discard(writer)
