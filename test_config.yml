@@ -176,7 +176,14 @@ plugins:
 
 
 general:
-    hostname: ""                      # Empty = use system hostname
+    hostname: "aio-test-parent"       # Must match the mTLS cert CN + the
+                                      # networking.hostname below + the name
+                                      # subnode peers pin us as: the C-106
+                                      # anti-spoof drops cross-node messages
+                                      # whose wire author_host (= this
+                                      # general.hostname) != the pinned peer
+                                      # hostname. Empty (system hostname)
+                                      # broke the remote suite.
     plugin_package: plugins_test
     console_log_level: "INFO"         # Quiet for cleaner test output
     file_log_level: "DEBUG"
