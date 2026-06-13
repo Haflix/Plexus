@@ -281,6 +281,11 @@ class NetworkManager:
         # peers_by_endpoint (which would permanently unpin it).
         # _create_connection stamps the current generation on each writer.
         self._pool_generation: dict[tuple[str, int], int] = {}
+        # C-106 follow-up: pinned peers whose wire author_host != their pinned
+        # hostname, already reported once by _warn_hostname_drift (so the loud
+        # ERROR + observable event fire once per peer, not once per dropped
+        # frame). Bounded by the number of distinct pinned peers.
+        self._hostname_drift_warned: set = set()
 
         # Server state
         self.server = None
@@ -527,6 +532,47 @@ class NetworkManager:
             if ip == IP and port is not None:
                 return port
         return self.port
+
+    def _warn_hostname_drift(
+        self, pinned: str, author_host: str, context: str
+    ) -> None:
+        """C-106 follow-up: a cert-pinned peer sent a wire ``author_host``
+        that does not match the hostname we pinned it under, so the anti-spoof
+        gate is dropping its message — and will drop ALL of its traffic. In a
+        real deployment this is almost always a silent config drift: the
+        peer's ``general.hostname`` differs from the hostname in this node's
+        ``peers`` entry (and its mTLS cert CN). Left as a per-message WARNING
+        it is easy to miss, so surface it LOUDLY once per pinned peer: an
+        ERROR log plus an observable ``_core/peer/hostname_mismatch`` event a
+        monitor or plugin can react to. Subsequent drops for the same peer
+        log at DEBUG to avoid flooding.
+        """
+        if pinned in self._hostname_drift_warned:
+            self._logger.debug(
+                "[ANTI-SPOOF] %s: dropping message from pinned peer %r "
+                "(wire author_host %r); hostname drift already reported",
+                context, pinned, author_host,
+            )
+            return
+        self._hostname_drift_warned.add(pinned)
+        self._logger.error(
+            "[ANTI-SPOOF] pinned peer %r is sending messages authored as %r "
+            "(%s); ALL of its traffic is being dropped. If %r is a legitimate "
+            "peer, align its general.hostname with the hostname in this node's "
+            "peers config (and its mTLS cert CN); otherwise revoke it. Logged "
+            "once per peer; further drops are at DEBUG.",
+            pinned, author_host, context, pinned,
+        )
+        try:
+            self.plexus._internal_emit(
+                "_core/peer/hostname_mismatch",
+                pinned_hostname=pinned,
+                wire_author_host=author_host,
+                context=context,
+                ts=time.time(),
+            )
+        except Exception:
+            pass
 
     # ── B-066 / B-018b — split helper ──────────────────────────────
 
@@ -1864,11 +1910,7 @@ class NetworkManager:
             if author_host:
                 pinned = conn_context.get("peer_hostname")
                 if pinned and pinned != author_host:
-                    self._logger.warning(
-                        "[EXECUTE] anti-spoof: pinned peer %r vs "
-                        "wire-claimed author_host %r — drop",
-                        pinned, author_host,
-                    )
+                    self._warn_hostname_drift(pinned, author_host, "EXECUTE")
                     return
                 conn_context.setdefault("peer_hostname", author_host)
 
@@ -2025,10 +2067,8 @@ class NetworkManager:
             if author_host:
                 pinned = conn_context.get("peer_hostname")
                 if pinned and pinned != author_host:
-                    self._logger.warning(
-                        "[EXECUTE_STREAM] anti-spoof: pinned peer %r vs "
-                        "wire-claimed author_host %r — drop",
-                        pinned, author_host,
+                    self._warn_hostname_drift(
+                        pinned, author_host, "EXECUTE_STREAM"
                     )
                     return
                 conn_context.setdefault("peer_hostname", author_host)
@@ -2632,10 +2672,8 @@ class NetworkManager:
             if author_host:
                 pinned = conn_context.get("peer_hostname")
                 if pinned and pinned != author_host:
-                    self._logger.warning(
-                        "[PUBLISH_EVENT] anti-spoof: pinned peer %r vs "
-                        "wire-claimed author_host %r — drop",
-                        pinned, author_host,
+                    self._warn_hostname_drift(
+                        pinned, author_host, "PUBLISH_EVENT"
                     )
                     return
                 conn_context.setdefault("peer_hostname", author_host)
@@ -2739,10 +2777,8 @@ class NetworkManager:
                 # C-106: pin-vs-wire identity check.
                 pinned = conn_context.get("peer_hostname")
                 if pinned and pinned != author_host:
-                    self._logger.warning(
-                        "[REQUEST_EVENT] anti-spoof: pinned peer %r vs "
-                        "wire-claimed author_host %r — drop",
-                        pinned, author_host,
+                    self._warn_hostname_drift(
+                        pinned, author_host, "REQUEST_EVENT"
                     )
                     await self._send_error_pickled(
                         writer,
@@ -2911,10 +2947,8 @@ class NetworkManager:
                 # C-106: pin-vs-wire identity check.
                 pinned = conn_context.get("peer_hostname")
                 if pinned and pinned != author_host:
-                    self._logger.warning(
-                        "[REQUEST_EVENT_STREAM] anti-spoof: pinned peer %r "
-                        "vs wire-claimed author_host %r — drop",
-                        pinned, author_host,
+                    self._warn_hostname_drift(
+                        pinned, author_host, "REQUEST_EVENT_STREAM"
                     )
                     await self._send_error_pickled(
                         writer,
@@ -3268,11 +3302,7 @@ class NetworkManager:
             # call sites that read peer_hostname from conn_context.
             pinned = conn_context.get("peer_hostname")
             if pinned and pinned != author_host:
-                self._logger.warning(
-                    "[SUB_ADVERTISE] anti-spoof: pinned peer %r vs wire-"
-                    "claimed author_host %r — drop",
-                    pinned, author_host,
-                )
+                self._warn_hostname_drift(pinned, author_host, "SUB_ADVERTISE")
                 return
             conn_context.setdefault("peer_hostname", author_host)
 
@@ -3440,11 +3470,7 @@ class NetworkManager:
             # for the rationale — same anti-spoof guard applies here.
             pinned = conn_context.get("peer_hostname")
             if pinned and pinned != author_host:
-                self._logger.warning(
-                    "[SUB_DELTA] anti-spoof: pinned peer %r vs wire-"
-                    "claimed author_host %r — drop",
-                    pinned, author_host,
-                )
+                self._warn_hostname_drift(pinned, author_host, "SUB_DELTA")
                 return
             conn_context.setdefault("peer_hostname", author_host)
 
