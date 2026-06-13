@@ -8176,7 +8176,7 @@ class Plexus:
             # Step 4: local fan-out — find all local subs matching resolved
             # topic. find_all returns insertion order (LOCKED C).
             all_subs = await self.topic_registry.find_all(resolved_topic)
-            local_subs = [s for s in all_subs if s.plugin_uuid in self.plugins_by_uuid]
+            local_subs = [s for s in all_subs if self._sub_owner_active(s)]
 
             survivors = [
                 s
@@ -8346,6 +8346,23 @@ class Plexus:
             ts=now_ts,
         )
         return local_count + remote_count
+
+    def _sub_owner_active(self, sub) -> bool:
+        """B-037: a subscription only delivers while its OWNER plugin is
+        still active. The owner flips ENABLED -> DISABLING synchronously at
+        the start of disable/pop (before on_disable yields control to the
+        event loop), so gating local fan-out on the owner's state closes
+        the publish/request-during-pop race BY CONSTRUCTION. A presence-only
+        check (``sub.plugin_uuid in self.plugins_by_uuid``) does NOT: the
+        dict pop happens late, after the on_disable await, so a concurrent
+        publish can snapshot a sub whose owner is already tearing down.
+
+        ``enabled`` is True for ENABLING as well as ENABLED, so a plugin's
+        own on_enable self-publish still delivers; only DISABLING / INACTIVE
+        / popped owners are filtered out.
+        """
+        owner = self.plugins_by_uuid.get(sub.plugin_uuid)
+        return owner is not None and owner.enabled
 
     async def _fanout_sub(
         self,
@@ -8599,7 +8616,7 @@ class Plexus:
                 (
                     s
                     for s in all_subs
-                    if s.plugin_uuid in self.plugins_by_uuid
+                    if self._sub_owner_active(s)
                     and self._sub_accepts_local(s)
                     and self._sub_accepts_author(s, publisher.plugin_name)
                 ),
@@ -8905,7 +8922,7 @@ class Plexus:
                 (
                     s
                     for s in all_subs
-                    if s.plugin_uuid in self.plugins_by_uuid
+                    if self._sub_owner_active(s)
                     and self._sub_accepts_local(s)
                     and self._sub_accepts_author(s, publisher.plugin_name)
                 ),
