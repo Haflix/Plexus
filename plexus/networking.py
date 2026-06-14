@@ -3132,7 +3132,7 @@ class NetworkManager:
                                 break
                             if first:
                                 first = False
-                                wrapped = _Event(
+                                obj = _Event(
                                     topic=topic,
                                     payload=chunk,
                                     author=author,
@@ -3141,17 +3141,19 @@ class NetworkManager:
                                     subscription_id=sub_id_for_event,
                                     timestamp=ts,
                                 )
-                                await self._send_message(
-                                    writer, MSG_STREAM_CHUNK, wrapped
-                                )
                             else:
-                                await self._send_message(
-                                    writer, MSG_STREAM_CHUNK, chunk
-                                )
-                            # W2-F4: mark chunk emission AFTER the
-                            # send completes so the outer except
-                            # clauses know a chunk landed on the wire.
+                                obj = chunk
+                            # B-024: send via _send_stream_chunk so a single
+                            # item larger than MAX_MESSAGE_SIZE is split across
+                            # frames (parity with execute_stream) instead of
+                            # aborting the whole stream. Mark chunks_sent BEFORE
+                            # the send (not after): _send_stream_chunk may emit
+                            # several frames, so a drain-timeout mid-item must
+                            # route the outer asyncio.TimeoutError branch to
+                            # close (a partial frame may be on the wire) rather
+                            # than emit a framing-illegal MSG_ERROR.
                             chunks_sent[0] = True
+                            await self._send_stream_chunk(writer, obj)
                             await self._send_message(
                                 writer, MSG_STREAM_ITEM_END, None
                             )
@@ -3184,7 +3186,7 @@ class NetworkManager:
                                 break
                             if first:
                                 first = False
-                                wrapped = _Event(
+                                obj = _Event(
                                     topic=topic,
                                     payload=chunk,
                                     author=author,
@@ -3193,17 +3195,19 @@ class NetworkManager:
                                     subscription_id=sub_id_for_event,
                                     timestamp=ts,
                                 )
-                                await self._send_message(
-                                    writer, MSG_STREAM_CHUNK, wrapped
-                                )
                             else:
-                                await self._send_message(
-                                    writer, MSG_STREAM_CHUNK, chunk
-                                )
-                            # W2-F4: mark chunk emission AFTER the
-                            # send completes so the outer except
-                            # clauses know a chunk landed on the wire.
+                                obj = chunk
+                            # B-024: send via _send_stream_chunk so a single
+                            # item larger than MAX_MESSAGE_SIZE is split across
+                            # frames (parity with execute_stream) instead of
+                            # aborting the whole stream. Mark chunks_sent BEFORE
+                            # the send (not after): _send_stream_chunk may emit
+                            # several frames, so a drain-timeout mid-item must
+                            # route the outer asyncio.TimeoutError branch to
+                            # close (a partial frame may be on the wire) rather
+                            # than emit a framing-illegal MSG_ERROR.
                             chunks_sent[0] = True
+                            await self._send_stream_chunk(writer, obj)
                             await self._send_message(
                                 writer, MSG_STREAM_ITEM_END, None
                             )
@@ -3985,32 +3989,79 @@ class NetworkManager:
             }
             await self._send_message(writer, MSG_REQUEST_EVENT_STREAM, request_data)
 
-            pending = None
-            have_pending = False
+            # B-024: read raw frames and reassemble. A single yielded item may
+            # be split across several MSG_STREAM_CHUNK frames (raw pickle byte
+            # slices, via the server's _send_stream_chunk), so we accumulate the
+            # bytes and unpickle the joined buffer at the MSG_STREAM_ITEM_END
+            # boundary — mirroring execute_remote_stream. We deliberately do NOT
+            # use _receive_message: it safe_loads every frame, and a chunk byte
+            # slice is not a valid standalone pickle. We also do NOT decode the
+            # __STREAM_ERROR__/__STREAM_EXCEPTION__ sentinels execute_remote_stream
+            # uses: the request_event_stream server reports errors with real
+            # MSG_ERROR frames, and a legitimate 2-tuple item must not be
+            # mistaken for an error.
+            current_item_chunks: list = []
             while True:
                 try:
-                    msg_type, chunk = await self._receive_message(reader)
-                except (TimeoutError, ConnectionError) as e:
-                    raise NetworkRequestException(str(e))
+                    length_bytes = await reader.readexactly(4)
+                    msg_length = struct.unpack(">I", length_bytes)[0]
+                    if msg_length >= MAX_MESSAGE_SIZE:
+                        raise NetworkRequestException(
+                            f"Message length {msg_length} exceeds maximum "
+                            f"{MAX_MESSAGE_SIZE}"
+                        )
+                    msg_type = (await reader.readexactly(1))[0]
+                    payload_length = msg_length - 1
+                    payload = (
+                        await reader.readexactly(payload_length)
+                        if payload_length > 0
+                        else b""
+                    )
+                except (asyncio.IncompleteReadError, ConnectionError, TimeoutError) as e:
+                    raise NetworkRequestException(
+                        str(e) or "Connection closed unexpectedly"
+                    )
+
+                # B-071: per-peer recv counter for the full frame.
+                self._count_recv(reader, 4 + 1 + payload_length)
+
                 if msg_type == MSG_STREAM_CHUNK:
-                    pending = chunk
-                    have_pending = True
+                    current_item_chunks.append(payload)
                     continue
                 if msg_type == MSG_STREAM_ITEM_END:
-                    if have_pending:
-                        yield pending
-                        pending = None
-                        have_pending = False
+                    # Item boundary (any payload is an ignored pickled None).
+                    if current_item_chunks:
+                        item = safe_loads(b"".join(current_item_chunks))
+                        current_item_chunks = []
+                        yield item
                     continue
                 if msg_type == MSG_END_STREAM:
+                    # Defensive: flush any chunks not closed by an ITEM_END
+                    # (the server always sends ITEM_END, so belt-and-suspenders).
+                    if current_item_chunks:
+                        yield safe_loads(b"".join(current_item_chunks))
+                        current_item_chunks = []
                     break
                 if msg_type == MSG_ERROR:
-                    decoded = chunk
-                    if not isinstance(decoded, BaseException):
-                        decoded = NetworkRequestException(
-                            str(decoded) if decoded is not None else ""
+                    # Unpickle the error here (we bypassed _receive_message's
+                    # safe_loads). Preserve a pickled exception INSTANCE; wrap
+                    # anything else — including a non-allowlisted class that
+                    # trips UnpicklingError — as NetworkRequestException.
+                    try:
+                        decoded = (
+                            safe_loads(payload) if payload_length > 0 else None
                         )
-                    raise decoded
+                    except pickle.UnpicklingError as _e:
+                        raise NetworkRequestException(
+                            f"Remote node {IP} sent unknown exception class: "
+                            f"{_e}. Make custom exceptions inherit from "
+                            f"plexus.serialization.SerializableException."
+                        ) from _e
+                    if isinstance(decoded, BaseException):
+                        raise decoded
+                    raise NetworkRequestException(
+                        str(decoded) if decoded is not None else ""
+                    )
                 raise NetworkRequestException(
                     f"Unexpected message type: {msg_type}"
                 )

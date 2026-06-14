@@ -43,6 +43,12 @@ class TestRemoteTarget(Plugin):
             ("test/r/req_stream_raise", "r_request_stream_raise_handler"),
             ("test/r/req_stream_raise_reqexc",
              "r_request_stream_raise_reqexc_handler"),
+            # B-024 huge-item guard: subscribe at runtime (default hosts="any")
+            # so the parent's REMOTE request_event_stream reaches it, matching
+            # the other remote stream handlers above. (The config-block
+            # subscriptions: entry was hosts="local"-style and not reached over
+            # the wire.)
+            ("test/r/huge_stream", "r_topic_huge_stream"),
         ):
             sid = await self._plexus.subscribe_event(
                 topic,

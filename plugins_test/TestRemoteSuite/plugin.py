@@ -571,42 +571,35 @@ class TestRemoteSuite(Plugin):
             )
 
         async def body_b024_huge_item(c):
-            # B-024: request_event_stream emits ONE MSG_STREAM_CHUNK per
-            # yielded item, no chunking, no item-end boundaries (unlike
-            # execute_stream which DOES chunk via _handle_execute_stream).
-            # The fixture yields one 101MB item — over MAX_MESSAGE_SIZE
-            # (100MB) — so the receiver should reject with
-            # NetworkRequestException. That is the B-024 repro path.
-            try:
-                items = []
-                async for chunk in self.request_event_stream(
-                    "r_huge_stream", hosts=c.hosts,
-                ):
-                    items.append(chunk)
-                # If items received cleanly with the 101MB payload
-                # intact, B-024 isn't reproducing here (server may have
-                # added per-item chunking). Mark and fail.
-                if not items:
-                    c.set_marker("stream_aborted")
-                    raise AssertionError(
-                        "B-024: stream returned 0 items"
-                    )
-                first = items[0]
-                expected_size = 101 * 1024 * 1024
-                if (
-                    not isinstance(first, dict)
-                    or "data" not in first
-                    or len(first.get("data", b"")) != expected_size
-                ):
-                    c.set_marker("stream_aborted")
-                    raise AssertionError(
-                        f"B-024: stream item corrupted (got {type(first).__name__})"
-                    )
-            except Exception as e:
-                if not c.marker:
-                    c.set_marker("stream_aborted")
+            # B-024 (FIXED, now a positive regression guard): a single yielded
+            # item larger than MAX_MESSAGE_SIZE (100MB) used to abort the whole
+            # request_event_stream, because _handle_request_event_stream sent
+            # each item as ONE pickled frame (size-capped) with no splitting.
+            # The fix routes item sends through _send_stream_chunk (splits the
+            # pickle across MSG_STREAM_CHUNK frames, parity with execute_stream)
+            # and request_event_stream_remote reassembles raw chunk bytes at the
+            # MSG_STREAM_ITEM_END boundary. The 101MB item must now arrive
+            # intact. Fails on revert (the stream aborts with NetworkRequestException).
+            from plexus.utils import Event
+            items = []
+            async for chunk in self.request_event_stream(
+                "r_huge_stream", hosts=c.hosts,
+            ):
+                items.append(chunk)
+            c.expect(len(items), 1)
+            # First (and only) item is Event-wrapped per LOCKED I.
+            first = items[0]
+            payload = first.payload if isinstance(first, Event) else first
+            expected_size = 101 * 1024 * 1024
+            if not isinstance(payload, dict) or "data" not in payload:
                 raise AssertionError(
-                    f"B-024: stream aborted with exception: {type(e).__name__}: {e}"
+                    f"B-024: expected dict with 'data', got "
+                    f"{type(payload).__name__}"
+                )
+            if len(payload["data"]) != expected_size:
+                raise AssertionError(
+                    f"B-024: huge item corrupted: got {len(payload['data'])} "
+                    f"bytes, expected {expected_size}"
                 )
 
         async def body_b025_partial_then_failover(c):
@@ -1057,6 +1050,11 @@ class TestRemoteSuite(Plugin):
             ("remote.request_event_stream.mid_stream_raise_reqexc",
              body_request_event_stream_mid_stream_raise_reqexc,
              ("basic", "request_event_stream", "regression_guard"), ()),
+            # B-024: must run BEFORE the wire_counter.reset_on_drop case below,
+            # which drops the peer and clears its adverts (the huge-item stream
+            # needs the subnode's advert present to route over the wire).
+            ("remote.B-024.huge_item", body_b024_huge_item,
+             ("request_event_stream", "regression_guard", "slow"), ("B-024",)),
             # End Stage N additions
             # B-071: per-peer wire counters
             ("remote.wire_counter.execute",
@@ -1074,8 +1072,6 @@ class TestRemoteSuite(Plugin):
             ("remote.B-021.first_sub_not_remote_eligible",
              body_b021_first_sub_not_remote_eligible,
              ("bug_repro",), ("B-021",)),
-            ("remote.B-024.huge_item", body_b024_huge_item,
-             ("bug_repro", "slow"), ("B-024",)),
             ("remote.B-025.partial_then_failover",
              body_b025_partial_then_failover,
              ("bug_repro",), ("B-025",)),
@@ -1130,17 +1126,13 @@ class TestRemoteSuite(Plugin):
         for case_id, body, tags, bug_ids in cases:
             extra: Dict[str, Any] = {}
             if "bug_repro" in tags:
-                # Bug-repro cases need expected_status="fail" with a
-                # signature when the body actually drives the bug; cases
-                # that skip via c.skip(...) don't need wiring.
-                if "B-024" in bug_ids:
-                    extra = {
-                        "expected_status": "fail",
-                        "expected_signature": {"marker": "stream_aborted"},
-                    }
-                # B-020 (Stage M) is a positive regression guard now —
-                # default extras={} is correct.
-                # Other bug_repro cases skip via c.skip(...) inside the body.
+                # Bug-repro cases that drive a bug need expected_status="fail"
+                # with a signature; cases that skip via c.skip(...) don't need
+                # wiring. (B-024 was here as an xfail asserting the huge-item
+                # abort; it is now FIXED and registered as a positive
+                # regression_guard, so no wiring.) Other bug_repro cases skip
+                # via c.skip(...) inside the body.
+                pass
             # C-128 timeout_resend needs more headroom than the 30s
             # default — it waits for a heartbeat-driven resend round
             # trip which scales with networking.heartbeat_interval.

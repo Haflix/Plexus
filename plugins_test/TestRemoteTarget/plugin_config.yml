@@ -1,12 +1,11 @@
 description: Phase 5 fixture — remote=True endpoints + topic handlers used by TestRemoteSuite cases
-version: 0.3.3
+version: 0.3.4
 remote: True
 arguments:
 subscriptions:
-  huge_stream_sub:
-    topic: "test/r/huge_stream"
-    target_access_name: r_topic_huge_stream
-    hosts: "local"
+  # B-024 huge-item: subscribed at runtime in on_enable (default hosts="any")
+  # so the parent's REMOTE request_event_stream reaches it. A config-block
+  # subscription here was not reached over the wire in this fixture.
   open_sub:
     topic: "test/r/open"
     target_access_name: r_topic_open
@@ -45,8 +44,9 @@ endpoints:
     tags:
     remote: True
     accessible_by_other_plugins: True
-    description: Async gen subscribed to test/r/huge_stream (via subscriptions block) — yields one bytes item bigger than CHUNK_SIZE for B-024 via request_event_stream
+    description: Async gen subscribed at runtime to test/r/huge_stream — yields one item bigger than MAX_MESSAGE_SIZE for the B-024 cross-node chunking guard
     arguments:
+      - name: event
 
   r_async_gen_raises_after:
     internal_name: r_async_gen_raises_after
