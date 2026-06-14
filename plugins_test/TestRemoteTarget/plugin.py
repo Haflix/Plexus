@@ -11,6 +11,7 @@ from typing import Any
 
 from plexus.utils import Plugin
 from plexus.decorators import async_gen_log_errors, async_log_errors, log_errors
+from plexus.exceptions import RequestException
 
 
 class TestRemoteTarget(Plugin):
@@ -40,6 +41,8 @@ class TestRemoteTarget(Plugin):
             ("test/r/req_raise",        "r_request_raise_handler"),
             ("test/r/req_stream_basic", "r_request_stream_basic_handler"),
             ("test/r/req_stream_raise", "r_request_stream_raise_handler"),
+            ("test/r/req_stream_raise_reqexc",
+             "r_request_stream_raise_reqexc_handler"),
         ):
             sid = await self._plexus.subscribe_event(
                 topic,
@@ -143,3 +146,14 @@ class TestRemoteTarget(Plugin):
         yield {"chunk": 0}
         yield {"chunk": 1}
         raise ValueError("midstream-error-marker")
+
+    @async_gen_log_errors
+    async def r_request_stream_raise_reqexc_handler(self, event=None):
+        """Async-gen handler yielding 2 chunks then raising a
+        RequestException. Covers the `except RequestException` mid-stream
+        branch of _handle_request_event_stream (which sends the exception
+        raw, distinct from the `except Exception` wrap branch that
+        r_request_stream_raise_handler drives via ValueError)."""
+        yield {"chunk": 0}
+        yield {"chunk": 1}
+        raise RequestException("reqexc-midstream-marker")

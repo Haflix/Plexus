@@ -382,6 +382,53 @@ class TestRemoteSuite(Plugin):
                     f"RequestException raised but original message lost: "
                     f"{raised!r}"
                 )
+            # The handler raised ValueError; the wire-error wrap must carry the
+            # exception TYPE NAME so the message is not opaque ("ValueError: ..."
+            # not just "..."). Asserts the type-name enrichment on the stream
+            # path (the `except Exception` branch of _handle_request_event_stream).
+            if "ValueError" not in str(raised):
+                c.set_marker("error_type_lost")
+                raise AssertionError(
+                    f"mid-stream error message dropped the exception type: "
+                    f"{raised!r}"
+                )
+            if len(chunks) != 2:
+                c.set_marker("chunk_count_wrong")
+                raise AssertionError(
+                    f"expected 2 chunks before mid-stream raise, "
+                    f"got {len(chunks)}"
+                )
+
+        async def body_request_event_stream_mid_stream_raise_reqexc(c):
+            """Mid-stream handler raise of a RequestException (not a plain
+            Exception): 2 chunks then the RequestException reaches the caller
+            with its original message preserved. Covers the
+            `except RequestException` raw-send branch of
+            _handle_request_event_stream — distinct from the ValueError case
+            above, which drives the `except Exception` wrap branch."""
+            from plexus.exceptions import RequestException
+            chunks = []
+            raised: Optional[BaseException] = None
+            try:
+                async for chunk in self.request_event_stream(
+                    "r_request_stream_raise_reqexc", payload={},
+                    hosts="remote", timeout=10.0,
+                ):
+                    chunks.append(chunk)
+            except RequestException as e:
+                raised = e
+            if raised is None:
+                c.set_marker("no_exception")
+                raise AssertionError(
+                    f"request_event_stream completed without raising; "
+                    f"got {len(chunks)} chunk(s)"
+                )
+            if "reqexc-midstream-marker" not in str(raised):
+                c.set_marker("error_message_lost")
+                raise AssertionError(
+                    f"RequestException raised but original message lost: "
+                    f"{raised!r}"
+                )
             if len(chunks) != 2:
                 c.set_marker("chunk_count_wrong")
                 raise AssertionError(
@@ -1013,6 +1060,9 @@ class TestRemoteSuite(Plugin):
              ("basic", "request_event_stream"), ()),
             ("remote.request_event_stream.mid_stream_raise",
              body_request_event_stream_mid_stream_raise,
+             ("basic", "request_event_stream", "regression_guard"), ()),
+            ("remote.request_event_stream.mid_stream_raise_reqexc",
+             body_request_event_stream_mid_stream_raise_reqexc,
              ("basic", "request_event_stream", "regression_guard"), ()),
             # End Stage N additions
             # B-071: per-peer wire counters

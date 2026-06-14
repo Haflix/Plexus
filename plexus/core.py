@@ -6300,7 +6300,21 @@ class Plexus:
                         func, request.args, chain, request=request
                     )
                 except Exception as e:
-                    await self._set_request_result(request, str(e), True)
+                    # Surface the exception TYPE NAME alongside the message so
+                    # the caller's RequestException is not opaque ("ValueError:
+                    # intentional", not "intentional"). Skip the prefix when the
+                    # handler already raised a RequestException — the caller
+                    # catches RequestException by contract, so a
+                    # "RequestException: ..." prefix would be redundant noise.
+                    # Mirrors the request_event stream server's two error
+                    # branches in networking.py (raw RequestException vs
+                    # type-prefixed wrap for everything else).
+                    msg = (
+                        str(e)
+                        if isinstance(e, RequestException)
+                        else f"{type(e).__name__}: {e}"
+                    )
+                    await self._set_request_result(request, msg, True)
                     return
 
             await self._set_request_result(request, result)

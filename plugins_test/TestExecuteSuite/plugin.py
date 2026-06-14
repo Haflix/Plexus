@@ -286,7 +286,10 @@ class TestExecuteSuite(Plugin):
             await self.execute("DoesNotExist", "ea_add", (1, 2), hosts=c.hosts)
 
         async def body_endpoint_raises(c):
-            c.expect_exception(RequestException, match=r"intentional")
+            # The endpoint raises ValueError("intentional"). The caller's
+            # RequestException must carry the exception TYPE NAME, not just the
+            # bare message — "ValueError: intentional", not "intentional".
+            c.expect_exception(RequestException, match=r"ValueError.*intentional")
             await self.execute(TARGET, "ea_raises", hosts=c.hosts)
 
         async def body_endpoint_raises_request_exc(c):

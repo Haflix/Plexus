@@ -1,5 +1,5 @@
 description: Phase 5 fixture — remote=True endpoints + topic handlers used by TestRemoteSuite cases
-version: 0.3.2
+version: 0.3.3
 remote: True
 arguments:
 subscriptions:
@@ -108,5 +108,14 @@ endpoints:
     remote: True
     accessible_by_other_plugins: True
     description: Stage N (PR4) — request_event_stream handler subscribed at runtime to test/r/req_stream_raise; yields 2 chunks then raises ValueError with marker
+    arguments:
+      - name: event
+
+  r_request_stream_raise_reqexc_handler:
+    internal_name: r_request_stream_raise_reqexc_handler
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: request_event_stream handler subscribed at runtime to test/r/req_stream_raise_reqexc; yields 2 chunks then raises RequestException (covers the except-RequestException mid-stream branch)
     arguments:
       - name: event

@@ -3068,12 +3068,15 @@ class NetworkManager:
             # First chunk wraps; subsequent chunks raw.
             #
             # W2-F4: chunks_sent tracks whether ANY MSG_STREAM_CHUNK frame
-            # has been written. Outer except clauses (TimeoutError /
-            # RequestException / Exception) read it to decide whether to
-            # send MSG_ERROR (legal pre-stream) or close the writer (the
-            # only legal action after MSG_STREAM_CHUNK without an
-            # intervening MSG_END_STREAM). Using a 1-element list because
-            # nonlocal across nested async function and outer except
+            # has been written. The asyncio.TimeoutError branch reads it to
+            # decide between MSG_ERROR (legal pre-stream) and close-only (the
+            # only legal action after MSG_STREAM_CHUNK without an intervening
+            # MSG_END_STREAM, because an async timeout can fire mid-send and
+            # leave a partial frame). The handler-raise branches
+            # (RequestException / Exception) no longer gate on it — a handler
+            # raise always lands at a clean frame boundary (see those branches),
+            # so MSG_ERROR is well-formed mid-stream. Using a 1-element list
+            # because nonlocal across the nested async function and outer except
             # would otherwise need an explicit declaration.
             chunks_sent = [False]
 
@@ -3211,32 +3214,48 @@ class NetworkManager:
                         ),
                     )
             except RequestException as exc:
-                # W2-F4: same framing concern for explicit
-                # RequestException raises from the handler.
-                if chunks_sent[0]:
+                # A HANDLER raise lands at a clean frame boundary even
+                # mid-stream: each yielded chunk is MSG_STREAM_CHUNK followed by
+                # MSG_STREAM_ITEM_END (both fully sent + drained), and the
+                # generator only raises on the SUBSEQUENT __anext__ — so no
+                # partial frame is on the wire and a fresh MSG_ERROR is
+                # well-formed. The consumer (request_event_stream_remote) raises
+                # on MSG_ERROR at any point and closes (never pools) the
+                # connection in its finally. This supersedes the old W2-F4
+                # close-on-chunks behavior, which dropped the error and left the
+                # consumer with a bare "Connection closed unexpectedly".
+                # (The asyncio.TimeoutError branch above still closes on chunks:
+                # an async interrupt CAN fire mid-_send_message and leave a
+                # partial frame, so close is the only safe action there.)
+                #
+                # If the error-send itself fails on a broken socket, degrade to
+                # close-only so we do NOT fall through to the outer handler and
+                # double-send a second (framing-illegal) MSG_ERROR on the same
+                # writer.
+                try:
+                    await self._send_error_pickled(writer, exc)
+                except Exception:
                     try:
                         writer.close()
                         await writer.wait_closed()
                     except Exception:
                         pass
-                else:
-                    await self._send_error_pickled(writer, exc)
             except Exception as exc:
                 self._logger.exception("[REQUEST_EVENT_STREAM] iteration crashed")
-                # W2-F4 (S1 follow-up): same framing concern — if any
-                # MSG_STREAM_CHUNK has gone out, MSG_ERROR is illegal
-                # without an intervening MSG_END_STREAM. Close the
-                # writer instead of corrupting the pooled connection.
-                if chunks_sent[0]:
+                # Same clean-boundary reasoning as the RequestException branch
+                # above. Wrap in RequestException so the consumer's
+                # `except RequestException` catches it; include the type name so
+                # the error is not opaque ("ValueError: ..." not "...").
+                try:
+                    await self._send_error_pickled(
+                        writer, RequestException(f"{type(exc).__name__}: {exc}")
+                    )
+                except Exception:
                     try:
                         writer.close()
                         await writer.wait_closed()
                     except Exception:
                         pass
-                else:
-                    await self._send_error_pickled(
-                        writer, RequestException(str(exc))
-                    )
 
         except Exception as exc:
             # V1 follow-up: this outer except is reachable only on
