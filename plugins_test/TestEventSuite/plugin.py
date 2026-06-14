@@ -391,6 +391,26 @@ class TestEventSuite(Plugin):
                 "test_event/eventid/alice/leaf",
             )
 
+        async def body_case_insensitive_topic(c):
+            # case_insensitive_event topic = "test_event/CaseInsensitive/Leaf";
+            # case_insensitive_sub topic = "test_event/caseinsensitive/LEAF"
+            # (a DIFFERENT case). Topics are case-insensitive — both fold to
+            # the lowercase canonical form — so the publish must reach the
+            # subscriber and the delivered topic is the lowercase form.
+            # Guard: without case-folding the two cases differ and count==0.
+            self._reset_self_mailboxes()
+            count = await self.publish_event(
+                "case_insensitive_event", payload={"k": "ci"},
+            )
+            await self._settle()
+            c.expect(count, 1)
+            c.expect(len(self.declared_events), 1)
+            c.expect(self.declared_events[0].payload, {"k": "ci"})
+            c.expect(
+                self.declared_events[0].topic,
+                "test_event/caseinsensitive/leaf",
+            )
+
         async def body_no_matching_sub(c):
             count = await self.publish_event(
                 "no_match_event", payload={"x": 1},
@@ -407,6 +427,10 @@ class TestEventSuite(Plugin):
 
         await rec.run_case(
             "event.eventid.declared_publishes", body_declared_publishes,
+            tags=("basic",), **kw,
+        )
+        await rec.run_case(
+            "event.topic.case_insensitive", body_case_insensitive_topic,
             tags=("basic",), **kw,
         )
         await rec.run_case(

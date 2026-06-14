@@ -1,5 +1,5 @@
 description: PR3 event API suite — comprehensive PLAN J coverage (Stage E)
-version: "0.2.3"
+version: "0.2.4"
 remote: false
 verbose_notifier: true
 prefix: "PSuite"
@@ -16,6 +16,12 @@ events:
   # ── eventid declaration / lookup tests ───────────────────────────────
   declared_event:
     topic: "test_event/eventid/declared"
+    hosts: "local"
+  # Case-insensitive topics: event topic is mixed-case; the matching
+  # subscription (case_insensitive_sub) uses a DIFFERENT case. Both fold to
+  # the same lowercase canonical form, so the publish must still match.
+  case_insensitive_event:
+    topic: "test_event/CaseInsensitive/Leaf"
     hosts: "local"
   no_match_event:
     topic: "test_event/eventid/no_match_anywhere"
@@ -134,6 +140,12 @@ subscriptions:
   # ── eventid lookup ───────────────────────────────────────────────────
   declared_event_sub:
     topic: "test_event/eventid/declared"
+    target_access_name: handle_declared
+    hosts: "local"
+  # Case-insensitive topics: subscribes a DIFFERENT case than
+  # case_insensitive_event's topic; both fold to lowercase and must match.
+  case_insensitive_sub:
+    topic: "test_event/caseinsensitive/LEAF"
     target_access_name: handle_declared
     hosts: "local"
   kwargs_override_sub:

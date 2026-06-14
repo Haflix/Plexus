@@ -8087,7 +8087,14 @@ class Plexus:
             allow_wildcards=False,
         )
 
-        return stripped_topic, event_entry
+        # Case-insensitive topics: canonicalize the resolved topic to
+        # lowercase here (the single publisher funnel for publish_event /
+        # request_event / request_event_stream), AFTER topic_vars
+        # substitution so a var value like "Alice" is folded too. The
+        # subscriber side lowercases topic_pattern in
+        # TopicRegistry.register, so matching is case-insensitive without
+        # any change to the matcher.
+        return stripped_topic.lower(), event_entry
 
     @async_log_errors
     async def publish_event(

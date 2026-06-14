@@ -271,6 +271,12 @@ class TopicRegistry:
             )
 
         async with self._lock:
+            # Case-insensitive topics: canonicalize the pattern to lowercase
+            # at this single subscriber funnel (every subscription path lands
+            # here) so matching is case-insensitive without touching the
+            # matcher. '*' / '/' are unaffected by lower(). The publisher side
+            # lowercases resolved topics in Plexus._resolve_topic_for_event.
+            sub.topic_pattern = sub.topic_pattern.lower()
             self._subs[sub.sub_uuid] = sub
             self._by_plugin.setdefault(sub.plugin_uuid, set()).add(sub.sub_uuid)
             if sub.declared_id is not None:
