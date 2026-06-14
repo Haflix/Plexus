@@ -1797,14 +1797,18 @@ class TestBugSuite(Plugin):
                     ),
                     timeout=5.0,
                 )
-                # Action 1 — denial.
+                # Action 1 — denial. author_host MUST match the peer's pinned
+                # hostname; otherwise the C-106 anti-spoof drift gate fires
+                # first and we never reach the B-018b system_caller denial this
+                # case is meant to exercise. (The grant case below already
+                # uses peer["spec"].hostname for the same reason.)
                 await _b066_send_msg(writer, MSG_EXECUTE, {
                     "plugin": "TestEventTarget",
                     "method": "get_state",
                     "args": None,
                     "author": "system",
                     "author_id": "system",
-                    "author_host": "b066_test_peer",
+                    "author_host": peer["spec"].hostname,
                     "request_id": "b066-test3-deny",
                 })
                 msg_type, data = await _b066_recv_msg(reader, timeout=5.0)
@@ -1816,6 +1820,48 @@ class TestBugSuite(Plugin):
                 msg_type2, data2 = await _b066_recv_msg(reader, timeout=5.0)
                 c.expect(msg_type2, MSG_RESULT)
                 c.expect(data2, {"status": "ok"})
+            finally:
+                if writer is not None:
+                    try:
+                        writer.close()
+                        await writer.wait_closed()
+                    except Exception:
+                        pass
+                self._b066_cleanup_test_peer(peer)
+
+        async def body_b_066_execute_hostname_drift_errors(c):
+            # C-106 follow-up regression guard: an EXECUTE whose wire
+            # author_host does NOT match the cert-pinned hostname must get an
+            # anti-spoof MSG_ERROR, not a silent drop. Before the fix the
+            # EXECUTE / EXECUTE_STREAM drift gates returned with no wire
+            # response, so the caller hung on its own receive until timeout
+            # (the original failure mode of the denial case above). author is
+            # "remote" (not "system") so the drift gate is exercised in
+            # isolation, ahead of the B-018b system_caller check.
+            peer = await self._b066_make_test_peer(system_caller=False)
+            writer = None
+            try:
+                client_ctx = self._b066_make_client_ssl_context(peer)
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(
+                        "127.0.0.1",
+                        self._plexus.network.port,
+                        ssl=client_ctx,
+                    ),
+                    timeout=5.0,
+                )
+                await _b066_send_msg(writer, MSG_EXECUTE, {
+                    "plugin": "TestEventTarget",
+                    "method": "get_state",
+                    "args": None,
+                    "author": "remote",
+                    "author_id": "remote",
+                    "author_host": peer["spec"].hostname + "-DRIFT",
+                    "request_id": "b066-drift-execute",
+                })
+                msg_type, data = await _b066_recv_msg(reader, timeout=5.0)
+                c.expect(msg_type, MSG_ERROR)
+                c.expect("anti-spoof" in str(data), True)
             finally:
                 if writer is not None:
                     try:
@@ -2014,6 +2060,13 @@ class TestBugSuite(Plugin):
         await rec.run_case(
             "bug.B-066.system_caller_privilege_denial",
             body_b_066_system_caller_privilege_denial,
+            category=category,
+            tags=("bug_repro", "security", "b066"), bug_ids=("B-066",),
+            hard_timeout_s=10.0, **kw,
+        )
+        await rec.run_case(
+            "bug.B-066.execute_hostname_drift_errors",
+            body_b_066_execute_hostname_drift_errors,
             category=category,
             tags=("bug_repro", "security", "b066"), bug_ids=("B-066",),
             hard_timeout_s=10.0, **kw,

@@ -1911,6 +1911,19 @@ class NetworkManager:
                 pinned = conn_context.get("peer_hostname")
                 if pinned and pinned != author_host:
                     self._warn_hostname_drift(pinned, author_host, "EXECUTE")
+                    # Send an anti-spoof error before returning so the caller
+                    # (execute_remote) gets a clear failure instead of hanging
+                    # on its own receive until timeout. Mirrors the
+                    # REQUEST_EVENT / REQUEST_EVENT_STREAM drift handlers; the
+                    # fire-and-forget handlers (publish_event, sub_advertise,
+                    # sub_delta) correctly stay silent (no caller awaiting a
+                    # reply).
+                    await self._send_error_pickled(
+                        writer,
+                        NetworkRequestException(
+                            "anti-spoof: author_host mismatch with pinned peer"
+                        ),
+                    )
                     return
                 conn_context.setdefault("peer_hostname", author_host)
 
@@ -2069,6 +2082,19 @@ class NetworkManager:
                 if pinned and pinned != author_host:
                     self._warn_hostname_drift(
                         pinned, author_host, "EXECUTE_STREAM"
+                    )
+                    # Send an anti-spoof error before returning so the caller
+                    # (execute_remote_stream) gets a clear failure instead of
+                    # hanging on its own receive until timeout. The consumer's
+                    # MSG_ERROR branch raises it; this mirrors the pre-stream
+                    # B-018b denial on this same path (which already sends via
+                    # _apply_b018b_guard) and the REQUEST_EVENT_STREAM drift
+                    # handler.
+                    await self._send_error_pickled(
+                        writer,
+                        NetworkRequestException(
+                            "anti-spoof: author_host mismatch with pinned peer"
+                        ),
                     )
                     return
                 conn_context.setdefault("peer_hostname", author_host)
