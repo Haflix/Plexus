@@ -829,27 +829,56 @@ class TestBugSuite(Plugin):
         category = "active"
 
         # ---- B-018b --------------------------------------------------
-        async def body_b_018b_execute_system_rewrite_alive(c):
-            # B-018b: Stage D removed _handle_notify and
-            # _handle_topic_request, but the `execute()` method still
-            # rewrites author=="system" to hostname. MSG_EXECUTE remains
-            # active so a remote node can still spoof via that path.
-            # Stage F can't actually run a remote spoof here without
-            # two-node infrastructure. Structural assertion: the
-            # rewrite block is still present in execute()'s source.
-            src = inspect.getsource(self._plexus.execute)
-            if (
-                'author == "system"' not in src
-                and "author == 'system'" not in src
-            ):
-                # The rewrite was removed — bug fixed-by-construction.
-                # Body completes normally; expected_status="fail" =>
-                # unexpected_pass => bug fixed.
-                return
-            raise AssertionError(
-                "B-018b: execute() still rewrites author=='system' to "
-                "hostname — remote spoof path partially survives Stage D"
-            )
+        async def body_b_018b_uuid_spoof_denied(c):
+            # B-018b consequence guard (real 2-node; replaces the old
+            # source-grep canary execute_system_rewrite_alive, which only
+            # checked that a benign local convenience rewrite still existed
+            # in execute()'s source and could never run an actual spoof).
+            #
+            # A remote peer that spoofs author_id = a real LOCAL plugin uuid
+            # must NOT gain local-plugin access. _apply_b018b_guard Part 2
+            # (networking.py, runs before execute()) rewrites the spoofed
+            # author_id to a remote-peer sentinel, so find_endpoint
+            # (core.py is_local_plugin check) treats the call as REMOTE.
+            # TestEventTarget is remote:false, so get_state is denied
+            # ("Endpoint get_state not found"). Without the rewrite the
+            # spoofed uuid would match a local plugin, take the local-access
+            # path, and reach the endpoint — the original B-018b bypass.
+            # author="remote" (not "system") isolates the author_id rewrite
+            # from the system_caller gate covered by the denial/grant cases.
+            peer = await self._b066_make_test_peer(system_caller=False)
+            writer = None
+            try:
+                client_ctx = self._b066_make_client_ssl_context(peer)
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(
+                        "127.0.0.1",
+                        self._plexus.network.port,
+                        ssl=client_ctx,
+                    ),
+                    timeout=5.0,
+                )
+                await _b066_send_msg(writer, MSG_EXECUTE, {
+                    "plugin": "TestEventTarget",
+                    "method": "get_state",
+                    "args": None,
+                    "author": "remote",
+                    "author_id": self.plugin_uuid,  # spoof a real local uuid
+                    "author_host": peer["spec"].hostname,
+                    "request_id": "b018b-uuid-spoof-denied",
+                })
+                msg_type, data = await _b066_recv_msg(reader, timeout=5.0)
+                # Denied: rewritten -> remote request -> remote:false endpoint.
+                c.expect(msg_type, MSG_ERROR)
+                c.expect("not found" in str(data).lower(), True)
+            finally:
+                if writer is not None:
+                    try:
+                        writer.close()
+                        await writer.wait_closed()
+                    except Exception:
+                        pass
+                self._b066_cleanup_test_peer(peer)
 
         # ---- B-021 ---------------------------------------------------
         async def body_b_021_request_event_fallthrough_or_fail(c):
@@ -1121,19 +1150,17 @@ class TestBugSuite(Plugin):
             c.expect("async_log_errors" in src, False)
 
         # -- run_case calls --------------------------------------------
-        # B-018b: expected_status="fail" — bug expected to repro
-        # (rewrite block still present); body raises AssertionError
-        # with matching signature on confirmed repro.
+        # B-018b consequence guard (positive): a spoofed author_id=<local uuid>
+        # is rewritten by _apply_b018b_guard and then DENIED local access to a
+        # remote:false endpoint. Replaces the retired source-grep canary
+        # execute_system_rewrite_alive. Real 2-node coverage of the actual
+        # security property, alongside the B-066 denial/grant cases.
         await rec.run_case(
-            "bug.B-018b.execute_system_rewrite_alive",
-            body_b_018b_execute_system_rewrite_alive,
+            "bug.B-018b.uuid_spoof_denied_local_endpoint",
+            body_b_018b_uuid_spoof_denied,
             category=category,
-            tags=("bug_repro", "active"), bug_ids=("B-018",),
-            expected_status="fail",
-            expected_signature={
-                "exception_type": "AssertionError",
-                "message_regex": r"system_rewrite|partially survives",
-            },
+            tags=("bug_repro", "security", "b066"), bug_ids=("B-018",),
+            hard_timeout_s=10.0,
             **kw,
         )
         # B-021: skip pending fixture work.

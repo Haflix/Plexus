@@ -24,7 +24,6 @@ Cases:
 - remote.execute.basic / .remote_false_blocked
 - remote.request_event.basic / .handler_raises / .timeout_honored
 - remote.request_event_stream.basic / .mid_stream_raise
-- remote.B-018.spoof_system_string / .spoof_known_uuid (skip — Stage E)
 - remote.B-019 / B-021 / B-025 / B-011_B-012 / B-029 / B-030 / B-027 /
   B-032 / B-033 (skip — fixture wiring TBD)
 - remote.B-024.huge_item
@@ -548,17 +547,11 @@ class TestRemoteSuite(Plugin):
             # semantic. That's the correct behavior — we don't recreate
             # stale state for a peer that was just declared dead.
 
-        async def body_b018_spoof_system_string(c):
-            c.skip(
-                "B-018 spoofing — Stage E re-evaluates author-stamping under "
-                "PR3 Stage C wire protocol; spoofer retired in PR3 Stage D."
-            )
-
-        async def body_b018_spoof_known_uuid(c):
-            c.skip(
-                "B-018 spoofing — Stage E re-evaluates author-stamping under "
-                "PR3 Stage C wire protocol; spoofer retired in PR3 Stage D."
-            )
+        # B-018 spoof cases retired 2026-06-14: the spoofer harness was removed
+        # in PR3 Stage D so these were permanent skips. B-018b is now covered
+        # end-to-end by the B-066 suite (system_caller denial/grant) plus
+        # bug.B-018b.uuid_spoof_denied_local_endpoint in TestBugSuite. See
+        # _private/bugs/bugs.jsonl entry B-018.
 
         async def body_b019_count_per_node(c):
             # On the parent's side we have one local sub for test/r/multi (set up
@@ -1075,12 +1068,6 @@ class TestRemoteSuite(Plugin):
             ("remote.wire_counter.reset_on_drop",
              body_wire_counter_reset,
              ("basic", "wire_counter"), ("B-071",)),
-            ("remote.B-018.spoof_system_string",
-             body_b018_spoof_system_string,
-             ("bug_repro", "security"), ("B-018",)),
-            ("remote.B-018.spoof_known_uuid",
-             body_b018_spoof_known_uuid,
-             ("bug_repro", "security"), ("B-018",)),
             ("remote.B-019.publish_event_count_per_node_not_per_sub",
              body_b019_count_per_node,
              ("bug_repro",), ("B-019",)),
@@ -1150,11 +1137,6 @@ class TestRemoteSuite(Plugin):
                     extra = {
                         "expected_status": "fail",
                         "expected_signature": {"marker": "stream_aborted"},
-                    }
-                elif "B-018" in bug_ids:
-                    extra = {
-                        "expected_status": "fail",
-                        "expected_signature": {"marker": "bypass_succeeded"},
                     }
                 # B-020 (Stage M) is a positive regression guard now —
                 # default extras={} is correct.
