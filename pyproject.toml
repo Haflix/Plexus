@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "plexus-core"
-version = "0.41.1"
+dynamic = ["version"]
 description = "Async plugin framework with multi-node mTLS networking and pub/sub event routing."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -40,6 +40,12 @@ dependencies = [
     "cryptography",
     "packaging",
 ]
+
+[tool.setuptools.dynamic]
+# Single source of truth: the package version is read from
+# plexus/__init__.py __version__. Bumping that constant is all that is
+# needed; the build picks it up, so pyproject never drifts.
+version = { attr = "plexus.__version__" }
 
 [tool.setuptools.packages.find]
 where = ["."]

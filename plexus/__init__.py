@@ -27,6 +27,9 @@ A minimal application entry point:
 
 Submodules:
     core                — Plexus class (config, lifecycle, dispatch orchestrator)
+    events              — EventMixin: event/topic/subscription methods, mixed into Plexus
+    runtime             — shared threadlocal + recursion-guard ContextVars + lifecycle timeouts
+    helpers.config      — stateless config-load / validation helpers (extracted from core)
     utils               — Plugin base, Request, Event, ConfigUtil, LogUtil
     networking          — NetworkManager + mTLS + advert protocol
     notifier            — TopicRegistry + Subscription + SyncDispatcher
@@ -37,7 +40,7 @@ Submodules:
     networking_classes  — Node + RemotePlugin data classes
 """
 
-__version__ = "0.46.0"
+__version__ = "0.47.0"
 
 from .core import Plexus
 from .utils import (
