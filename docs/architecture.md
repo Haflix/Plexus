@@ -1,6 +1,6 @@
 # Architecture
 
-*Last updated for Plexus 0.41.1*
+*Last updated for Plexus 0.46.0*
 
 This document describes the runtime shape of a Plexus process: how Plexus loads plugins, how the lifecycle hooks fire, what guarantees the framework gives during hot-swap and shutdown, and how the three-tier discipline organises the plugins themselves.
 
@@ -101,7 +101,7 @@ Order of operations inside `_enable_plugin_under_lock`:
 2. The YAML `subscriptions:` block is registered with the `TopicRegistry` BEFORE `on_enable` runs. This means published events can already match the plugin's subscriptions while it is still mid-startup — the readiness gate (see below) is what blocks dispatch from completing.
 3. The framework transitions the plugin's state from `INACTIVE` to `ENABLING` (emits `_core/plugin/state_changed`).
 4. Subscription add-deltas are broadcast to peers (no-op when networking is disabled or the manager is not ready).
-5. `on_enable` is called.
+5. `on_enable` is called, wrapped in `asyncio.wait_for(timeout=plugin_enable_timeout)` (default 30s; configurable via `general.plugin_enable_timeout`). On timeout the enable is treated as a failure and the rollback in step 7 runs, so a hung `on_enable` cannot pin the lifecycle lock indefinitely.
 6. On success: the framework sets `_lifecycle_ready` and transitions `ENABLING` → `ENABLED`. Cross-plugin callers waiting on the readiness gate proceed.
 7. On failure (raise or cancel): `_lifecycle_ready` stays cleared, `ready` is reset, `on_disable` is called defensively, subscriptions are unregistered, and the state transitions `ENABLING` → `INACTIVE`. `last_errors[Phase.ENABLE]` is populated for non-cancellation exceptions.
 

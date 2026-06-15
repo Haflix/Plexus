@@ -1,6 +1,6 @@
 # Networking
 
-*Last updated for Plexus 0.41.1*
+*Last updated for Plexus 0.46.0*
 
 Plexus ships with an optional `NetworkManager` that bridges plugin calls between nodes over an mTLS-pinned TCP protocol. With networking enabled, calling `await self.execute("OtherPlugin", ...)` works whether `OtherPlugin` is on this node or another node. The same applies to `publish_event` and `request_event`.
 
@@ -258,7 +258,7 @@ Three message types keep peer subscription tables in sync:
 
 | Wire ID | Name              | Purpose                                                                                                           |
 |---------|-------------------|-------------------------------------------------------------------------------------------------------------------|
-| 18      | `MSG_SUB_ADVERTISE` | Initial sub-snapshot exchange between peers (sent once per connection).                                         |
+| 18      | `MSG_SUB_ADVERTISE` | Full sub-snapshot exchange between peers: sent on initial connection, and re-sent periodically every `resync_interval` seconds (default 300s, C-109) to scrub ghost subscriptions. |
 | 19      | `MSG_SUB_DELTA`     | Incremental subscribe/unsubscribe delta. Broadcast on every `_register_yaml_subscriptions` call after `plugin_lock` is released, and on every `subscribe_event` / `unsubscribe_event`. |
 | 21      | `MSG_SUB_ADVERTISE_ACK` | Async receiver-side acknowledgement of `MSG_SUB_ADVERTISE` snapshots and `MSG_SUB_DELTA` add-operations. Returned via the receiver's outbound connection back to the original sender; populates `acked_at` / `state` on the sender's `_outbound_adverts` entries. |
 

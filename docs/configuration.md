@@ -1,6 +1,6 @@
 # Configuration
 
-*Last updated for Plexus 0.41.1*
+*Last updated for Plexus 0.46.0*
 
 Reference for the top-level `config.yml` — the file Plexus reads on
 startup to find plugins, configure the runtime, and (when enabled) wire
@@ -65,7 +65,7 @@ plugins:
 
 | Field | Type | Required | Default | Notes |
 |---|---|---|---|---|
-| `name` | identifier | YES | — | Validated by `_validate_identifier_name`. Must be a valid Python identifier. Reserved names rejected: `system`, `general`, `any`, `remote`, `local`. |
+| `name` | identifier | YES | — | Validated by `_validate_identifier_name`. Must be a valid Python identifier. Reserved names rejected: `system`, `general`, `any`, `remote`, `local`, `plexus`. |
 | `enabled` | bool | YES | — | If `false`, the entry is parsed and immediately popped — the plugin is never loaded. |
 | `path` | str | optional | `{plugin_package}/{name}` | If absent, auto-resolved from `general.plugin_package`. |
 | `overrides` | dict / null | optional | `null` | Deep-merged into the plugin's own `plugin_config.yml`. See [overrides mechanics](#overrides-mechanics). |
@@ -150,8 +150,9 @@ Override semantics:
   `prefix`, `verbose_notifier`) — value-replace.
 - **`endpoints:`** — STRICT. Unknown sub-keys under an endpoint
   override are fail-load errors. Protects against typos that would
-  silently change nothing. Driven by
-  `_STRICT_OVERRIDE_SECTIONS = frozenset({"endpoints"})` on `Plexus`.
+  silently change nothing. Driven by the module-level
+  `_STRICT_OVERRIDE_SECTIONS = frozenset({"endpoints"})` in
+  `plexus/helpers/config.py`.
 - **`arguments:`**, **`events:`**, **`subscriptions:`** — LENIENT.
   Unknown subkeys merge in.
 - **`__replace__: true`** in any sub-mapping triggers wholesale
@@ -193,7 +194,7 @@ overrides:
 Use this strictness deliberately: misspelled override keys never reach
 production silently. Reserved endpoint `access_name` values follow the
 same forbidden list as plugin names: `system`, `general`, `any`,
-`remote`, `local`.
+`remote`, `local`, `plexus`.
 
 ---
 
@@ -385,6 +386,8 @@ networking:
 | `heartbeat_interval` | float | `10.0` | Seconds between heartbeat ticks. Each tick pings every peer; on failure the peer is marked dead. Bad values fall back to default with a warning. |
 | `lookup_interval` | float | `60.0` | Seconds between discovery / `update_all_nodes` loop ticks. Re-resolves peer addresses and reaps unreachable nodes. Bad values fall back to default with a warning. |
 | `liveness_timeout` | float | `30.0` | A peer whose last successful heartbeat is older than this is considered dead. Should be `>= heartbeat_interval`; 2-3× is typical. Bad values fall back to default with a warning. |
+| `probe_timeout` | float | `min(heartbeat_interval, liveness_timeout)` | Per-probe budget for a single heartbeat ping (R2-LL-5). Bad values fall back to the default. |
+| `resync_interval` | float | `300.0` | Seconds between periodic full sub-snapshot resyncs that scrub ghost subscriptions (C-109). The next heartbeat tick after this interval re-sends a `MSG_SUB_ADVERTISE` snapshot. |
 
 The validators check `enabled`, `port`, `auto_discoverable`,
 `direct_discoverable`, and `discover_nodes` for presence (warn on

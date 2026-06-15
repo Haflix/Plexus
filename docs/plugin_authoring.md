@@ -1,6 +1,6 @@
 # Plugin Authoring Guide
 
-*Last updated for Plexus 0.41.1*
+*Last updated for Plexus 0.46.0*
 
 Write a plugin from scratch. This page walks through the moving parts in
 the order an author meets them; reference details live in
@@ -173,7 +173,7 @@ Field details:
 
 | Field | Type | Required | Default | Notes |
 |---|---|---|---|---|
-| `<key>` (access_name) | identifier | YES | — | Must be a valid Python identifier and not in `{"system", "general", "any", "remote", "local"}`. |
+| `<key>` (access_name) | identifier | YES | — | Must be a valid Python identifier and not in `{"system", "general", "any", "remote", "local", "plexus"}`. |
 | `internal_name` | str | optional | access_name | The real method name on the class. Use it when the public name differs from the implementation name. Must be non-empty ASCII. |
 | `remote` | bool | YES | — | Required even when `plugin.remote: true`. Both flags must be true for a peer to reach the endpoint. |
 | `accessible_by_other_plugins` | bool | YES | — | When `false`, only the plugin itself (matched by `plugin_uuid`) can call. |

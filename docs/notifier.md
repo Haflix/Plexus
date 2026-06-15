@@ -1,6 +1,6 @@
 # Notifier and Events
 
-*Last updated for Plexus 0.41.1*
+*Last updated for Plexus 0.46.0*
 
 Deep dive on the topic-based event system. The user-facing Plugin
 methods are covered in [api_reference.md](./api_reference.md); this page
@@ -48,6 +48,16 @@ Validation rules:
 - Mid-segment `*` is rejected (`mes*ages` is not a wildcard).
 - Event topics (publisher-declared) MAY NOT contain `*`. Subscription
   topics MAY.
+- Topics MAY NOT start with `_`. The `_core/` prefix is reserved for
+  framework-internal events; a topic beginning with `_` is rejected at
+  config-load time and at runtime `subscribe()`.
+
+Topic matching is **case-insensitive**. Every subscription pattern is
+lowercased when registered (`TopicRegistry.register`) and every resolved
+publish/request topic is lowercased before dispatch
+(`_resolve_topic_for_event`), so `Chat/Messages` and `chat/messages` are
+the same topic. Declare topics in lowercase; mixed case is silently
+folded and shows lowercased in logs and introspection.
 
 The matcher (`_topic_matches` in `plexus.notifier`) splits both
 strings on `/` and matches segment-by-segment, requiring identical
@@ -257,7 +267,10 @@ blacklist. The publisher's `plugin_name` is checked against both.
 ### The `"system"` author bypass
 
 The pseudo-author `"system"` is used for framework-originated calls
-(e.g. an `execute()` made with default `author="system"`). A sub's
+(framework-internal dispatch, and peers configured with
+`system_caller: true`). It is NOT the default for a plugin's own
+`execute()` / `publish_event()` — those default the author to the
+calling plugin's own `plugin_name`. A sub's
 `authors:` whitelist accepts `"system"` automatically — UNLESS
 `"system"` is explicitly named in `blocked_authors`. This is
 intentional: it lets framework dispatch reach legitimately gated subs

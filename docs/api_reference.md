@@ -1,6 +1,6 @@
 # API Reference
 
-*Last updated for Plexus 0.41.1*
+*Last updated for Plexus 0.46.0*
 
 Reference manual for the public surface of `Plugin` (in `plexus.utils`) — the methods and attributes a plugin author calls from inside their own class. Methods on `Plexus` itself are covered at the end for tooling and harness authors.
 
@@ -13,10 +13,10 @@ Argument types use Python conventions; `Any` means no constraint. For tutorials 
 - [Lifecycle hooks](#lifecycle-hooks)
 - [Public attributes](#public-attributes)
 - [Cross-plugin call methods](#cross-plugin-call-methods)
-  - [`execute`](#await-selfexecuteplugin-method-argsnone-plugin_uuid-hostsany-blocked_hostsnone-authorsystem-author_idsystem-timeoutnone---any)
-  - [`execute_sync`](#selfexecute_syncplugin-method-argsnone-plugin_uuid-hostsany-blocked_hostsnone-authorsystem-author_idsystem-timeoutnone---any)
-  - [`execute_stream`](#async-for-chunk-in-selfexecute_streamplugin-method-argsnone-plugin_uuid-hostsany-blocked_hostsnone-authorsystem-author_idsystem-timeoutnone)
-  - [`execute_stream_sync`](#for-chunk-in-selfexecute_stream_syncplugin-method-argsnone-plugin_uuid-hostsany-blocked_hostsnone-authorsystem-author_idsystem-timeoutnone)
+  - [`execute`](#await-selfexecuteplugin-method-argsnone-plugin_uuid-hostsany-blocked_hostsnone-authornone-author_idnone-timeoutnone---any)
+  - [`execute_sync`](#selfexecute_syncplugin-method-argsnone-plugin_uuid-hostsany-blocked_hostsnone-authornone-author_idnone-timeoutnone---any)
+  - [`execute_stream`](#async-for-chunk-in-selfexecute_streamplugin-method-argsnone-plugin_uuid-hostsany-blocked_hostsnone-authornone-author_idnone-timeoutnone)
+  - [`execute_stream_sync`](#for-chunk-in-selfexecute_stream_syncplugin-method-argsnone-plugin_uuid-hostsany-blocked_hostsnone-authornone-author_idnone-timeoutnone)
 - [Event API](#event-api)
   - [`publish_event`](#await-selfpublish_eventevent_id-payloadnone-topic_varsnone-hostsnone-blocked_hostsnone---int)
   - [`publish_event_sync`](#selfpublish_event_syncevent_id-payloadnone-topic_varsnone-hostsnone-blocked_hostsnone---int)
@@ -99,7 +99,7 @@ Each method below has signature, args, return, raises, and behaviour notes. The 
 
 ---
 
-### `await self.execute(plugin, method, args=None, plugin_uuid=None, hosts="any", blocked_hosts=None, author="system", author_id="system", timeout=None) -> Any`
+### `await self.execute(plugin, method, args=None, plugin_uuid=None, hosts="any", blocked_hosts=None, author=None, author_id=None, timeout=None) -> Any`
 
 | Argument | Type | Default | Notes |
 |---|---|---|---|
@@ -109,19 +109,19 @@ Each method below has signature, args, return, raises, and behaviour notes. The 
 | `plugin_uuid` | `Optional[str]` | `None` | Pin to a specific instance. `None` = any instance with this name. |
 | `hosts` | `str \| list \| None` | `"any"` | `"any"`, `"local"`, `"remote"`, hostname, or list. |
 | `blocked_hosts` | `str \| list \| None` | `None` | Same shape as `hosts`. |
-| `author` | `str` | `"system"` | Caller-side author identity for filter chains. |
-| `author_id` | `str` | `"system"` | Caller-side author uuid. |
+| `author` | `str \| None` | `None` | Caller-side author identity for filter chains. When `None`, substituted with the calling plugin's own `plugin_name`. |
+| `author_id` | `str \| None` | `None` | Caller-side author uuid. When `None`, substituted with the calling plugin's own `plugin_uuid`. |
 | `timeout` | `float \| None` | `None` | Per-call deadline. Framework-level default if `None`. |
 
 **Returns** Whatever the endpoint returns.
 
-**Raises** `RequestException` on any error (target not found, target not ready, type mismatch, target raised, network failure). `NetworkRequestException` and `NoLocalSubException` are subclasses, so a single `except RequestException` covers both.
+**Raises** `RequestException` on any error (target not found, target not ready, type mismatch, target raised, network failure). `NetworkRequestException` and `NoLocalSubException` are subclasses, so a single `except RequestException` covers both. When the endpoint raises a non-`RequestException`, the surfaced message is prefixed with the exception type name (e.g. a handler `raise ValueError("bad input")` arrives as `RequestException("ValueError: bad input")`); a `RequestException` raised by the handler is passed through verbatim.
 
 **Decorator** `@async_log_errors`.
 
 ---
 
-### `self.execute_sync(plugin, method, args=None, plugin_uuid=None, hosts="any", blocked_hosts=None, author="system", author_id="system", timeout=None) -> Any`
+### `self.execute_sync(plugin, method, args=None, plugin_uuid=None, hosts="any", blocked_hosts=None, author=None, author_id=None, timeout=None) -> Any`
 
 Synchronous bridge. Calls `_check_framework_started()` first; raises `RequestException` if no event loop is bound yet. Detects circular sync calls via a per-thread chain and raises `RequestException("Circular sync call: ...")` rather than deadlocking the executor. Bridges to the loop via `asyncio.run_coroutine_threadsafe`. Same args, same return, same `RequestException` on error.
 
@@ -129,7 +129,7 @@ Synchronous bridge. Calls `_check_framework_started()` first; raises `RequestExc
 
 ---
 
-### `async for chunk in self.execute_stream(plugin, method, args=None, plugin_uuid=None, hosts="any", blocked_hosts=None, author="system", author_id="system", timeout=None)`
+### `async for chunk in self.execute_stream(plugin, method, args=None, plugin_uuid=None, hosts="any", blocked_hosts=None, author=None, author_id=None, timeout=None)`
 
 Async generator. Yields each chunk produced by the target generator/async-generator method. If the producer raises mid-stream, the call surfaces as `RequestException`.
 
@@ -137,7 +137,7 @@ Async generator. Yields each chunk produced by the target generator/async-genera
 
 ---
 
-### `for chunk in self.execute_stream_sync(plugin, method, args=None, plugin_uuid=None, hosts="any", blocked_hosts=None, author="system", author_id="system", timeout=None)`
+### `for chunk in self.execute_stream_sync(plugin, method, args=None, plugin_uuid=None, hosts="any", blocked_hosts=None, author=None, author_id=None, timeout=None)`
 
 Sync generator. Pre-start guard fires at call time, not at first iteration.
 
