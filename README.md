@@ -60,6 +60,14 @@ From PyPI (recommended for using Plexus as a library):
 pip install plexus-core
 ```
 
+Optional: add `[fastloop]` for a faster event loop (uvloop on Linux/macOS,
+winloop on Windows). Purely a performance opt-in; everything works without
+it.
+
+```bash
+pip install plexus-core[fastloop]
+```
+
 From source (for developing on the framework itself):
 
 ```bash

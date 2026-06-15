@@ -1,6 +1,25 @@
 import asyncio
 import signal
+import sys
 from plexus.core import Plexus
+
+
+def _install_fast_loop():
+    """Install a faster event-loop policy when available: winloop on
+    Windows, uvloop on POSIX. Must run before asyncio.run() creates the
+    loop. Optional — `pip install plexus-core[fastloop]` activates it; a
+    bare checkout falls back to the stock asyncio loop (no-op). Returns the
+    installed module name, or None.
+    """
+    try:
+        if sys.platform == "win32":
+            import winloop as _fast
+        else:
+            import uvloop as _fast
+    except ImportError:
+        return None
+    _fast.install()
+    return _fast.__name__
 
 
 async def main():
@@ -27,6 +46,9 @@ async def main():
 
 
 if __name__ == "__main__":
+    _loop_impl = _install_fast_loop()
+    if _loop_impl:
+        print(f"Using fast event loop: {_loop_impl}")
     try:
         asyncio.run(main())
     except KeyboardInterrupt:

@@ -26,6 +26,23 @@ from plexus.core import Plexus
 from plexus.serialization import generate_keypair
 
 
+def _install_fast_loop():
+    """Install a faster event-loop policy when available: winloop on
+    Windows, uvloop on POSIX. Must run before asyncio.run(). Optional —
+    `pip install plexus-core[fastloop]` activates it; a bare checkout falls
+    back to the stock asyncio loop (no-op). Returns the module name or None.
+    """
+    try:
+        if sys.platform == "win32":
+            import winloop as _fast
+        else:
+            import uvloop as _fast
+    except ImportError:
+        return None
+    _fast.install()
+    return _fast.__name__
+
+
 CONFIG_PATH = "test_config.yml"
 DUMP_PATH = "_private/test_outputs/phase_1_baseline.json"
 RUNNER_PLUGIN = "TestRunner"
@@ -268,6 +285,9 @@ async def run_tests() -> int:
 
 
 if __name__ == "__main__":
+    _loop_impl = _install_fast_loop()
+    if _loop_impl:
+        print(f"Using fast event loop: {_loop_impl}", file=sys.stderr)
     try:
         rc = asyncio.run(run_tests())
     except KeyboardInterrupt:
