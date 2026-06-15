@@ -228,9 +228,23 @@ class TestBugSuite(Plugin):
         # B-047 mailbox: probe handler increments to confirm fan-out
         # actually fires (sanity check for the task_list growth body).
         self.b047_probe_calls = 0
+        # B-021 mailboxes: which of the two competing subs answered.
+        self.b021_blocked_calls = 0
+        self.b021_eligible_calls = 0
 
     async def handle_b047_probe(self, event):
         self.b047_probe_calls += 1
+
+    async def handle_b021_blocked(self, event):
+        # The non-eligible sub (blocks the publisher). request_event must
+        # never reach this; if it does, the filter chain was bypassed.
+        self.b021_blocked_calls += 1
+        return {"who": "blocked"}
+
+    async def handle_b021_eligible(self, event):
+        # The eligible fall-through sub. request_event must land here.
+        self.b021_eligible_calls += 1
+        return {"who": "eligible"}
 
     @async_log_errors
     async def on_enable(self):
@@ -883,23 +897,25 @@ class TestBugSuite(Plugin):
 
         # ---- B-021 ---------------------------------------------------
         async def body_b_021_request_event_fallthrough_or_fail(c):
-            # B-021: does a non-eligible sub (earlier in insertion order)
-            # block an eligible one on the request_event path? Code says
-            # NO — request_event walks find_all and selects the first sub
-            # that PASSES the filter chain (filtered next(); non-eligible
-            # subs are skipped, search continues). It does NOT use the
-            # filter-blind _find_first. A dedicated fixture (two competing
-            # subs on one topic, the first non-eligible) would turn that
-            # into a live regression guard; existing fixtures don't provide
-            # the pairing (priv_endpoint isn't paired with a public
-            # alternative on the same topic). Skip pending that fixture.
-            c.skip(
-                "STAGE_F_FIXME: request_event fall-through investigation "
-                "requires deliberate sub ordering plus paired "
-                "private/public endpoints on the same topic. Existing "
-                "fixtures don't provide this pairing — defer to a "
-                "follow-up that adds a dedicated fixture."
+            # B-021 (regression): two subs on the SAME topic
+            # "test_bugsuite/b021/leaf", declared in this order:
+            #   1. b021_blocked_first  — blocked_authors=[TestBugSuite], so it
+            #      does NOT accept this suite as the publisher.
+            #   2. b021_eligible_second — accepts.
+            # request_event must SKIP the non-eligible first match (it is
+            # earlier in find_all insertion order) and fall through to the
+            # eligible second — proving the 1:1 path uses find_all + the
+            # filter chain, NOT the filter-blind _find_first. A regression to
+            # first-topic-match would either raise "no subscriber" or
+            # dispatch to the blocked handler.
+            self.b021_blocked_calls = 0
+            self.b021_eligible_calls = 0
+            r = await self.request_event(
+                "b021_event", payload={"x": 1}, timeout=2.0,
             )
+            c.expect(r, {"who": "eligible"})
+            c.expect(self.b021_blocked_calls, 0)
+            c.expect(self.b021_eligible_calls, 1)
 
         # ---- B-044 ---------------------------------------------------
         async def body_b_044_silent_truncation_on_error(c):
@@ -1163,12 +1179,12 @@ class TestBugSuite(Plugin):
             hard_timeout_s=10.0,
             **kw,
         )
-        # B-021: skip pending fixture work.
+        # B-021: live regression guard (was skipped pending a fixture).
         await rec.run_case(
             "bug.B-021.request_event_fallthrough_or_fail",
             body_b_021_request_event_fallthrough_or_fail,
             category=category,
-            tags=("bug_repro", "active", "deferred"), bug_ids=("B-021",),
+            tags=("bug_repro", "active"), bug_ids=("B-021",),
             **kw,
         )
         # B-044: FIXED in Stage G. Case now asserts the FIXED behavior
