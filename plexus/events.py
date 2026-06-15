@@ -56,6 +56,7 @@ from .runtime import (
     _bridge_wait,
     _held_permit,
     _sync_call_chain,
+    current_caller_chain,
 )
 from .utils import (
     Event,
@@ -1280,7 +1281,12 @@ class EventMixin:
         # C-004: same-thread deadlock guard.
         self._check_not_loop_thread("publish_event_sync")
         chain = getattr(_sync_call_chain, "chain", ())
-        future = asyncio.run_coroutine_threadsafe(
+        # Rate-limiter Step 2a: also carry the originating sync handler's
+        # IDENTITY across the bridge (distinct from `chain`/`_caller_chain`
+        # above, which is the flat cycle-detection chain). Captured worker-side
+        # via current_caller_chain(), re-seated loop-side by _with_caller_chain.
+        _pub_coro = self._with_caller_chain(
+            current_caller_chain(),
             self.publish_event(
                 publisher,
                 event_id,
@@ -1290,6 +1296,9 @@ class EventMixin:
                 blocked_hosts,
                 _caller_chain=chain,
             ),
+        )
+        future = asyncio.run_coroutine_threadsafe(
+            _pub_coro,
             self.main_event_loop,
         )
         # R2-FF-1: bound the worker-thread wait so a stalled event loop
@@ -1588,7 +1597,10 @@ class EventMixin:
         # C-004: same-thread deadlock guard.
         self._check_not_loop_thread("request_event_sync")
         chain = getattr(_sync_call_chain, "chain", ())
-        future = asyncio.run_coroutine_threadsafe(
+        # Rate-limiter Step 2a: carry the originating sync handler's IDENTITY
+        # across the bridge (distinct from the flat cycle-detection `chain`).
+        _req_coro = self._with_caller_chain(
+            current_caller_chain(),
             self.request_event(
                 publisher,
                 event_id,
@@ -1599,6 +1611,9 @@ class EventMixin:
                 timeout,
                 _caller_chain=chain,
             ),
+        )
+        future = asyncio.run_coroutine_threadsafe(
+            _req_coro,
             self.main_event_loop,
         )
         # R2-FF-1: bound the worker-thread wait — derive from the
@@ -2057,6 +2072,11 @@ class EventMixin:
             timeout,
             _caller_chain=chain,
         )
+        # Rate-limiter Step 2a: capture the originating sync handler's IDENTITY
+        # once (constant across the stream); re-seated loop-side on each pull
+        # below so the open-charge (first __anext__) attributes to the right
+        # caller. Distinct from the flat cycle-detection `chain` above.
+        _es_cap = current_caller_chain()
 
         try:
             while True:
@@ -2066,7 +2086,8 @@ class EventMixin:
                 # caller passed a per-stream budget, else a 60s default
                 # so a runaway handler can't deadlock the worker.
                 next_fut = asyncio.run_coroutine_threadsafe(
-                    async_gen.__anext__(), self.main_event_loop
+                    self._with_caller_chain(_es_cap, async_gen.__anext__()),
+                    self.main_event_loop,
                 )
                 next_timeout = (
                     timeout + 5.0

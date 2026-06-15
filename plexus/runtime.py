@@ -16,7 +16,9 @@ class Plexus methods keep resolving).
 import concurrent.futures
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from contextvars import ContextVar
+from typing import NamedTuple
 
 from .exceptions import RequestException
 
@@ -79,6 +81,108 @@ _MAX_EMIT_DEPTH: int = 5
 # fan-out, same trap _EMIT_DEPTH avoids.
 _EXECUTE_DEPTH: ContextVar[int] = ContextVar("_aio_execute_depth", default=0)
 _MAX_EXECUTE_DEPTH: int = 16
+
+
+# ── Rate-limiter Step 2a: framework-stamped caller identity ───────────
+#
+# "Who is really making this call." At every framework->plugin dispatch the
+# framework PUSHES the identity of the plugin it is about to enter; a plugin
+# that then calls back into execute/publish/request sees its OWN identity as
+# the innermost frame. Read as the authoritative caller for rate-limit
+# attribution (Step 3) and the capability gate (Step 2b); the plugin's
+# ``author`` argument is a separate, gated CLAIM and is never trusted as the
+# identity (design ``ratelimiter_design.md`` Sections 2, 9).
+#
+# Two parallel structures, same shape (a tuple of CallerIdentity,
+# outermost-first), because run_in_executor does NOT propagate a ContextVar
+# into the worker thread (verified in Phase 2b):
+#   _caller_chain        — async path: awaited handlers + tasks spawned via
+#                          create_task (contextvars copy into child tasks).
+#   _sync_caller_chain   — sync path: handlers dispatched onto a pool worker,
+#                          seeded from the loop-side chain captured at dispatch.
+# This is a SEPARATE structure from ``_sync_call_chain`` (the flat
+# "plugin.method" cycle-detection chain): Section 2 forbids reshaping that
+# one, since the ``target in chain`` membership tests depend on its shape.
+#
+# Stamping is CONDITIONAL on a per-Plexus ``_identity_active`` flag (default
+# False; Step 4 flips it from config). With it off, every push/pop below is
+# skipped, so a fully-default node pays nothing per dispatch (the Section 11
+# zero-overhead-when-off contract). Step 2a ships the seam wired but inert.
+
+class CallerIdentity(NamedTuple):
+    """One frame of the caller chain: the entered plugin's name + uuid, plus
+    an ``exempt`` origin marker (Section 8) set when the framework enters a
+    lifecycle hook / internal-origin scope so the whole sub-chain is exempt
+    from charging. ``exempt`` rides every nested frame via the chain."""
+    name: str
+    uuid: str
+    exempt: bool = False
+
+
+_caller_chain: ContextVar[tuple] = ContextVar("_aio_caller_chain", default=())
+_sync_caller_chain = threading.local()
+
+
+def current_caller_chain() -> tuple:
+    """The active caller chain (outermost-first tuple of CallerIdentity).
+
+    Reads the sync threadlocal when this thread is a pool worker running a
+    seeded sync handler (the ContextVar is not visible there); otherwise the
+    async ContextVar. Returns ``()`` when no plugin frame is active.
+    """
+    sync = getattr(_sync_caller_chain, "chain", None)
+    if sync:
+        return sync
+    return _caller_chain.get()
+
+
+@contextmanager
+def caller_chain_scope(ident: "CallerIdentity", active: bool):
+    """Push ``ident`` onto the async caller chain for the block, then pop.
+
+    A no-op when ``active`` is False. Implemented as a sync contextmanager
+    (the set/reset are synchronous) so it wraps an awaited dispatch with a
+    plain ``with`` -- the ContextVar token is reset in the same task that set
+    it, which is correct across the inner ``await``.
+    """
+    if not active:
+        yield
+        return
+    token = _caller_chain.set(_caller_chain.get() + (ident,))
+    try:
+        yield
+    finally:
+        _caller_chain.reset(token)
+
+
+def seeded_sync_chain(active: bool, ident: "CallerIdentity"):
+    """The chain to seed a sync worker's threadlocal with: the loop-side
+    parent chain captured now, plus ``ident``. Returns ``None`` when
+    ``active`` is False so the dispatch wrapper skips the threadlocal write
+    entirely (zero overhead off). Call on the loop thread at dispatch.
+    """
+    if not active:
+        return None
+    return _caller_chain.get() + (ident,)
+
+
+@contextmanager
+def establish_caller_chain(chain: tuple):
+    """REPLACE the async caller chain with ``chain`` for the block, then
+    restore. Used by the sync-bridge handoff: a plugin's sync handler carries
+    its identity in the _sync_caller_chain threadlocal, which is invisible once
+    a sync mirror bridges the operation onto the loop via
+    run_coroutine_threadsafe. The mirror captures the worker chain and re-seats
+    it here so the loop-side dispatch attributes to the originating handler.
+    Distinct from ``caller_chain_scope`` (which APPENDS one frame): the loop
+    context for a freshly-bridged coroutine is empty, so the whole captured
+    chain is set, not appended. The caller guards on an empty chain.
+    """
+    token = _caller_chain.set(chain)
+    try:
+        yield
+    finally:
+        _caller_chain.reset(token)
 
 
 # ── Phase 2b: deadlock-free sync bridge (native, stdlib-only) ──────────

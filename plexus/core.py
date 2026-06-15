@@ -93,6 +93,13 @@ from .runtime import (  # noqa: F401  (re-export shim)
     PLUGIN_EXECUTOR_THREAD_CEILING,
     SYNC_DISPATCHER_THREAD_CEILING,
     SYNC_STREAM_THREAD_CEILING,
+    # Rate-limiter Step 2a: framework-stamped caller-identity primitives.
+    CallerIdentity,
+    _sync_caller_chain,
+    caller_chain_scope,
+    seeded_sync_chain,
+    current_caller_chain,
+    establish_caller_chain,
 )
 
 from .events import EventMixin
@@ -154,6 +161,16 @@ class Plexus(EventMixin):
         # races shutdown and is NOT covered by the 30s in-flight
         # drain. See _spawn_fire_and_forget for the contract.
         self._fire_and_forget: set = set()
+
+        # Rate-limiter Step 2a: master switch for framework-stamped caller
+        # identity (runtime._caller_chain / _sync_caller_chain). When False
+        # (the default) every push/pop at a framework->plugin dispatch is
+        # skipped, so a default node pays zero per dispatch (design Section 11
+        # zero-overhead-when-off). Step 4 recomputes this from config whenever
+        # a rate limit OR capability grant is active; until then it stays off
+        # and the identity machinery ships wired but inert. Tests force it True
+        # to exercise the stamping in isolation.
+        self._identity_active: bool = False
 
         self.main_event_loop = None
         self.plugins = {}
@@ -3500,13 +3517,24 @@ class Plexus(EventMixin):
             on_enable_timeout = getattr(
                 self, "plugin_enable_timeout", DEFAULT_PLUGIN_ENABLE_TIMEOUT
             )
+            # Rate-limiter Step 2a: lifecycle scope is exempt (Section 8). Stamp
+            # an exempt caller frame so execute/publish calls the plugin makes
+            # from inside on_enable inherit the exemption down the chain. The
+            # _core/ + system-origin exemption is a charge-site read (Step 3),
+            # not an identity push, so it is not handled here.
+            _enable_ident = (
+                CallerIdentity(plugin.plugin_name, plugin.plugin_uuid, exempt=True)
+                if self._identity_active else None
+            )
+            _enable_active = _enable_ident is not None
             if asyncio.iscoroutinefunction(plugin.on_enable):
-                if on_enable_timeout is not None:
-                    await asyncio.wait_for(
-                        plugin.on_enable(), timeout=on_enable_timeout
-                    )
-                else:
-                    await plugin.on_enable()
+                with caller_chain_scope(_enable_ident, _enable_active):
+                    if on_enable_timeout is not None:
+                        await asyncio.wait_for(
+                            plugin.on_enable(), timeout=on_enable_timeout
+                        )
+                    else:
+                        await plugin.on_enable()
             else:
                 # C-136: explicit None-check on main_event_loop so a
                 # pre-wait_until_ready call surfaces a clear RuntimeError
@@ -3526,7 +3554,11 @@ class Plexus(EventMixin):
                         f"enable_plugin can run a sync on_enable."
                     )
                 executor_call = self.main_event_loop.run_in_executor(
-                    self._plugin_executor, plugin.on_enable
+                    self._plugin_executor,
+                    self._seed_sync_hook(
+                        plugin.on_enable,
+                        seeded_sync_chain(_enable_active, _enable_ident),
+                    ),
                 )
                 if on_enable_timeout is not None:
                     await asyncio.wait_for(executor_call, timeout=on_enable_timeout)
@@ -3608,17 +3640,29 @@ class Plexus(EventMixin):
                     "plugin_disable_timeout",
                     DEFAULT_PLUGIN_DISABLE_TIMEOUT,
                 )
+                # Rate-limiter Step 2a: rollback on_disable is lifecycle scope
+                # too -> exempt frame (Section 8).
+                _rb_ident = (
+                    CallerIdentity(plugin.plugin_name, plugin.plugin_uuid, exempt=True)
+                    if self._identity_active else None
+                )
+                _rb_active = _rb_ident is not None
                 try:
                     try:
                         if asyncio.iscoroutinefunction(plugin.on_disable):
-                            await asyncio.wait_for(
-                                plugin.on_disable(),
-                                timeout=rollback_disable_timeout,
-                            )
+                            with caller_chain_scope(_rb_ident, _rb_active):
+                                await asyncio.wait_for(
+                                    plugin.on_disable(),
+                                    timeout=rollback_disable_timeout,
+                                )
                         else:
                             await asyncio.wait_for(
                                 self.main_event_loop.run_in_executor(
-                                    self._plugin_executor, plugin.on_disable
+                                    self._plugin_executor,
+                                    self._seed_sync_hook(
+                                        plugin.on_disable,
+                                        seeded_sync_chain(_rb_active, _rb_ident),
+                                    ),
                                 ),
                                 timeout=rollback_disable_timeout,
                             )
@@ -3786,17 +3830,29 @@ class Plexus(EventMixin):
         # cancellation hitting during _unregister_plugin_subscriptions
         # would skip the transition and leave the plugin in a stuck
         # DISABLING state.
+        # Rate-limiter Step 2a: on_disable is lifecycle scope -> exempt frame
+        # (Section 8), same as on_enable.
+        _disable_ident = (
+            CallerIdentity(plugin.plugin_name, plugin.plugin_uuid, exempt=True)
+            if self._identity_active else None
+        )
+        _disable_active = _disable_ident is not None
         try:
             if asyncio.iscoroutinefunction(plugin.on_disable):
-                if on_disable_timeout is not None:
-                    await asyncio.wait_for(
-                        plugin.on_disable(), timeout=on_disable_timeout
-                    )
-                else:
-                    await plugin.on_disable()
+                with caller_chain_scope(_disable_ident, _disable_active):
+                    if on_disable_timeout is not None:
+                        await asyncio.wait_for(
+                            plugin.on_disable(), timeout=on_disable_timeout
+                        )
+                    else:
+                        await plugin.on_disable()
             else:
                 executor_call = self.main_event_loop.run_in_executor(
-                    self._plugin_executor, plugin.on_disable
+                    self._plugin_executor,
+                    self._seed_sync_hook(
+                        plugin.on_disable,
+                        seeded_sync_chain(_disable_active, _disable_ident),
+                    ),
                 )
                 if on_disable_timeout is not None:
                     await asyncio.wait_for(executor_call, timeout=on_disable_timeout)
@@ -4687,6 +4743,9 @@ class Plexus(EventMixin):
             author_host,
             request_id,
         )
+        # Rate-limiter Step 2a: carry the originating sync handler's identity
+        # across the bridge (captured worker-side, re-seated loop-side).
+        coro = self._with_caller_chain(current_caller_chain(), coro)
         future = asyncio.run_coroutine_threadsafe(coro, self.main_event_loop)
         # R2-FF-1: bound the worker-thread wait so a stalled event loop
         # (deadlock, long GC pause, racing shutdown) cannot block the
@@ -4810,6 +4869,9 @@ class Plexus(EventMixin):
             request_id,
             _post_construct_hook=_post_construct_hook,
         )
+        # Rate-limiter Step 2a: carry the originating sync handler's identity
+        # across the bridge (captured worker-side, re-seated loop-side).
+        coro = self._with_caller_chain(current_caller_chain(), coro)
         future = asyncio.run_coroutine_threadsafe(coro, self.main_event_loop)
         # R2-FF-1: bound the worker-thread wait — see create_request_sync.
         request_timeout = timeout[0] if isinstance(timeout, tuple) else timeout
@@ -5443,6 +5505,41 @@ class Plexus(EventMixin):
             # under cancel mid-finally.
             self.requests.pop(request.id, None)
 
+    async def _with_caller_chain(self, chain, coro):
+        """Rate-limiter Step 2a: re-seat a worker-captured caller chain onto the
+        loop for ``coro``'s lifetime (the sync-bridge handoff).
+
+        A plugin's sync handler carries its identity in the _sync_caller_chain
+        threadlocal; that threadlocal is invisible once a sync mirror bridges
+        the operation back onto the loop via run_coroutine_threadsafe. The
+        mirror captures ``current_caller_chain()`` worker-side and passes it
+        here so the loop-side dispatch attributes to the originating handler,
+        not an empty caller. No-op when the captured chain is empty (identity
+        off, or a non-plugin top-level sync caller -- nothing to attribute)."""
+        if not chain:
+            return await coro
+        with establish_caller_chain(chain):
+            return await coro
+
+    def _seed_sync_hook(self, fn, seed):
+        """Rate-limiter Step 2a: wrap a bare sync callable (a lifecycle hook
+        dispatched via ``run_in_executor`` with no ``_tracked`` wrapper of its
+        own) so it seeds the worker caller-identity threadlocal from ``seed``
+        and clears it on return. Returns ``fn`` unchanged when ``seed`` is None
+        (identity inactive), so the off path adds nothing. The async ContextVar
+        is invisible on the worker, hence the explicit seed."""
+        if seed is None:
+            return fn
+
+        def _seeded(*a, **kw):
+            _sync_caller_chain.chain = seed
+            try:
+                return fn(*a, **kw)
+            finally:
+                _sync_caller_chain.chain = ()
+
+        return _seeded
+
     async def _call_endpoint(
         self,
         func: Callable,
@@ -5461,6 +5558,24 @@ class Plexus(EventMixin):
         ``_plugin_executor``. The execute path (``request is None`` OR
         ``request.kind == "execute"``) takes ZERO new code paths.
         """
+        # Rate-limiter Step 2a: stamp the identity of the plugin we are about
+        # to enter so its own callbacks into execute/publish read it as the
+        # innermost caller. Identity comes from the RESOLVED plugin instance
+        # bound to ``func`` (``func.__self__``), NOT request.target_plugin_uuid
+        # -- the latter is None whenever the caller addressed the target by name
+        # only (the dominant case). The bound method's owner is the exact plugin
+        # whose code runs, so it carries both the real name and the real uuid.
+        # The sync seed is captured HERE on the loop thread (the worker can't
+        # see the async ContextVar) and written into the worker threadlocal.
+        _target = getattr(func, "__self__", None)
+        _tname = getattr(_target, "plugin_name", None)
+        _id_active = self._identity_active and _tname is not None
+        ident = (
+            CallerIdentity(_tname, getattr(_target, "plugin_uuid", None))
+            if _id_active else None
+        )
+        _sync_seed = seeded_sync_chain(_id_active, ident)
+
         # PR3 Stage A: kind-aware Event branch. Only fires for event
         # kinds; the execute path (kind="execute" or no request) falls
         # through to the original implementation untouched.
@@ -5472,7 +5587,8 @@ class Plexus(EventMixin):
 
             if asyncio.iscoroutinefunction(func):
                 # Async handlers awaited directly on the main event loop.
-                return await func(event)
+                with caller_chain_scope(ident, _id_active):
+                    return await func(event)
 
             # Sync event handlers run on the dedicated SyncDispatcher
             # executor (Q17 + C3 + C8). run_in_executor pattern — NOT
@@ -5481,10 +5597,14 @@ class Plexus(EventMixin):
             # 30s shutdown drain.
             def _tracked_event(ev):
                 _sync_call_chain.chain = call_chain
+                if _sync_seed is not None:
+                    _sync_caller_chain.chain = _sync_seed
                 try:
                     return func(ev)
                 finally:
                     _sync_call_chain.chain = ()
+                    if _sync_seed is not None:
+                        _sync_caller_chain.chain = ()
 
             return await self.main_event_loop.run_in_executor(
                 self.sync_dispatcher.executor, _tracked_event, event
@@ -5492,21 +5612,26 @@ class Plexus(EventMixin):
 
         # Execute path — unchanged from PR2 behavior.
         if asyncio.iscoroutinefunction(func):
-            if isinstance(args, tuple):
-                return await func(*args)
-            if isinstance(args, dict):
-                return await func(**args)
-            if args is None:
-                return await func()
-            return await func(args)
+            with caller_chain_scope(ident, _id_active):
+                if isinstance(args, tuple):
+                    return await func(*args)
+                if isinstance(args, dict):
+                    return await func(**args)
+                if args is None:
+                    return await func()
+                return await func(args)
 
         # sync function -> threadpool, propagate call chain for cycle detection
         def _tracked(*a, **kw):
             _sync_call_chain.chain = call_chain
+            if _sync_seed is not None:
+                _sync_caller_chain.chain = _sync_seed
             try:
                 return func(*a, **kw)
             finally:
                 _sync_call_chain.chain = ()
+                if _sync_seed is not None:
+                    _sync_caller_chain.chain = ()
 
         if isinstance(args, tuple):
             return await self.main_event_loop.run_in_executor(
@@ -5655,6 +5780,21 @@ class Plexus(EventMixin):
                     )
                     return
 
+                # Rate-limiter Step 2a: stamp the target plugin's identity for
+                # the generator's lifetime (its code runs the plugin's). Local
+                # branch only -- a RemotePlugin stream runs on the peer and is
+                # gated by Nodes-IN there, not a local identity here. Identity
+                # comes from the resolved ``plugin`` instance (real name + uuid),
+                # NOT request.target_plugin_uuid (None on name-only addressing).
+                # The sync seed is captured on the loop and written into the
+                # worker by _next_with_chain below.
+                _stream_active = self._identity_active
+                _stream_ident = (
+                    CallerIdentity(plugin.plugin_name, plugin.plugin_uuid)
+                    if _stream_active else None
+                )
+                _stream_seed = seeded_sync_chain(_stream_active, _stream_ident)
+
                 if asyncio.iscoroutinefunction(func):
                     await self._set_gen_request_result(
                         request,
@@ -5664,18 +5804,19 @@ class Plexus(EventMixin):
                     return
 
                 elif inspect.isasyncgenfunction(func):
-                    if isinstance(request.args, tuple):
-                        async for result in func(*request.args):
-                            await request.queue.put((result, False, False))
-                    elif isinstance(request.args, dict):
-                        async for result in func(**request.args):
-                            await request.queue.put((result, False, False))
-                    elif request.args is None:
-                        async for result in func():
-                            await request.queue.put((result, False, False))
-                    else:
-                        async for result in func(request.args):
-                            await request.queue.put((result, False, False))
+                    with caller_chain_scope(_stream_ident, _stream_active):
+                        if isinstance(request.args, tuple):
+                            async for result in func(*request.args):
+                                await request.queue.put((result, False, False))
+                        elif isinstance(request.args, dict):
+                            async for result in func(**request.args):
+                                await request.queue.put((result, False, False))
+                        elif request.args is None:
+                            async for result in func():
+                                await request.queue.put((result, False, False))
+                        else:
+                            async for result in func(request.args):
+                                await request.queue.put((result, False, False))
 
                 elif inspect.isgeneratorfunction(func):
                     if isinstance(request.args, tuple):
@@ -5709,10 +5850,14 @@ class Plexus(EventMixin):
 
                     def _next_with_chain(g, sent, ch):
                         _sync_call_chain.chain = ch
+                        if _stream_seed is not None:
+                            _sync_caller_chain.chain = _stream_seed
                         try:
                             return next(g, sent)
                         finally:
                             _sync_call_chain.chain = ()
+                            if _stream_seed is not None:
+                                _sync_caller_chain.chain = ()
 
                     sentinel = object()
                     while True:
@@ -5871,18 +6016,32 @@ class Plexus(EventMixin):
 
             first = True
 
+            # Rate-limiter Step 2a: identity of the subscriber plugin whose
+            # streaming handler we are about to pull. Stamped around each
+            # generator pull (where the plugin's code runs), not across the
+            # queue.put between pulls (framework code).
+            _es_active = self._identity_active
+            _es_ident = (
+                CallerIdentity(
+                    target_plugin.plugin_name, target_plugin.plugin_uuid
+                )
+                if _es_active else None
+            )
+            _es_seed = seeded_sync_chain(_es_active, _es_ident)
+
             if inspect.isasyncgenfunction(func):
                 ait = func(event_meta).__aiter__()
                 try:
                     while True:
                         rem = _residual()
                         try:
-                            if rem is None:
-                                chunk = await ait.__anext__()
-                            else:
-                                chunk = await asyncio.wait_for(
-                                    ait.__anext__(), timeout=rem
-                                )
+                            with caller_chain_scope(_es_ident, _es_active):
+                                if rem is None:
+                                    chunk = await ait.__anext__()
+                                else:
+                                    chunk = await asyncio.wait_for(
+                                        ait.__anext__(), timeout=rem
+                                    )
                         except StopAsyncIteration:
                             break
                         except asyncio.TimeoutError as e:
@@ -5922,7 +6081,10 @@ class Plexus(EventMixin):
                             await request.queue.put((chunk, False, False))
                 finally:
                     with contextlib.suppress(Exception):
-                        await ait.aclose()
+                        # Generator cleanup may run the plugin's finally blocks
+                        # (which could call execute); keep identity stamped.
+                        with caller_chain_scope(_es_ident, _es_active):
+                            await ait.aclose()
             else:
                 # Sync generator branch — chain propagation +
                 # sync_stream_dispatcher.executor (C-072: dedicated
@@ -5946,10 +6108,14 @@ class Plexus(EventMixin):
 
                 def _next_with_chain(g, sent, ch):
                     _sync_call_chain.chain = ch
+                    if _es_seed is not None:
+                        _sync_caller_chain.chain = _es_seed
                     try:
                         return next(g, sent)
                     finally:
                         _sync_call_chain.chain = ()
+                        if _es_seed is not None:
+                            _sync_caller_chain.chain = ()
 
                 try:
                     while True:
@@ -6111,6 +6277,15 @@ class Plexus(EventMixin):
         async def _emit_depth_isolated():
             token = _EMIT_DEPTH.set(0)
             try:
+                # Rate-limiter Step 2a note: the caller-identity chain is
+                # deliberately NOT isolated here. create_task copies the parent
+                # context, and every _spawn_tracked callee is a PER-OPERATION
+                # task (request dispatch, fan-out delivery, stream producer), so
+                # the copied chain is genuine caller ancestry -- exactly what the
+                # capability "ancestor" scope and exemption propagation read.
+                # Isolating would sever it (a sync-bridge / fan-out target would
+                # lose its caller). _EMIT_DEPTH is a recursion guard and DOES
+                # reset; identity is ancestry and must not.
                 return await coro
             finally:
                 _EMIT_DEPTH.reset(token)
@@ -6207,6 +6382,15 @@ class Plexus(EventMixin):
         async def _emit_depth_isolated():
             token = _EMIT_DEPTH.set(0)
             try:
+                # Rate-limiter Step 2a note: the caller-identity chain is
+                # deliberately NOT isolated here. create_task copies the parent
+                # context, and every _spawn_tracked callee is a PER-OPERATION
+                # task (request dispatch, fan-out delivery, stream producer), so
+                # the copied chain is genuine caller ancestry -- exactly what the
+                # capability "ancestor" scope and exemption propagation read.
+                # Isolating would sever it (a sync-bridge / fan-out target would
+                # lose its caller). _EMIT_DEPTH is a recursion guard and DOES
+                # reset; identity is ancestry and must not.
                 return await coro
             finally:
                 _EMIT_DEPTH.reset(token)
@@ -6440,21 +6624,24 @@ class Plexus(EventMixin):
 
         depth_token = _EXECUTE_DEPTH.set(execute_depth + 1)
         try:
+            # Rate-limiter Step 2a: capture the originating sync handler's
+            # identity worker-side, re-seat it loop-side across the bridge.
+            _exec_coro = self._execute_sync_tracked(
+                chain + (target,),
+                plugin,
+                method,
+                args,
+                plugin_uuid,
+                hosts,
+                blocked_hosts,
+                author,
+                author_id,
+                timeout,
+                author_host,
+                request_id,
+            )
             future = asyncio.run_coroutine_threadsafe(
-                self._execute_sync_tracked(
-                    chain + (target,),
-                    plugin,
-                    method,
-                    args,
-                    plugin_uuid,
-                    hosts,
-                    blocked_hosts,
-                    author,
-                    author_id,
-                    timeout,
-                    author_host,
-                    request_id,
-                ),
+                self._with_caller_chain(current_caller_chain(), _exec_coro),
                 self.main_event_loop,
             )
             # R2-FF-1: bound the worker-thread wait — see create_request_sync.

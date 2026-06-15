@@ -107,6 +107,15 @@ plugins:
     enabled: true
     path: ./plugins_test/TestRuntimeToggleSuite
 
+  # Rate-limiter Step 2a caller-identity stamping suite + its lifecycle target.
+  - name: TestIdentitySuite
+    enabled: true
+    path: ./plugins_test/TestIdentitySuite
+
+  - name: TestIdentityTarget
+    enabled: true
+    path: ./plugins_test/TestIdentityTarget
+
   # PR2 fixture plugins — loaded on-demand by TestPR2Suite (§5.4 idiom).
   # enabled:false so they don't auto-start at test framework boot.
   - name: TestPR2Fixture
