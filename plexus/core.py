@@ -3452,7 +3452,7 @@ class Plexus(EventMixin):
                 return
             # Register YAML subs FIRST. Disabled subs (Q13 `enabled:
             # false`) ARE registered, but with the Subscription.enabled=
-            # False flag so find_all/find_first skip them. Broadcast of
+            # False flag so find_all (and _find_first) skip them. Broadcast of
             # add-deltas happens AFTER plugin_lock release (below) — see
             # the Network I/O note in the lock-ordering rule.
             new_sub_uuids = await self._register_yaml_subscriptions(plugin)

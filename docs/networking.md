@@ -196,7 +196,7 @@ When `find_endpoint` finds the endpoint on a `RemotePlugin` proxy instead of a l
 ```
    Local Plexus.request_event
      |
-     | find_first(topic) on local registry
+     | find_all(topic) on local registry, take first sub past filter chain
      |     ├── hit -> dispatch locally, return
      |     └── miss -> proceed to remote candidates
      |

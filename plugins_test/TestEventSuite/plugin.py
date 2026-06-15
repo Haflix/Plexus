@@ -898,8 +898,10 @@ class TestEventSuite(Plugin):
             c.expect(len(no_match), 0)
 
         async def body_yaml_order_wildcard_first(c):
-            # request_event uses find_first → returns FIRST YAML-declared
-            # match. order_wildcard_first declared first, order_exact_second
+            # request_event walks find_all in YAML insertion order and
+            # returns the first match that passes the filter chain. With no
+            # filters rejecting here, that's the FIRST YAML-declared match.
+            # order_wildcard_first declared first, order_exact_second
             # second. Both match "test_event/order/exactmatch/leaf" — the
             # wildcard wins because it was declared first.
             self._reset_self_mailboxes()
@@ -1235,8 +1237,8 @@ class TestEventSuite(Plugin):
                 )
                 try:
                     # The pre-existing smoke_request_sub on the suite still
-                    # matches the same topic. find_first iterates YAML
-                    # insertion order and the suite's smoke_request_sub
+                    # matches the same topic. request_event iterates find_all
+                    # in YAML insertion order and the suite's smoke_request_sub
                     # comes BEFORE the runtime-added bad_actor sub
                     # (runtime subs are appended). request_event would
                     # therefore hit the suite's working handler, NOT the

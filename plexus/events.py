@@ -388,7 +388,7 @@ class EventMixin:
         Disabled subs (``enabled: false``) get a Subscription with
         ``enabled=False`` so they live in the registry (visible to
         introspection / future advertisement) but are skipped by
-        find_all/find_first matching.
+        find_all (and _find_first) matching.
 
         C-056: atomic — if any single subscribe() call raises mid-loop,
         roll back the subs already registered in this invocation so the

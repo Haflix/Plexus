@@ -764,13 +764,13 @@ class TestBugSuite(Plugin):
         async def body_b_056_disabled_subs_excluded(c):
             # B-056: disabled YAML subs registered with enabled=False.
             # Verify topic_registry contains the disabled sub with
-            # `.enabled == False`, AND find_first skips it.
+            # `.enabled == False`, AND _find_first skips it.
             #
             # The TestEventSuite YAML declares `disabled_event` (an
             # event with `enabled: false`) — but no matching sub for
             # it. Use a runtime sub instead: register one, mark it
             # disabled directly on the registry entry, then verify
-            # find_first returns no eligible subscriber.
+            # _find_first returns no eligible subscriber.
             topic = "test_bugsuite/B056/disabled_probe"
             sub_uuid = await self.subscribe(
                 topic,
@@ -787,14 +787,15 @@ class TestBugSuite(Plugin):
                     )
                 # Toggle to disabled.
                 owned[0].enabled = False
-                # find_all should still return the sub (enabled is a
-                # post-filter); find_first/eligibility must skip it.
+                # Disabled subs are skipped at match time (enabled is
+                # checked inside find_all), so _find_first must return no
+                # eligible subscriber for this topic.
                 found = (
-                    await self._plexus.topic_registry.find_first(topic)
+                    await self._plexus.topic_registry._find_first(topic)
                 )
                 if found is not None and found.sub_uuid == sub_uuid:
                     raise AssertionError(
-                        "B-056: find_first returned a disabled sub "
+                        "B-056: _find_first returned a disabled sub "
                         "(enabled=False not honored)"
                     )
             finally:
@@ -882,17 +883,16 @@ class TestBugSuite(Plugin):
 
         # ---- B-021 ---------------------------------------------------
         async def body_b_021_request_event_fallthrough_or_fail(c):
-            # B-021: find_first/request_event ordering may still cause
-            # non-eligible-sub-blocks-eligible-sub on the new
-            # request_event path. Investigation requires constructing a
-            # deliberate sub ordering with private/public endpoint pair
-            # and exercising request_event's fall-through behavior end
-            # to end. The framework state available from inside a
-            # running suite doesn't cleanly support adding two
-            # competing subs on the same topic (and the existing
-            # priv_endpoint fixture is not paired with a public
-            # alternative on the same topic). Skip with note pointing
-            # at the structural investigation.
+            # B-021: does a non-eligible sub (earlier in insertion order)
+            # block an eligible one on the request_event path? Code says
+            # NO — request_event walks find_all and selects the first sub
+            # that PASSES the filter chain (filtered next(); non-eligible
+            # subs are skipped, search continues). It does NOT use the
+            # filter-blind _find_first. A dedicated fixture (two competing
+            # subs on one topic, the first non-eligible) would turn that
+            # into a live regression guard; existing fixtures don't provide
+            # the pairing (priv_endpoint isn't paired with a public
+            # alternative on the same topic). Skip pending that fixture.
             c.skip(
                 "STAGE_F_FIXME: request_event fall-through investigation "
                 "requires deliberate sub ordering plus paired "

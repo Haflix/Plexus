@@ -208,10 +208,18 @@ the subscription itself.
 The topic registry (`TopicRegistry` in `plexus.notifier`) stores
 subscriptions in a single insertion-ordered dict keyed by `sub_uuid`.
 
-- `find_all(topic)` iterates all subs in insertion order, returns every
-  sub whose `topic_pattern` matches.
-- `find_first(topic)` iterates in insertion order, returns the first
-  match.
+- `find_all(topic)` iterates all subs in insertion order and returns every
+  enabled sub whose `topic_pattern` matches. This is a TOPIC match only —
+  it does **not** apply the host / author / blocked filter chain (that is
+  the dispatcher's job, see below).
+
+Request-by-topic (`request_event` / `request_event_stream`) does **not**
+just take the first topic match. It walks `find_all` in insertion order
+and selects the first candidate that *also* passes the full filter chain,
+so a non-eligible sub earlier in the order (e.g. one that blocks the
+publisher) is **skipped**, not allowed to block an eligible later one.
+(There is an internal, filter-blind `_find_first` helper used only for
+introspection/tests — never route off it.)
 
 There is **no exact-then-wildcard split.** Insertion order alone
 determines tie-breaks. For example, with two subs in this order:
@@ -219,9 +227,11 @@ determines tie-breaks. For example, with two subs in this order:
 1. `messages/*` (registered first)
 2. `messages/incoming` (registered second)
 
-A publish to `messages/incoming` matches both. `find_first` returns
-sub 1 (the wildcard) because it was registered first. If you want the
-exact match to win, register it first.
+A publish to `messages/incoming` matches both. `request_event` returns
+sub 1 (the wildcard) because it was registered first *and* passes the
+filters; if sub 1 were filtered out (it blocks the publisher, wrong host,
+etc.) request_event falls through to sub 2. If you want the exact match
+to win unconditionally, register it first.
 
 Disabled subs (`enabled: false`) are skipped at match time but stay in
 the registry for advert / introspection.
@@ -230,7 +240,7 @@ the registry for advert / introspection.
 
 ## The filter chain
 
-For every candidate subscription found by `find_all` / `find_first`, the
+For every candidate subscription found by `find_all`, the
 framework runs a chain of filters. Any filter that rejects drops the
 candidate; only candidates that survive every filter actually receive
 the event. Each filter is a separate predicate so the rules compose
@@ -306,7 +316,7 @@ deployment without removing the YAML.
 
 - Stay in the registry — visible to introspection and advertised to
   peers.
-- Skipped by `find_all` and `find_first` at match time.
+- Skipped by `find_all` at match time.
 
 Useful for feature flags and for advertising future bindings without
 activating them yet.

@@ -104,7 +104,7 @@ class Subscription:
       * ``hosts`` / ``blocked_hosts`` / ``authors`` / ``blocked_authors``
         — receiver-side filter chain.
       * ``enabled`` — opt-out flag, default True. Disabled subs are
-        registered but skipped by ``find_all`` / ``find_first``.
+        registered but skipped by ``find_all`` (and ``_find_first``).
     """
 
     # Identity
@@ -192,7 +192,7 @@ class TopicRegistry:
 
     PR3 Stage B: subscriptions are stored in a SINGLE insertion-ordered
     dict (``self._subs`` keyed by sub_uuid; Python dicts preserve
-    insertion order natively). ``find_all`` and ``find_first`` iterate
+    insertion order natively). ``find_all`` (and ``_find_first``) iterate
     this single dict so YAML declaration order alone determines
     matching order — fixing the LOCKED C tie-break (a wildcard sub
     declared FIRST in YAML must win over an exact-match sub declared
@@ -428,6 +428,11 @@ class TopicRegistry:
         subs (``enabled is False``) are skipped — they stay in the
         registry for advertisement-protocol introspection but are
         never dispatched.
+
+        Matches on topic + ``enabled`` ONLY. It does NOT apply the
+        host / author / blocked filter chain — that is the dispatcher's
+        job (EventMixin applies ``_sub_accepts_local`` / ``_sub_accepts_author``
+        per candidate). Do not route off this list without those filters.
         """
         results: List[Subscription] = []
         async with self._lock:
@@ -484,13 +489,18 @@ class TopicRegistry:
                     results.append(sub)
         return results
 
-    async def find_first(self, topic: str) -> Optional[Subscription]:
+    async def _find_first(self, topic: str) -> Optional[Subscription]:
         """
-        Find the first matching subscription (for request-by-topic).
+        First TOPIC-matching subscription in insertion order (LOCKED C).
 
-        PR3 Stage B (LOCKED C): single iteration over insertion-ordered
-        store; first match wins. NO config-driven preference logic —
-        YAML declaration order alone decides.
+        INTERNAL / filter-blind. Like :meth:`find_all`, this matches on
+        topic + ``enabled`` ONLY — it does NOT apply the host / author /
+        blocked filter chain. It is therefore NOT a routing primitive:
+        never use it to pick a request-by-topic target, or you bypass the
+        authorization filters. ``request_event`` deliberately does NOT call
+        this — it walks :meth:`find_all` and selects the first candidate
+        that passes the full filter chain (see EventMixin.request_event).
+        Kept private for introspection/tests only.
         """
         all_subs = await self.find_all(topic)
         return all_subs[0] if all_subs else None
@@ -518,7 +528,7 @@ class TopicRegistry:
         which has no defined iteration order; we walk ``_subs`` (a
         Python 3.7+ insertion-ordered dict) and filter, ensuring
         introspection callers see a deterministic ordering matching
-        find_all/find_first behavior.
+        find_all/_find_first behavior.
         """
         async with self._lock:
             sub_uuids = self._by_plugin.get(plugin_uuid, set())
