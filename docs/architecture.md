@@ -253,11 +253,11 @@ Nothing leaks across the swap. The instance attributes a plugin set in its previ
 `Plexus.close()` walks a deterministic sequence so dependents wind down before their dependencies:
 
 1. Wait up to 30 seconds for in-flight tracked tasks; cancel survivors.
-2. Shut the `SyncDispatcher` down with `wait=True` and a 30-second budget. Falls back to `wait=False` on timeout.
-3. **Disable plugins in REVERSE config order.** Each `on_disable` gets a 30-second cap (hardcoded for shutdown). Different plugins do not block each other — their per-plugin lifecycle locks are independent.
-4. Sweep stranded plugin-source per-logger thresholds.
+2. **Disable plugins in REVERSE config order.** Each `on_disable` gets a 30-second cap (hardcoded for shutdown). Different plugins do not block each other — their per-plugin lifecycle locks are independent.
+3. Sweep stranded plugin-source per-logger thresholds.
+4. Shut down BOTH sync dispatchers (the event-handler pool, then the streaming pool) with `wait=True` and a 30-second budget each; on timeout the in-flight shutdown is left running and `close()` continues. They drain AFTER the disable loop so a sync `on_disable` that publishes an event still has a pool to run on.
 5. Stop `NetworkManager` if present.
-6. Shut down the plugin executor with `wait=False`.
+6. Shut down the main plugin executor with `wait=True, cancel_futures=True`: pending submissions are cancelled and running sync threads are joined before `close()` returns.
 
 Reverse-order shutdown is deliberate: an orchestrator that depends on `Postgres` is disabled before `Postgres` is, so it has a chance to flush state cleanly.
 

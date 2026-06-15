@@ -15,10 +15,11 @@ Single-level wildcard "*" is supported: "sensor/*/temperature" matches
 
 import asyncio
 import logging
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import ClassVar, Dict, List, Optional, Set, Tuple, Union
 from uuid import uuid4
+
+from .runtime import GatedExecutor
 
 
 class SyncDispatcher:
@@ -47,13 +48,25 @@ class SyncDispatcher:
     def __init__(
         self,
         workers: int = 12,
+        thread_ceiling: int = 32,
+        name: str = "sync-notifier",
         logger: Optional[logging.Logger] = None,
     ) -> None:
         self._workers = max(1, int(workers))
         self._logger = logger or logging.getLogger(__name__)
-        self.executor = ThreadPoolExecutor(
-            max_workers=self._workers,
-            thread_name_prefix="sync-notifier",
+        # Phase 2b: the dispatch executor is now a GatedExecutor — ``workers``
+        # is its execution budget (E) and ``thread_ceiling`` its hard thread
+        # ceiling (M). ``.executor`` IS the GatedExecutor, so existing
+        # ``run_in_executor(dispatcher.executor, ...)`` dispatch sites and the
+        # ``.executor.shutdown(...)`` teardown in Plexus.close() are unchanged.
+        # ``name`` is the GatedExecutor identity: the worker thread_name_prefix
+        # AND the pool named in saturation errors, so the RPC and stream pools
+        # are distinguishable. Defaults to "sync-notifier" (the RPC pool's
+        # historical prefix, which a sync-event-handler thread-name test pins).
+        self.executor = GatedExecutor(
+            name,
+            exec_permits=self._workers,
+            thread_ceiling=thread_ceiling,
         )
         self._logger.debug(
             "SyncDispatcher initialized with %d worker(s)", self._workers

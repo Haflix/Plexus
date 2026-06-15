@@ -38,6 +38,18 @@ general:
     file_log_level: "DEBUG"       # Log level written to file (DEBUG, INFO, WARNING, etc.)
     asyncio_debug: false          # Enable asyncio debug mode (tracks coroutine creation, slow callbacks)
 
+    # Sync-bridge thread pools. Each pool has an execution budget (how many
+    # sync endpoint bodies run at once) and a hard thread ceiling (runaway
+    # backstop; on saturation the call loud-rejects rather than spawning
+    # unbounded threads). The ceiling is auto-raised to the worker count if
+    # you set workers higher. See docs/configuration.md.
+    sync_executor_workers: 32           # main sync-endpoint pool concurrency (E)
+    sync_executor_thread_ceiling: 128   # main sync-endpoint pool thread ceiling (M)
+    sync_dispatcher_workers: 4          # sync event-handler pool concurrency (E)
+    sync_dispatcher_thread_ceiling: 32  # sync event-handler pool thread ceiling (M)
+    sync_stream_workers: 4              # sync streaming-generator pool concurrency (E)
+    sync_stream_thread_ceiling: 16      # sync streaming-generator pool thread ceiling (M)
+
     # Per-logger thresholds. String value = same level for both handlers; or use
     # explicit form { console: ..., file: ... } for an independent split.
     # Levels: DEBUG | INFO | WARNING | ERROR | CRITICAL | MUTE.

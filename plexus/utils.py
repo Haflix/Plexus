@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 import asyncio
-import concurrent.futures
 import contextlib
 import dataclasses
 import datetime
@@ -32,6 +31,12 @@ from .decorators import (
 )
 from .exceptions import RequestException, ConfigException
 from .plugin_state import State
+# Phase 2b: the sync-bridge choke point + carrier poison flag. runtime.py
+# imports nothing from the package except exceptions, so this top-level
+# import introduces no cycle (utils.py previously dodged the timeouts via a
+# local import; the bridge helpers must be module-level for the *_sync park
+# sites below).
+from .runtime import _bridge_wait, _held_permit
 from colorama import Fore, Style
 
 
@@ -2032,6 +2037,13 @@ class Plugin(ABC):
         handler= path here — sync callers running on a worker thread
         should use the declarative target_access_name shape."""
         self._check_framework_started()
+        # Phase 2b: poison fail-fast (see Plexus.execute_sync).
+        if getattr(_held_permit, "poisoned", False):
+            raise RequestException(
+                "sync bridge gave up its execution permit under "
+                "saturation/shutdown; this call chain must unwind (do not "
+                "make further sync-bridge calls)."
+            )
         # C-004: same-thread deadlock guard.
         self._plexus._check_not_loop_thread("subscribe_sync")
         future = asyncio.run_coroutine_threadsafe(
@@ -2053,16 +2065,20 @@ class Plugin(ABC):
         # cannot block the caller forever. Control-plane subscribe op
         # has no caller-supplied timeout; use a generous default.
         # TODO: thread an explicit caller timeout through if needed.
-        try:
-            return future.result(timeout=60.0)
-        except concurrent.futures.TimeoutError:
-            future.cancel()
-            raise
+        # Phase 2b: free E while parked; _bridge_wait owns cancel-on-timeout.
+        return _bridge_wait(future, 60.0)
 
     @log_errors
     def unsubscribe_sync(self, sub_uuid: str) -> bool:
         """Sync variant of unsubscribe (C16)."""
         self._check_framework_started()
+        # Phase 2b: poison fail-fast (see Plexus.execute_sync).
+        if getattr(_held_permit, "poisoned", False):
+            raise RequestException(
+                "sync bridge gave up its execution permit under "
+                "saturation/shutdown; this call chain must unwind (do not "
+                "make further sync-bridge calls)."
+            )
         # C-004: same-thread deadlock guard.
         self._plexus._check_not_loop_thread("unsubscribe_sync")
         future = asyncio.run_coroutine_threadsafe(
@@ -2070,11 +2086,8 @@ class Plugin(ABC):
             self._plexus.main_event_loop,
         )
         # R2-FF-1: bound the worker-thread wait — see subscribe_sync.
-        try:
-            return future.result(timeout=60.0)
-        except concurrent.futures.TimeoutError:
-            future.cancel()
-            raise
+        # Phase 2b: free E while parked; _bridge_wait owns cancel-on-timeout.
+        return _bridge_wait(future, 60.0)
 
     @async_log_errors
     async def set_subscription_enabled(self, sub_uuid: str, enabled: bool) -> bool:
@@ -2093,6 +2106,13 @@ class Plugin(ABC):
     def set_subscription_enabled_sync(self, sub_uuid: str, enabled: bool) -> bool:
         """Sync variant of ``set_subscription_enabled``."""
         self._check_framework_started()
+        # Phase 2b: poison fail-fast (see Plexus.execute_sync).
+        if getattr(_held_permit, "poisoned", False):
+            raise RequestException(
+                "sync bridge gave up its execution permit under "
+                "saturation/shutdown; this call chain must unwind (do not "
+                "make further sync-bridge calls)."
+            )
         # C-004: same-thread deadlock guard.
         self._plexus._check_not_loop_thread("set_subscription_enabled_sync")
         future = asyncio.run_coroutine_threadsafe(
@@ -2100,11 +2120,8 @@ class Plugin(ABC):
             self._plexus.main_event_loop,
         )
         # R2-FF-1: bound the worker-thread wait — see subscribe_sync.
-        try:
-            return future.result(timeout=60.0)
-        except concurrent.futures.TimeoutError:
-            future.cancel()
-            raise
+        # Phase 2b: free E while parked; _bridge_wait owns cancel-on-timeout.
+        return _bridge_wait(future, 60.0)
 
     @async_log_errors
     async def set_event_enabled(self, event_id: str, enabled: bool) -> bool:
@@ -2127,6 +2144,13 @@ class Plugin(ABC):
     def set_event_enabled_sync(self, event_id: str, enabled: bool) -> bool:
         """Sync variant of ``set_event_enabled``."""
         self._check_framework_started()
+        # Phase 2b: poison fail-fast (see Plexus.execute_sync).
+        if getattr(_held_permit, "poisoned", False):
+            raise RequestException(
+                "sync bridge gave up its execution permit under "
+                "saturation/shutdown; this call chain must unwind (do not "
+                "make further sync-bridge calls)."
+            )
         # C-004: same-thread deadlock guard.
         self._plexus._check_not_loop_thread("set_event_enabled_sync")
         future = asyncio.run_coroutine_threadsafe(
@@ -2136,11 +2160,8 @@ class Plugin(ABC):
             self._plexus.main_event_loop,
         )
         # R2-FF-1: bound the worker-thread wait — see subscribe_sync.
-        try:
-            return future.result(timeout=60.0)
-        except concurrent.futures.TimeoutError:
-            future.cancel()
-            raise
+        # Phase 2b: free E while parked; _bridge_wait owns cancel-on-timeout.
+        return _bridge_wait(future, 60.0)
 
     @log_errors
     @abstractmethod
@@ -2318,6 +2339,14 @@ class Request:
 
     def get_result_sync(self) -> Any:
         """Get the result synchronously."""
+        # Phase 2b: poison fail-fast (see Plexus.execute_sync). This park is
+        # load-bearing — it waits for the actual endpoint body.
+        if getattr(_held_permit, "poisoned", False):
+            raise RequestException(
+                "sync bridge gave up its execution permit under "
+                "saturation/shutdown; this call chain must unwind (do not "
+                "make further sync-bridge calls)."
+            )
         future = asyncio.run_coroutine_threadsafe(
             self.wait_for_result_async(), self.event_loop
         )
@@ -2330,11 +2359,8 @@ class Request:
             if isinstance(timeout_duration, (int, float))
             else 60.0
         )
-        try:
-            result, error, timed_out = future.result(timeout=wait_timeout)
-        except concurrent.futures.TimeoutError:
-            future.cancel()
-            raise
+        # Phase 2b: free E while parked; _bridge_wait owns cancel-on-timeout.
+        result, error, timed_out = _bridge_wait(future, wait_timeout)
         # R2-FF-6: use the local `result` from the destructured tuple
         # rather than self.result. self.result can be mutated by a
         # concurrent set_result() call between the future.result() unpack
@@ -2510,6 +2536,15 @@ class GeneratorRequest:
     def get_queue_stream_sync(self):
         """Get the result stream synchronously."""
 
+        # Phase 2b: poison fail-fast (see Plexus.execute_sync). Fires on the
+        # first next() of this generator.
+        if getattr(_held_permit, "poisoned", False):
+            raise RequestException(
+                "sync bridge gave up its execution permit under "
+                "saturation/shutdown; this call chain must unwind (do not "
+                "make further sync-bridge calls)."
+            )
+
         iterator = self.get_queue_stream()
         # R2-EE-2 / R2-FF-3: when the caller breaks out of the for-loop
         # early (or raises), the async generator's try/finally and any
@@ -2534,22 +2569,22 @@ class GeneratorRequest:
                     if isinstance(self.timeout_duration, (int, float))
                     else 60.0
                 )
+                # Phase 2b: free E around each per-chunk park, HELD during
+                # the yield. _bridge_wait owns cancel-on-timeout;
+                # StopAsyncIteration still propagates from the anext future.
                 try:
-                    result = future.result(timeout=deadline_timeout)
-                    yield result
+                    result = _bridge_wait(future, deadline_timeout)
                 except StopAsyncIteration:
                     break
-                except concurrent.futures.TimeoutError:
-                    future.cancel()
-                    raise
+                yield result
         finally:
             close_fut = asyncio.run_coroutine_threadsafe(
                 iterator.aclose(), self.event_loop
             )
             try:
-                close_fut.result(timeout=5.0)
-            except concurrent.futures.TimeoutError:
-                close_fut.cancel()
+                # Phase 2b: free E during aclose cleanup; _bridge_wait owns
+                # cancel-on-timeout.
+                _bridge_wait(close_fut, 5.0)
             except Exception:
                 pass
 

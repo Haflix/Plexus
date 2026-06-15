@@ -268,7 +268,7 @@ Removes by `sub_uuid`. Returns `True` if a sub was removed, `False` otherwise.
 
 Sync equivalents that bridge to the event loop via `run_coroutine_threadsafe`.
 
-**Internal timeout:** `subscribe_sync`, `unsubscribe_sync`, `set_subscription_enabled_sync`, and `set_event_enabled_sync` wrap the bridged future in `future.result(timeout=60.0)`. If the event loop is blocked or stalled beyond 60 seconds, the call raises `concurrent.futures.TimeoutError`. Callers in background threads or sync entry points should treat this as a framework-stall signal (loop blocked, deadlock, or shutdown in progress) rather than a normal failure mode.
+**Internal timeout:** `subscribe_sync`, `unsubscribe_sync`, `set_subscription_enabled_sync`, and `set_event_enabled_sync` route the bridged future through the framework's `_bridge_wait` helper with a 60-second budget (which also frees the caller's execution slot while parked, so a parked sync call never starves the pool). If the event loop is blocked or stalled beyond 60 seconds, the call raises `concurrent.futures.TimeoutError`. Callers in background threads or sync entry points should treat this as a framework-stall signal (loop blocked, deadlock, or shutdown in progress) rather than a normal failure mode.
 
 ---
 

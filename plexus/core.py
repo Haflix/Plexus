@@ -18,7 +18,6 @@ import threading
 import traceback
 from collections import deque
 import concurrent.futures
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional, Callable, Union, Dict, List, Set, Tuple
 import yaml
 
@@ -88,6 +87,12 @@ from .runtime import (  # noqa: F401  (re-export shim)
     _MAX_EMIT_DEPTH,
     _EXECUTE_DEPTH,
     _MAX_EXECUTE_DEPTH,
+    GatedExecutor,
+    _bridge_wait,
+    _held_permit,
+    PLUGIN_EXECUTOR_THREAD_CEILING,
+    SYNC_DISPATCHER_THREAD_CEILING,
+    SYNC_STREAM_THREAD_CEILING,
 )
 
 from .events import EventMixin
@@ -189,10 +194,45 @@ class Plexus(EventMixin):
         self._lifecycle_locks: Dict[str, asyncio.Lock] = {}
         # Dedicated thread pool for sync plugin endpoints — isolated from
         # Python's default executor to prevent deadlock under load.
-        # See README "Sync vs Async Plugins: Thread Pool Deadlock Risk".
-        self._plugin_executor = ThreadPoolExecutor(
-            max_workers=32,
-            thread_name_prefix="plugin",
+        # See docs/configuration.md "Sync-bridge thread pools (E and M)".
+        # Phase 2b: GatedExecutor splits the budget into E (execution
+        # concurrency, the old worker count, released while a carrier parks
+        # on a bridge wait) and M (a hard thread ceiling held the full
+        # carrier lifetime). Both are config-tunable for this pool:
+        # `general.sync_executor_workers` (E, default 32) and
+        # `general.sync_executor_thread_ceiling` (M, default 128). yaml_config
+        # is already populated (load_config_yaml above); malformed/absent
+        # values fall back to the default with a warning (no startup hard
+        # failure). GatedExecutor raises the ceiling to E if E exceeds it.
+        boot_general = self.yaml_config.get("general", {}) or {}
+        raw_exec_workers = boot_general.get("sync_executor_workers", 32)
+        try:
+            exec_workers = int(raw_exec_workers)
+            if exec_workers < 1:
+                raise ValueError("must be >= 1")
+        except (TypeError, ValueError):
+            self._logger.warning(
+                "Invalid general.sync_executor_workers=%r; defaulting to 32",
+                raw_exec_workers,
+            )
+            exec_workers = 32
+        raw_exec_ceiling = boot_general.get(
+            "sync_executor_thread_ceiling", PLUGIN_EXECUTOR_THREAD_CEILING
+        )
+        try:
+            exec_ceiling = int(raw_exec_ceiling)
+            if exec_ceiling < 1:
+                raise ValueError("must be >= 1")
+        except (TypeError, ValueError):
+            self._logger.warning(
+                "Invalid general.sync_executor_thread_ceiling=%r; defaulting to %d",
+                raw_exec_ceiling, PLUGIN_EXECUTOR_THREAD_CEILING,
+            )
+            exec_ceiling = PLUGIN_EXECUTOR_THREAD_CEILING
+        self._plugin_executor = GatedExecutor(
+            "plugin",
+            exec_permits=exec_workers,
+            thread_ceiling=exec_ceiling,
         )
         self._init_tasks = []
         self.network = None
@@ -268,8 +308,25 @@ class Plexus(EventMixin):
                 raw_workers,
             )
             sync_workers = 4
+        # Thread ceiling (M) — runaway backstop, configurable via
+        # `general.sync_dispatcher_thread_ceiling` (default 32). Auto-raised
+        # to the worker count by GatedExecutor if set lower.
+        raw_sync_ceiling = general_cfg.get(
+            "sync_dispatcher_thread_ceiling", SYNC_DISPATCHER_THREAD_CEILING
+        )
+        try:
+            sync_ceiling = int(raw_sync_ceiling)
+            if sync_ceiling < 1:
+                raise ValueError("must be >= 1")
+        except (TypeError, ValueError):
+            self._logger.warning(
+                "Invalid general.sync_dispatcher_thread_ceiling=%r; defaulting to %d",
+                raw_sync_ceiling, SYNC_DISPATCHER_THREAD_CEILING,
+            )
+            sync_ceiling = SYNC_DISPATCHER_THREAD_CEILING
         self.sync_dispatcher = SyncDispatcher(
             workers=sync_workers,
+            thread_ceiling=sync_ceiling,
             logger=self._logger.getChild("sync_dispatcher"),
         )
 
@@ -291,8 +348,26 @@ class Plexus(EventMixin):
                 raw_stream_workers,
             )
             stream_workers = 4
+        # Thread ceiling (M) — runaway backstop, configurable via
+        # `general.sync_stream_thread_ceiling` (default 16). Auto-raised to
+        # the worker count by GatedExecutor if set lower.
+        raw_stream_ceiling = general_cfg.get(
+            "sync_stream_thread_ceiling", SYNC_STREAM_THREAD_CEILING
+        )
+        try:
+            stream_ceiling = int(raw_stream_ceiling)
+            if stream_ceiling < 1:
+                raise ValueError("must be >= 1")
+        except (TypeError, ValueError):
+            self._logger.warning(
+                "Invalid general.sync_stream_thread_ceiling=%r; defaulting to %d",
+                raw_stream_ceiling, SYNC_STREAM_THREAD_CEILING,
+            )
+            stream_ceiling = SYNC_STREAM_THREAD_CEILING
         self.sync_stream_dispatcher = SyncDispatcher(
             workers=stream_workers,
+            thread_ceiling=stream_ceiling,
+            name="sync-stream-notifier",
             logger=self._logger.getChild("sync_stream_dispatcher"),
         )
 
@@ -4621,11 +4696,10 @@ class Plexus(EventMixin):
         # timeout was supplied.
         request_timeout = timeout[0] if isinstance(timeout, tuple) else timeout
         wait_timeout = (request_timeout + 5.0) if isinstance(request_timeout, (int, float)) else 60.0
-        try:
-            return future.result(timeout=wait_timeout)
-        except concurrent.futures.TimeoutError:
-            future.cancel()
-            raise
+        # Phase 2b: construction-only park (no endpoint body, sub-ms) — but
+        # still route through _bridge_wait for uniformity; freeing E during
+        # the wait is harmless. No poison check: not a deadlock source.
+        return _bridge_wait(future, wait_timeout)
 
     @async_log_errors
     async def create_gen_request(
@@ -4740,11 +4814,9 @@ class Plexus(EventMixin):
         # R2-FF-1: bound the worker-thread wait — see create_request_sync.
         request_timeout = timeout[0] if isinstance(timeout, tuple) else timeout
         wait_timeout = (request_timeout + 5.0) if isinstance(request_timeout, (int, float)) else 60.0
-        try:
-            return future.result(timeout=wait_timeout)
-        except concurrent.futures.TimeoutError:
-            future.cancel()
-            raise
+        # Phase 2b: construction-only park — route through _bridge_wait for
+        # uniformity (frees E during the sub-ms wait). No poison check.
+        return _bridge_wait(future, wait_timeout)
 
     @async_log_errors
     async def find_endpoints_by_tag(self, tag: str) -> List[Dict[str, Any]]:
@@ -6316,6 +6388,16 @@ class Plexus(EventMixin):
             RequestException: when the underlying request reports an error.
         """
 
+        # Phase 2b: if this carrier was poisoned (it gave up its execution
+        # permit under saturation/shutdown), fail fast so the call chain
+        # unwinds instead of doing more bridge work permit-less.
+        if getattr(_held_permit, "poisoned", False):
+            raise RequestException(
+                "sync bridge gave up its execution permit under "
+                "saturation/shutdown; this call chain must unwind (do not "
+                "make further sync-bridge calls)."
+            )
+
         # C-004: same-thread deadlock guard. See _check_not_loop_thread
         # for rationale.
         self._check_not_loop_thread("execute_sync")
@@ -6378,11 +6460,10 @@ class Plexus(EventMixin):
             # R2-FF-1: bound the worker-thread wait — see create_request_sync.
             request_timeout = timeout[0] if isinstance(timeout, tuple) else timeout
             wait_timeout = (request_timeout + 5.0) if isinstance(request_timeout, (int, float)) else 60.0
-            try:
-                return future.result(timeout=wait_timeout)
-            except concurrent.futures.TimeoutError:
-                future.cancel()
-                raise
+            # Phase 2b: route through _bridge_wait so this carrier frees its
+            # execution permit while parked (nested work always finds a slot)
+            # and re-acquires on resume. _bridge_wait owns cancel-on-timeout.
+            return _bridge_wait(future, wait_timeout)
         finally:
             _EXECUTE_DEPTH.reset(depth_token)
 
@@ -6556,6 +6637,15 @@ class Plexus(EventMixin):
             RequestException: when the underlying request reports an error.
         """
 
+        # Phase 2b: poison fail-fast (see execute_sync). Fires on the first
+        # next() of this generator.
+        if getattr(_held_permit, "poisoned", False):
+            raise RequestException(
+                "sync bridge gave up its execution permit under "
+                "saturation/shutdown; this call chain must unwind (do not "
+                "make further sync-bridge calls)."
+            )
+
         hosts, blocked_hosts = self._validate_host_args(hosts, blocked_hosts)
 
         if author == "system":
@@ -6655,9 +6745,10 @@ class Plexus(EventMixin):
                     request.set_collected(), self.main_event_loop
                 )
                 try:
-                    collected_fut.result(timeout=5.0)
+                    # Phase 2b: free E during the cleanup wait; _bridge_wait
+                    # owns cancel-on-timeout.
+                    _bridge_wait(collected_fut, 5.0)
                 except concurrent.futures.TimeoutError:
-                    collected_fut.cancel()
                     self._logger.warning(
                         "execute_stream_sync: set_collected() exceeded 5s for "
                         "request %s — cancelled orphan task",

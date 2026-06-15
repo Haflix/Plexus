@@ -215,7 +215,12 @@ general:
   plugin_ready_timeout: 60.0
   plugin_disable_timeout: 30.0
   plugin_enable_timeout: 30.0
+  sync_executor_workers: 32
+  sync_executor_thread_ceiling: 128
   sync_dispatcher_workers: 4
+  sync_dispatcher_thread_ceiling: 32
+  sync_stream_workers: 4
+  sync_stream_thread_ceiling: 16
 ```
 
 ### Reference
@@ -231,7 +236,12 @@ general:
 | `plugin_ready_timeout` | float | `60.0` | Cross-plugin readiness gate budget. |
 | `plugin_disable_timeout` | float | `30.0` | Per-plugin `on_disable` cap during runtime disable / pop / reload. |
 | `plugin_enable_timeout` | float | `30.0` | Per-plugin `on_enable` cap during runtime enable / load. |
-| `sync_dispatcher_workers` | int | `4` | Workers in the dedicated `SyncDispatcher` thread pool. |
+| `sync_executor_workers` | int | `32` | Execution concurrency (E) of the main sync-endpoint pool: how many sync plugin endpoints run at once. |
+| `sync_executor_thread_ceiling` | int | `128` | Hard thread ceiling (M) of the main sync-endpoint pool. Runaway backstop; on saturation the call loud-rejects. Auto-raised to `sync_executor_workers` if set lower. |
+| `sync_dispatcher_workers` | int | `4` | Execution concurrency (E) of the sync event-handler pool (the `SyncDispatcher`). |
+| `sync_dispatcher_thread_ceiling` | int | `32` | Hard thread ceiling (M) of the sync event-handler pool. Auto-raised to `sync_dispatcher_workers` if set lower. |
+| `sync_stream_workers` | int | `4` | Execution concurrency (E) of the sync streaming-generator pool. |
+| `sync_stream_thread_ceiling` | int | `16` | Hard thread ceiling (M) of the sync streaming-generator pool. Auto-raised to `sync_stream_workers` if set lower. |
 
 ### `plugin_ready_timeout` (default 60.0)
 
@@ -278,16 +288,38 @@ leak observers or subs.
 > can occupy two pool slots until natural return. The plugin's state still
 > transitions to `INACTIVE` on time.
 
-### `sync_dispatcher_workers` (default 4)
+### Sync-bridge thread pools (E and M)
 
-Workers in the dedicated `SyncDispatcher` thread pool used for **sync
-subscriber handlers** (sync `def` methods invoked through the
-`publish_event` / `request_event` dispatch). Sync `execute()` endpoints
-use a separate shared pool.
+The framework runs sync plugin code on three thread pools. Each pool has
+two budgets:
 
-- Min 1. Bad values warn and fall back to 4.
-- `workers=1` serializes all sync subscriber handlers — useful when
-  handlers share non-thread-safe state.
+- **E (execution concurrency)** — how many sync bodies run at once. This
+  is the `*_workers` knob. A parked sync body (one that called
+  `execute_sync` / `publish_event_sync` / etc. and is waiting on the
+  result) releases its E slot while parked, so nested sync calls always
+  find a slot. This is what keeps re-entrant sync fan-out from
+  deadlocking.
+- **M (thread ceiling)** — the maximum live threads before the pool
+  loud-rejects with a `RequestException` instead of spawning more. A pure
+  runaway-prevention backstop. E and M are independent: M must stay >= E
+  (the framework auto-raises it if you set workers higher).
+
+| pool | what runs on it | E knob (default) | M knob (default) |
+|---|---|---|---|
+| main sync-endpoint | sync `execute()` endpoint bodies | `sync_executor_workers` (32) | `sync_executor_thread_ceiling` (128) |
+| event-handler | sync subscriber handlers (`publish_event` / `request_event`) | `sync_dispatcher_workers` (4) | `sync_dispatcher_thread_ceiling` (32) |
+| streaming | sync streaming-generator producers | `sync_stream_workers` (4) | `sync_stream_thread_ceiling` (16) |
+
+Every pool exposes both E and M as config. The defaults suit a personal
+deployment; you rarely need to touch the M ceilings (they only cap a
+runaway, never the steady state).
+
+- All keys: min 1, bad values warn and fall back to the default.
+- `sync_dispatcher_workers=1` serializes all sync subscriber handlers —
+  useful when handlers share non-thread-safe state.
+- Raising a `*_workers` key raises real concurrency; raising a
+  `*_thread_ceiling` key only raises the runaway backstop. M is auto-raised
+  to its pool's E if you set the ceiling below the worker count.
 
 ### `logger_levels` — per-logger thresholds
 

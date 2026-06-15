@@ -437,18 +437,28 @@ A subscriber endpoint can be `async def` or plain `def`. The framework
 runs each kind on a different executor:
 
 - Async handlers run on the main event loop directly.
-- Sync handlers are submitted to a dedicated `SyncDispatcher` — a
-  `ThreadPoolExecutor(max_workers=N, thread_name_prefix="sync-notifier")`
-  separate from the framework's general-purpose plugin executor.
+- Sync handlers are submitted to a dedicated `SyncDispatcher`, backed by a
+  `GatedExecutor` (a `concurrent.futures.Executor` wrapping a private
+  `ThreadPoolExecutor`, thread-name prefix `sync-notifier`) separate from
+  the framework's general-purpose plugin executor.
 
-- Default workers: 4. Configurable via `general.sync_dispatcher_workers`
-  in `config.yml`.
+The `GatedExecutor` gives the pool two independent budgets (see
+[configuration.md](configuration.md) for the full model):
+
+- **Execution concurrency (E)** — how many sync handlers run at once.
+  Default 4, via `general.sync_dispatcher_workers`. A handler that itself
+  makes a sync-bridge call and parks releases its E slot while waiting, so
+  nested sync calls can never deadlock the pool.
+- **Thread ceiling (M)** — the hard cap on live threads before the pool
+  loud-rejects with `RequestException` instead of spawning more. Default
+  32, via `general.sync_dispatcher_thread_ceiling`. Auto-raised to E if
+  set lower.
 - Min 1 worker (clamped via `max(1, int(workers))`). With `workers=1`
   you get serialization of all sync subscriber handlers — useful when
   handlers share non-thread-safe state.
-- Sync `execute()` endpoints use a SEPARATE shared thread pool
-  (`_plugin_executor`). The two pools do not contend, so a slow sync
-  subscriber cannot starve sync `execute()` calls.
+- Sync `execute()` endpoints use a SEPARATE shared pool
+  (`_plugin_executor`, also a `GatedExecutor`). The two pools do not
+  contend, so a slow sync subscriber cannot starve sync `execute()` calls.
 - Shutdown happens AFTER the 30 s in-flight drain in
   `Plexus.close()`, with a 30 s budget; falls back to `wait=False`
   on timeout.

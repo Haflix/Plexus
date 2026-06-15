@@ -53,6 +53,8 @@ from .runtime import (
     DEFAULT_PLUGIN_READY_TIMEOUT,
     _EMIT_DEPTH,
     _MAX_EMIT_DEPTH,
+    _bridge_wait,
+    _held_permit,
     _sync_call_chain,
 )
 from .utils import (
@@ -1268,6 +1270,13 @@ class EventMixin:
         explicitly via _caller_chain to thread cycle detection through
         sync→fan-out→sync paths.
         """
+        # Phase 2b: poison fail-fast (see Plexus.execute_sync).
+        if getattr(_held_permit, "poisoned", False):
+            raise RequestException(
+                "sync bridge gave up its execution permit under "
+                "saturation/shutdown; this call chain must unwind (do not "
+                "make further sync-bridge calls)."
+            )
         # C-004: same-thread deadlock guard.
         self._check_not_loop_thread("publish_event_sync")
         chain = getattr(_sync_call_chain, "chain", ())
@@ -1287,11 +1296,9 @@ class EventMixin:
         # cannot block the publisher forever. publish_event has no
         # caller-supplied timeout, so use a generous fixed budget.
         # TODO: thread an explicit publisher timeout through if needed.
-        try:
-            return future.result(timeout=60.0)
-        except concurrent.futures.TimeoutError:
-            future.cancel()
-            raise
+        # Phase 2b: _bridge_wait frees E while parked (the 60s hold would
+        # otherwise starve the pool) and owns cancel-on-timeout.
+        return _bridge_wait(future, 60.0)
 
     @async_log_errors
     async def request_event(
@@ -1571,6 +1578,13 @@ class EventMixin:
     ) -> Any:
         """Sync variant of request_event (C16). C10: capture caller's
         _sync_call_chain on the WORKER thread before scheduling."""
+        # Phase 2b: poison fail-fast (see Plexus.execute_sync).
+        if getattr(_held_permit, "poisoned", False):
+            raise RequestException(
+                "sync bridge gave up its execution permit under "
+                "saturation/shutdown; this call chain must unwind (do not "
+                "make further sync-bridge calls)."
+            )
         # C-004: same-thread deadlock guard.
         self._check_not_loop_thread("request_event_sync")
         chain = getattr(_sync_call_chain, "chain", ())
@@ -1590,11 +1604,8 @@ class EventMixin:
         # R2-FF-1: bound the worker-thread wait — derive from the
         # request timeout (+ 5s grace) or a generous default.
         wait_timeout = (timeout + 5.0) if isinstance(timeout, (int, float)) else 60.0
-        try:
-            return future.result(timeout=wait_timeout)
-        except concurrent.futures.TimeoutError:
-            future.cancel()
-            raise
+        # Phase 2b: free E while parked; _bridge_wait owns cancel-on-timeout.
+        return _bridge_wait(future, wait_timeout)
 
     @async_gen_log_errors
     async def request_event_stream(
@@ -2025,6 +2036,14 @@ class EventMixin:
         stream re-set the chain on each next() call (see
         request_event_stream sync branch).
         """
+        # Phase 2b: poison fail-fast (see Plexus.execute_sync). Fires on the
+        # first next() of this generator.
+        if getattr(_held_permit, "poisoned", False):
+            raise RequestException(
+                "sync bridge gave up its execution permit under "
+                "saturation/shutdown; this call chain must unwind (do not "
+                "make further sync-bridge calls)."
+            )
         # C-004: same-thread deadlock guard.
         self._check_not_loop_thread("request_event_stream_sync")
         chain = getattr(_sync_call_chain, "chain", ())
@@ -2054,13 +2073,13 @@ class EventMixin:
                     if isinstance(timeout, (int, float))
                     else 60.0
                 )
+                # Phase 2b: free E around each per-chunk park, HELD during
+                # the yield (the body runs when it yields). _bridge_wait owns
+                # cancel-on-timeout; StopAsyncIteration still propagates.
                 try:
-                    chunk = next_fut.result(timeout=next_timeout)
+                    chunk = _bridge_wait(next_fut, next_timeout)
                 except StopAsyncIteration:
                     break
-                except concurrent.futures.TimeoutError:
-                    next_fut.cancel()
-                    raise
                 yield chunk
         finally:
             # Close the underlying async generator if the caller breaks
@@ -2082,9 +2101,10 @@ class EventMixin:
                 async_gen.aclose(), self.main_event_loop
             )
             try:
-                fut.result(timeout=5.0)
+                # Phase 2b: free E during aclose cleanup; _bridge_wait owns
+                # cancel-on-timeout.
+                _bridge_wait(fut, 5.0)
             except concurrent.futures.TimeoutError:
-                fut.cancel()
                 self._logger.warning(
                     "request_event_stream_sync: aclose() exceeded 5s — "
                     "underlying handler's finally/async-with cleanup may "
