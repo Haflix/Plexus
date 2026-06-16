@@ -1206,8 +1206,9 @@ class EventMixin:
         # handler eventually re-enters execute_sync / publish_event_sync /
         # etc. Stage A's _tracked_event wrapper reads request._call_chain.
         # Use the SAME flat-string format the execute path uses
-        # (`f"{plugin}.{method}"`) — see _execute_sync_tracked at the
-        # `chain + (target,)` site. Mismatched element shapes break the
+        # (`f"{plugin}.{method}"`) — see execute_sync at the `chain +
+        # (target,)` site (passed as _dispatch_request's call_chain).
+        # Mismatched element shapes break the
         # `target in chain` membership test downstream and let real
         # cycles slip past detection.
         #

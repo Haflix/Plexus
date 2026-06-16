@@ -15,6 +15,12 @@ Cases:
 - ancestor scope allow (via a relay that puts the asserted plugin in the chain).
 - no-chaining deny (proves the asserted-identity scope propagates).
 - self-call passthrough while the gate is active.
+- sync gated: execute_sync assertion now denied loop-side (dispatch-unify
+  cleanup extended the gate to the sync path).
+- stream async/sync gated: execute_stream / execute_stream_sync assertions
+  denied through the shared _create_gen_request_gated body (stream cleanup).
+- stream async lazy: execute_stream is a lazy async generator -- creation does
+  not gate, only iteration does.
 
 ``TestCapabilityActor`` is loaded twice by the test config -- once as ACTOR,
 once as ACTOR2 -- to provide two distinct identities and an ancestry chain.
@@ -31,7 +37,7 @@ from plexus.decorators import async_log_errors, log_errors  # noqa: E402
 from _test_helpers import CaseRecorder  # noqa: E402
 
 
-SUITE_VERSION = "0.1.1"
+SUITE_VERSION = "0.1.3"
 ACTOR = "TestCapabilityActor"
 ACTOR2 = "TestCapabilityActor2"
 
@@ -92,7 +98,10 @@ class TestCapabilitySuite(Plugin):
             await self._case_ancestor_allow(rec, kw)
             await self._case_no_chaining_deny(rec, kw)
             await self._case_self_call_passthrough(rec, kw)
-            await self._case_sync_stream_gating_deferred(rec, kw)
+            await self._case_sync_gated(rec, kw)
+            await self._case_stream_async_gated(rec, kw)
+            await self._case_stream_sync_gated(rec, kw)
+            await self._case_stream_async_lazy(rec, kw)
         finally:
             self._plexus._capability_grants = orig_grants
             self._plexus._capability_active = orig_cap
@@ -215,15 +224,93 @@ class TestCapabilitySuite(Plugin):
                 )
         await rec.run_case("capability.self_call.passthrough", body, **kw)
 
-    async def _case_sync_stream_gating_deferred(self, rec, kw):
+    async def _case_sync_gated(self, rec, kw):
         async def body(c):
-            # Known gap: execute_sync / execute_stream assertions are NOT gated
-            # yet (they rewrite author worker-side / iterate as generators; the
-            # gate lands when the deferred dispatch-unify cleanup relocates those
-            # bodies loop-side). This skip is the anchor to FLIP to an
-            # expect-denied case once that lands.
-            c.skip(
-                "execute_sync/execute_stream gating deferred to the "
-                "dispatch-unify cleanup; flip to expect-denied then"
+            # The dispatch-unify cleanup folded execute() + execute_sync into one
+            # loop-side _dispatch_request, so execute_sync is now gated too. Gate
+            # active (Actor has impersonation only, NO system_caller); a SYNC-path
+            # assertion of "system" must now be DENIED loop-side, the
+            # CapabilityException crossing the sync bridge back to the asserting
+            # sync handler (do_assert_sync). Before the cleanup execute_sync
+            # rewrote author worker-side and this passed through ungated.
+            self._set_grants({ACTOR: {"impersonation": "ancestor"}})
+            marker = await self.execute(
+                ACTOR, "do_assert_sync",
+                args={"target": ACTOR, "method": "echo",
+                      "author": "system", "author_id": "system"},
             )
-        await rec.run_case("capability.sync_stream.gating_deferred", body, **kw)
+            outcome = marker["outcome"]
+            reason = marker.get("reason") or ""
+            if outcome != "denied":
+                raise AssertionError(
+                    f"execute_sync system assertion must now deny, got {outcome}"
+                )
+            if "system_caller" not in reason:
+                raise AssertionError(
+                    f"sync deny reason should name system_caller: {reason!r}"
+                )
+        await rec.run_case("capability.sync.gated", body, **kw)
+
+    async def _case_stream_async_gated(self, rec, kw):
+        async def body(c):
+            # execute_stream gated through the shared _create_gen_request_gated
+            # body. Gate active (Actor has impersonation only, NO system_caller);
+            # an async-stream assertion of "system" must be DENIED on iteration.
+            self._set_grants({ACTOR: {"impersonation": "ancestor"}})
+            marker = await self.execute(
+                ACTOR, "do_assert_stream",
+                args={"target": ACTOR, "method": "echo",
+                      "author": "system", "author_id": "system"},
+            )
+            if marker.get("outcome") != "denied":
+                raise AssertionError(
+                    f"execute_stream system assertion must deny, got {marker!r}"
+                )
+            if "system_caller" not in (marker.get("reason") or ""):
+                raise AssertionError(
+                    f"async-stream deny reason should name system_caller: {marker!r}"
+                )
+        await rec.run_case("capability.stream_async.gated", body, **kw)
+
+    async def _case_stream_sync_gated(self, rec, kw):
+        async def body(c):
+            # execute_stream_sync gated: the gate runs in the bridged construction
+            # loop-side (_create_gen_request_gated), and the CapabilityException
+            # crosses the sync bridge back to the asserting sync handler.
+            self._set_grants({ACTOR: {"impersonation": "ancestor"}})
+            marker = await self.execute(
+                ACTOR, "do_assert_stream_sync",
+                args={"target": ACTOR, "method": "echo",
+                      "author": "system", "author_id": "system"},
+            )
+            if marker.get("outcome") != "denied":
+                raise AssertionError(
+                    f"execute_stream_sync system assertion must deny, got {marker!r}"
+                )
+            if "system_caller" not in (marker.get("reason") or ""):
+                raise AssertionError(
+                    f"sync-stream deny reason should name system_caller: {marker!r}"
+                )
+        await rec.run_case("capability.stream_sync.gated", body, **kw)
+
+    async def _case_stream_async_lazy(self, rec, kw):
+        async def body(c):
+            # execute_stream is a LAZY async generator: merely creating it must
+            # NOT gate; only iterating triggers the denial. The fixture returns a
+            # marker proving construction succeeded (created) and the denial
+            # happened on iteration (denied_on_iter). Guards against a future
+            # eager-eval regression that the iterating gated cases would hide.
+            self._set_grants({ACTOR: {"impersonation": "ancestor"}})
+            marker = await self.execute(
+                ACTOR, "do_assert_stream_lazy",
+                args={"target": ACTOR, "method": "echo",
+                      "author": "system", "author_id": "system"},
+            )
+            if not (isinstance(marker, dict)
+                    and marker.get("created") is True
+                    and marker.get("denied_on_iter") is True):
+                raise AssertionError(
+                    f"execute_stream must be lazy (create-no-gate, deny-on-iter); "
+                    f"got {marker!r}"
+                )
+        await rec.run_case("capability.stream_async.lazy", body, **kw)

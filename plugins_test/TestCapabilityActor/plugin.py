@@ -75,3 +75,74 @@ class TestCapabilityActor(Plugin):
         return await self.execute(
             spec["plugin"], spec["method"], args=spec.get("args")
         )
+
+    @log_errors
+    def do_assert_sync(
+        self, target: str, method: str, author: str, author_id: str
+    ) -> dict:
+        # SYNC-path assertion. A sync endpoint runs on a worker thread, so
+        # self.execute_sync bridges the dispatch onto the loop where the
+        # (now-unified) _dispatch_request gates the RAW author claim. This is the
+        # integration proof that the dispatch-unify cleanup extended the
+        # capability gate to execute_sync: the CapabilityException raised
+        # loop-side crosses the bridge via future.result() and is caught here.
+        try:
+            r = self.execute_sync(
+                target, method, author=author, author_id=author_id
+            )
+            return {"outcome": "ok", "result": r}
+        except CapabilityException as e:
+            return {"outcome": "denied", "reason": str(e)}
+
+    @async_log_errors
+    async def do_assert_stream(
+        self, target: str, method: str, author: str, author_id: str
+    ) -> dict:
+        # ASYNC-stream assertion. execute_stream is a lazy async generator; the
+        # gate fires on the first iteration (inside _create_gen_request_gated).
+        # Iterate fully and report the gate result.
+        try:
+            async for _ in self.execute_stream(
+                target, method, author=author, author_id=author_id
+            ):
+                pass
+            return {"outcome": "ok"}
+        except CapabilityException as e:
+            return {"outcome": "denied", "reason": str(e)}
+
+    @log_errors
+    def do_assert_stream_sync(
+        self, target: str, method: str, author: str, author_id: str
+    ) -> dict:
+        # SYNC-stream assertion. execute_stream_sync bridges construction
+        # loop-side where _create_gen_request_gated gates; the
+        # CapabilityException crosses the bridge on the first next() and surfaces
+        # here. Proves the dispatch-unify gate reached execute_stream_sync.
+        try:
+            for _ in self.execute_stream_sync(
+                target, method, author=author, author_id=author_id
+            ):
+                pass
+            return {"outcome": "ok"}
+        except CapabilityException as e:
+            return {"outcome": "denied", "reason": str(e)}
+
+    @async_log_errors
+    async def do_assert_stream_lazy(
+        self, target: str, method: str, author: str, author_id: str
+    ) -> dict:
+        # Prove the async generator is LAZY: merely creating it must NOT gate (no
+        # body runs until iteration), so `created` is reached; only iterating
+        # triggers the denial. If execute_stream ever became eager, the gen
+        # creation below would raise and this handler would error instead of
+        # returning the marker.
+        gen = self.execute_stream(
+            target, method, author=author, author_id=author_id
+        )
+        created = True
+        try:
+            async for _ in gen:
+                pass
+            return {"created": created, "denied_on_iter": False}
+        except CapabilityException:
+            return {"created": created, "denied_on_iter": True}

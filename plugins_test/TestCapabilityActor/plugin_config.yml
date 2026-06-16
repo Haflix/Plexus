@@ -1,5 +1,5 @@
 description: Capability-gate fixture — makes asserting execute calls to drive the gate
-version: "0.1.1"
+version: "0.1.3"
 remote: false
 arguments:
 endpoints:
@@ -34,3 +34,43 @@ endpoints:
     description: Forward to an inner execute so the inner target sees this actor as ancestor
     arguments:
       - name: spec
+  do_assert_sync:
+    internal_name: do_assert_sync
+    remote: false
+    accessible_by_other_plugins: true
+    description: Make an asserting execute_sync call (sync-path gate proof)
+    arguments:
+      - name: target
+      - name: method
+      - name: author
+      - name: author_id
+  do_assert_stream:
+    internal_name: do_assert_stream
+    remote: false
+    accessible_by_other_plugins: true
+    description: Make an asserting execute_stream call (async-stream gate proof)
+    arguments:
+      - name: target
+      - name: method
+      - name: author
+      - name: author_id
+  do_assert_stream_sync:
+    internal_name: do_assert_stream_sync
+    remote: false
+    accessible_by_other_plugins: true
+    description: Make an asserting execute_stream_sync call (sync-stream gate proof)
+    arguments:
+      - name: target
+      - name: method
+      - name: author
+      - name: author_id
+  do_assert_stream_lazy:
+    internal_name: do_assert_stream_lazy
+    remote: false
+    accessible_by_other_plugins: true
+    description: Prove execute_stream is lazy (gate fires only on iteration)
+    arguments:
+      - name: target
+      - name: method
+      - name: author
+      - name: author_id

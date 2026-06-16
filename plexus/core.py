@@ -6589,50 +6589,25 @@ class Plexus(EventMixin):
         """
         hosts, blocked_hosts = self._validate_host_args(hosts, blocked_hosts)
 
-        # Capability gate: capability gate on the RAW author claim, BEFORE
-        # the system->hostname rewrite below (the gate reasons about the raw
-        # claim). No-op when capability is inactive or the call is framework-
-        # origin (empty chain). asserted is scoped over the whole dispatch so
-        # nested calls inherit it (no-chaining + Step 3 charge-asserted).
-        author, author_id, _asserted = self._gate_author(author, author_id)
-
-        if author == "system":
-            author = self.hostname
-            author_id = self.hostname
-
-        with asserted_identity_scope(_asserted):
-            request = await self.create_request(
-                plugin,
-                method,
-                args,
-                plugin_uuid,
-                hosts,
-                blocked_hosts,
-                author,
-                author_id,
-                timeout,
-                author_host,
-                request_id,
-            )
-            try:
-                result, error, _ = await request.wait_for_result_async()
-                if error:
-                    self._logger.warning(
-                        "Error executing %s.%s (Req-ID: %s): %s. You can check the logs for this Req-ID.",
-                        plugin,
-                        method,
-                        request.id,
-                        result,
-                    )
-                    raise RequestException(result)
-                return result
-            finally:
-                # B-073 Session 2 Step 3: done-callback eviction. Runs on
-                # normal return, RequestException, AND CancelledError —
-                # without this, a cancelled caller would leave the Request
-                # lingering in self.requests forever. Sync, GIL-atomic,
-                # idempotent with the producer-side pop in _process_request.
-                self.requests.pop(request.id, None)
+        # The capability gate, system->hostname rewrite, asserted-identity
+        # scope, request creation, await, and eviction all live in the shared
+        # _dispatch_request body -- the single capability-gate point for the
+        # execute family. execute() validates hosts here (loop-side) and
+        # delegates; execute_sync validates worker-side and bridges the same
+        # body onto the loop.
+        return await self._dispatch_request(
+            plugin,
+            method,
+            args,
+            plugin_uuid,
+            hosts,
+            blocked_hosts,
+            author,
+            author_id,
+            timeout,
+            author_host,
+            request_id,
+        )
 
     @log_errors
     def execute_sync(
@@ -6690,9 +6665,11 @@ class Plexus(EventMixin):
 
         hosts, blocked_hosts = self._validate_host_args(hosts, blocked_hosts)
 
-        if author == "system":
-            author = self.hostname
-            author_id = self.hostname
+        # The system->hostname rewrite is deliberately NOT done here: the RAW
+        # author is carried across the bridge so _dispatch_request can gate the
+        # raw claim loop-side (the gate's evaluate_capability branches on
+        # author=="system"), THEN rewrite. Rewriting here would hide the claim
+        # from the gate.
 
         # Detect circular sync calls that would deadlock the threadpool
         chain = getattr(_sync_call_chain, "chain", ())
@@ -6726,10 +6703,11 @@ class Plexus(EventMixin):
 
         depth_token = _EXECUTE_DEPTH.set(execute_depth + 1)
         try:
-            # Caller identity: capture the originating sync handler's
-            # identity worker-side, re-seat it loop-side across the bridge.
-            _exec_coro = self._execute_sync_tracked(
-                chain + (target,),
+            # Caller identity: capture the originating sync handler's identity
+            # worker-side, re-seat it loop-side across the bridge. The RAW
+            # author is passed through; _dispatch_request gates then rewrites
+            # loop-side. call_chain carries the sync cycle-detection chain.
+            _exec_coro = self._dispatch_request(
                 plugin,
                 method,
                 args,
@@ -6741,6 +6719,7 @@ class Plexus(EventMixin):
                 timeout,
                 author_host,
                 request_id,
+                call_chain=chain + (target,),
             )
             future = asyncio.run_coroutine_threadsafe(
                 self._with_caller_chain(current_caller_chain(), _exec_coro),
@@ -6756,9 +6735,8 @@ class Plexus(EventMixin):
         finally:
             _EXECUTE_DEPTH.reset(depth_token)
 
-    async def _execute_sync_tracked(
+    async def _dispatch_request(
         self,
-        call_chain,
         plugin: str,
         method: str,
         args: Union[tuple, dict, None] = None,
@@ -6774,38 +6752,151 @@ class Plexus(EventMixin):
         timeout: Union[float, tuple] = None,
         author_host: str = None,
         request_id: str = None,
+        call_chain: tuple = (),
     ) -> Any:
-        """Like execute(), but attaches the sync call chain to the request."""
-        request = await self.create_request(
-            plugin,
-            method,
-            args,
-            plugin_uuid,
-            hosts,
-            blocked_hosts,
-            author,
-            author_id,
-            timeout,
-            author_host,
-            request_id,
-        )
-        request._call_chain = call_chain
-        try:
-            result, error, _ = await request.wait_for_result_async()
-            if error:
-                self._logger.warning(
-                    "Error executing %s.%s (Req-ID: %s): %s",
-                    plugin,
-                    method,
-                    request.id,
-                    result,
-                )
-                raise RequestException(result)
-            return result
-        finally:
-            # B-073 Session 2 Step 3: done-callback eviction. Idempotent
-            # with the producer-side pop in _process_request.
-            self.requests.pop(request.id, None)
+        """Shared loop-side dispatch body for execute() and execute_sync().
+
+        The single capability-gate point for the execute family: gate the RAW
+        author claim, THEN apply the system->hostname rewrite (the gate reasons
+        about the raw claim, so the rewrite must follow it), scope the asserted
+        identity over the whole dispatch, create the request, await the result,
+        raise on error, and evict the request in ``finally``.
+
+        ``call_chain`` is the sync cycle-detection chain (``_sync_call_chain``
+        shape: ``"plugin.method"`` strings) stamped onto the request for the
+        sync-bridge path. The async ``execute()`` path passes the default
+        ``()`` -- equivalent to not setting it, since both ``_call_chain``
+        consumers read it via ``getattr(request, "_call_chain", ())``.
+
+        Callers validate hosts BEFORE delegating here (``execute()`` loop-side,
+        ``execute_sync()`` worker-side); this body does NOT call
+        ``_validate_host_args`` so the sync path does not double-validate /
+        double-warn.
+
+        Deadlock-safety: the gate is synchronous loop-side work (dict lookup +
+        pure ``evaluate_capability`` + fire-and-forget audit emit); it never
+        awaits, acquires a sync-bridge permit, or calls a ``*_sync`` mirror. A
+        denied assertion raises ``CapabilityException`` loop-side, which crosses
+        the sync bridge through ``future.result()`` exactly like a handler
+        ``RequestException``.
+        """
+        # Gate the RAW author claim BEFORE the system->hostname rewrite (the
+        # gate's evaluate_capability branches on author=="system"). No-op when
+        # capability is inactive or the call is framework-origin (empty chain).
+        author, author_id, asserted = self._gate_author(author, author_id)
+
+        if author == "system":
+            author = self.hostname
+            author_id = self.hostname
+
+        # asserted is scoped over the whole dispatch so nested calls inherit it
+        # (the no-chaining check + Step 3 charge-the-asserted attribution).
+        with asserted_identity_scope(asserted):
+            request = await self.create_request(
+                plugin,
+                method,
+                args,
+                plugin_uuid,
+                hosts,
+                blocked_hosts,
+                author,
+                author_id,
+                timeout,
+                author_host,
+                request_id,
+            )
+            # Sync cycle-detection chain; () for the async path (no-op, both
+            # consumers getattr-default to ()).
+            request._call_chain = call_chain
+            try:
+                result, error, _ = await request.wait_for_result_async()
+                if error:
+                    self._logger.warning(
+                        "Error executing %s.%s (Req-ID: %s): %s. You can check the logs for this Req-ID.",
+                        plugin,
+                        method,
+                        request.id,
+                        result,
+                    )
+                    raise RequestException(result)
+                return result
+            finally:
+                # B-073 Session 2 Step 3: done-callback eviction. Runs on
+                # normal return, RequestException, AND CancelledError. Sync,
+                # GIL-atomic, idempotent with the producer-side pop in
+                # _process_request.
+                self.requests.pop(request.id, None)
+
+    async def _create_gen_request_gated(
+        self,
+        plugin: str,
+        method: str,
+        args: Union[tuple, dict, None] = None,
+        plugin_uuid: Optional[str] = None,
+        hosts: Union[
+            str, list, None
+        ] = "any",  # "any", "remote", "local", or list of allowed hosts
+        blocked_hosts: Union[
+            str, list, None
+        ] = None,  # blocked hosts (str keyword, list, or None)
+        author: str = "system",
+        author_id: str = "system",
+        timeout: Union[float, tuple] = None,
+        author_host: str = None,
+        request_id: str = None,
+        _post_construct_hook: Optional[Callable[["GeneratorRequest"], None]] = None,
+    ) -> GeneratorRequest:
+        """Shared loop-side gated construction for the stream entries.
+
+        The single capability-gate point for execute_stream / execute_stream_sync
+        (mirrors `_dispatch_request` for the value-returning execute family): gate
+        the RAW author claim, THEN apply the system->hostname rewrite, then build
+        the GeneratorRequest + spawn its producer INSIDE `asserted_identity_scope`
+        so the producer task inherits the asserted identity by ContextVar
+        copy-at-`create_task`.
+
+        Construction-only scope is sufficient: the producer task is the only thing
+        that dispatches the endpoint and it captures the asserted identity at
+        spawn; the consume loop (which pulls already-produced items) dispatches
+        nothing and needs no scope.
+
+        Callers validate hosts BEFORE delegating; this body does NOT call
+        `_validate_host_args`. `_post_construct_hook` is forwarded to
+        `create_gen_request` (the sync path stamps `request._call_chain`
+        pre-spawn).
+
+        Deadlock-safety: the gate is synchronous loop-side work (dict lookup +
+        pure `evaluate_capability` + fire-and-forget audit emit); it never awaits,
+        takes a sync-bridge permit, or calls a `*_sync` mirror. A denied assertion
+        raises `CapabilityException` loop-side, which crosses the sync bridge via
+        `future.result()` exactly like a handler error.
+        """
+        # Gate the RAW author claim BEFORE the system->hostname rewrite (the
+        # gate's evaluate_capability branches on author=="system"). No-op when
+        # capability is inactive or the call is framework-origin (empty chain).
+        author, author_id, asserted = self._gate_author(author, author_id)
+
+        if author == "system":
+            author = self.hostname
+            author_id = self.hostname
+
+        # The producer is spawned inside create_gen_request, so wrapping it in the
+        # asserted scope makes the producer inherit the assertion at create_task.
+        with asserted_identity_scope(asserted):
+            return await self.create_gen_request(
+                plugin,
+                method,
+                args,
+                plugin_uuid,
+                hosts,
+                blocked_hosts,
+                author,
+                author_id,
+                timeout,
+                author_host,
+                request_id,
+                _post_construct_hook=_post_construct_hook,
+            )
 
     @async_gen_log_errors
     async def execute_stream(
@@ -6850,11 +6941,11 @@ class Plexus(EventMixin):
 
         hosts, blocked_hosts = self._validate_host_args(hosts, blocked_hosts)
 
-        if author == "system":
-            author = self.hostname
-            author_id = self.hostname
-
-        request = await self.create_gen_request(
+        # Gate + system->hostname rewrite + producer spawn happen in the shared
+        # _create_gen_request_gated body (the single gate point for the stream
+        # entries). The request assignment stays ABOVE the try below so a
+        # gate-deny never reaches the finally with request unbound.
+        request = await self._create_gen_request_gated(
             plugin,
             method,
             args,
@@ -6935,11 +7026,18 @@ class Plexus(EventMixin):
                 "make further sync-bridge calls)."
             )
 
+        # C-004: same-thread deadlock guard. Previously inherited from
+        # create_gen_request_sync (which this method no longer calls); added here
+        # so a loop-thread caller still fails fast with a clear RuntimeError
+        # instead of parking the loop on the construction bridge below.
+        self._check_not_loop_thread("execute_stream_sync")
+
         hosts, blocked_hosts = self._validate_host_args(hosts, blocked_hosts)
 
-        if author == "system":
-            author = self.hostname
-            author_id = self.hostname
+        # The system->hostname rewrite is deliberately NOT done here: the RAW
+        # author is carried across the bridge so _create_gen_request_gated can
+        # gate the raw claim loop-side (the gate branches on author=="system"),
+        # THEN rewrite. Rewriting here would hide the claim from the gate.
 
         # Detect circular sync calls that would deadlock the threadpool
         chain = getattr(_sync_call_chain, "chain", ())
@@ -6984,7 +7082,12 @@ class Plexus(EventMixin):
         def _stamp_chain(request):
             request._call_chain = new_chain
 
-        request = self.create_gen_request_sync(
+        # Bridge the GATED construction loop-side — mirrors execute_sync's inline
+        # bridge of _dispatch_request, and deliberately does NOT call
+        # create_gen_request_sync (which hard-codes an UNGATED create_gen_request
+        # coro): the gate must land loop-side where the re-seated caller chain is
+        # visible. Do NOT DRY these two bridges back together.
+        coro = self._create_gen_request_gated(
             plugin,
             method,
             args,
@@ -6997,6 +7100,20 @@ class Plexus(EventMixin):
             author_host,
             request_id,
             _post_construct_hook=_stamp_chain,
+        )
+        # Caller identity: re-seat the worker-captured caller chain loop-side so
+        # the gate reads the originating handler as the real caller.
+        coro = self._with_caller_chain(current_caller_chain(), coro)
+        # R2-FF-1: bound the construction wait — see create_request_sync.
+        request_timeout = timeout[0] if isinstance(timeout, tuple) else timeout
+        wait_timeout = (request_timeout + 5.0) if isinstance(request_timeout, (int, float)) else 60.0
+        # Construction-only park; _bridge_wait frees E during the sub-ms wait and
+        # owns cancel-on-timeout. A gate-deny CapabilityException crosses here via
+        # future.result() and propagates out. Stays ABOVE the try below so a deny
+        # never reaches the finally with `request` unbound.
+        request = _bridge_wait(
+            asyncio.run_coroutine_threadsafe(coro, self.main_event_loop),
+            wait_timeout,
         )
 
         # R2-FF-4: increment _EXECUTE_DEPTH for the streaming body
