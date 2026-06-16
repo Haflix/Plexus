@@ -583,3 +583,71 @@ def _warn_redundant_host_combos(hosts, blocked_hosts, logger) -> None:
                 "hosts='remote' + blocked_hosts contains 'remote' or 'any' — "
                 "every allowed target is also blocked; no delivery will occur."
             )
+
+
+def parse_capabilities(raw: Any) -> dict:
+    """Rate-limiter Step 2b: validate + normalise the top-level main-config
+    ``capabilities:`` section into the runtime grant store shape:
+
+        {plugin_name: {"system_caller": bool,
+                       "impersonation": "caller" | "ancestor" | [names]}}
+
+    The operator-facing key is ``impersonation_allowed``; it is stored as
+    ``impersonation`` (what ``runtime.evaluate_capability`` reads). Returns ``{}``
+    when the section is absent. Raises ``ValueError`` (the config-layer
+    convention) on a malformed entry so a bad grant fails LOUD at load, never as
+    a silent missing/over-broad privilege. Grants are OPERATOR authority: a
+    plugin manifest may document a request elsewhere, but only main config here
+    confers a capability.
+    """
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError(
+            "`capabilities` must be a mapping of plugin-name -> grant"
+        )
+    grants: dict = {}
+    for pname, spec in raw.items():
+        if not isinstance(spec, dict):
+            raise ValueError(
+                f"capabilities[{pname!r}] must be a mapping "
+                f"(system_caller / impersonation_allowed)"
+            )
+        g: dict = {}
+        if "system_caller" in spec:
+            sc = spec["system_caller"]
+            if not isinstance(sc, bool):
+                raise ValueError(
+                    f"capabilities[{pname!r}].system_caller must be true/false, "
+                    f"got {sc!r}"
+                )
+            g["system_caller"] = sc
+        if "impersonation_allowed" in spec:
+            imp = spec["impersonation_allowed"]
+            if imp in ("caller", "ancestor"):
+                g["impersonation"] = imp
+            elif isinstance(imp, list) and imp and all(
+                isinstance(x, str) for x in imp
+            ):
+                g["impersonation"] = list(imp)
+            else:
+                raise ValueError(
+                    f"capabilities[{pname!r}].impersonation_allowed must be "
+                    f"'caller', 'ancestor', or a non-empty list of plugin names; "
+                    f"got {imp!r}"
+                )
+        unknown = set(spec) - {"system_caller", "impersonation_allowed"}
+        if unknown:
+            raise ValueError(
+                f"capabilities[{pname!r}] has unknown key(s) {sorted(unknown)}; "
+                f"allowed: system_caller, impersonation_allowed"
+            )
+        # Only store an entry that actually CONFERS a capability. A
+        # ``{system_caller: false}`` (or otherwise empty) entry grants nothing,
+        # so it must NOT land in the store -- otherwise it would flip
+        # _capability_active on (and force default-deny + identity stamping
+        # node-wide) while granting the plugin nothing, a silent operator
+        # foot-gun. ``system_caller: false`` is thus a no-op, same as omitting it.
+        if g.get("system_caller") or "impersonation" in g:
+            grants[pname] = g
+    return grants

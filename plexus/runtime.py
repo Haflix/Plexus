@@ -18,7 +18,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 
 from .exceptions import RequestException
 
@@ -164,6 +164,156 @@ def seeded_sync_chain(active: bool, ident: "CallerIdentity"):
     if not active:
         return None
     return _caller_chain.get() + (ident,)
+
+
+# ── Rate-limiter Step 2b: capability gate (identity assertion) ────────
+#
+# Step 2a stamps WHO IS REALLY CALLING (the chain). Step 2b governs WHO A CALL
+# MAY CLAIM TO BE -- the ``author`` / ``author_id`` passed to execute / publish /
+# request. When any capability grant is configured (the gate is otherwise inert,
+# preserving the historical "author is a plain routing label" behaviour), an
+# author that differs from the real caller is an ASSERTION and must be
+# authorised: ``system_caller`` to claim "system", ``impersonation_allowed``
+# (scope caller | ancestor | [list]) to claim another plugin. Default-deny,
+# fail-closed (raises CapabilityException before dispatch), audited.
+#
+# ``_asserted_identity`` carries the currently-active asserted identity down the
+# call chain (ContextVar -> copied into child tasks). It powers BOTH the
+# no-chaining rule (an already-impersonating chain may only continue the SAME
+# assertion) now, and the "charge the asserted identity" attribution in Step 3.
+
+_asserted_identity: ContextVar = ContextVar("_aio_asserted_identity", default=None)
+
+
+class CapabilityVerdict(NamedTuple):
+    """Outcome of ``evaluate_capability``.
+
+    allowed       -- False -> the caller (the gate) raises CapabilityException.
+    author/author_id -- the EFFECTIVE claim to carry forward (an impersonation of
+                     an in-chain plugin is normalised to that plugin's REAL uuid
+                     from the chain, never the caller-supplied one).
+    asserted      -- the CallerIdentity to install in ``_asserted_identity`` for
+                     the operation's duration (None = no new scope: a self-call,
+                     or continuing an assertion already active up the chain).
+    is_assertion  -- True when the claim differs from the real caller (audit it).
+    reason        -- human-readable basis (for audit / the deny message).
+    """
+    allowed: bool
+    author: str
+    author_id: str
+    asserted: Optional["CallerIdentity"]
+    is_assertion: bool
+    reason: str
+
+
+def _same_ident(ident: "CallerIdentity", name: str, uuid: str) -> bool:
+    return ident is not None and ident.name == name and ident.uuid == uuid
+
+
+def evaluate_capability(real, chain, author, author_id, grant, active_asserted):
+    """Pure capability decision. The framework-side gate handles the ContextVar
+    reads, audit, and raise; this function is side-effect-free and unit-tested.
+
+    real           -- CallerIdentity of the plugin making the call (chain's
+                      innermost). The framework gate must short-circuit (no
+                      gating) when the chain is EMPTY -- an empty chain is
+                      framework/system origin, which is trusted, so this function
+                      is only called with a real plugin frame.
+    chain          -- the full caller chain (outermost-first); chain[-1] is real.
+    author/author_id -- the claim passed to execute/publish/request.
+    grant          -- real's grants: {"system_caller": bool,
+                      "impersonation": "caller"|"ancestor"|list|None}. {} if none.
+    active_asserted -- the CallerIdentity currently in _asserted_identity, or None.
+    """
+    # Claiming one's own identity is not an assertion -- always allowed.
+    if author == real.name and author_id == real.uuid:
+        return CapabilityVerdict(True, author, author_id, None, False, "self")
+
+    # No-chaining: inside an active impersonation, only CONTINUING the same
+    # asserted identity is allowed; any different new assertion is denied,
+    # regardless of the caller's own grants (blocks laundering across budgets).
+    if active_asserted is not None:
+        if _same_ident(active_asserted, author, author_id):
+            return CapabilityVerdict(True, author, author_id, None, True, "continue-same")
+        return CapabilityVerdict(
+            False, author, author_id, None, True,
+            f"no-chaining: chain already asserts {active_asserted.name!r}; "
+            f"{real.name!r} cannot newly assert {author!r}",
+        )
+
+    # Fresh assertion -> consult real's grants.
+    if author == "system":
+        if grant.get("system_caller"):
+            return CapabilityVerdict(
+                True, "system", "system",
+                CallerIdentity("system", "system"), True, "system_caller grant",
+            )
+        return CapabilityVerdict(
+            False, author, author_id, None, True,
+            f"{real.name!r} claimed author='system' without the system_caller grant",
+        )
+
+    scope = grant.get("impersonation")
+    if scope is None:
+        return CapabilityVerdict(
+            False, author, author_id, None, True,
+            f"{real.name!r} attempted to impersonate {author!r} without "
+            f"impersonation_allowed",
+        )
+
+    # Explicit [targets]: a static trust independent of the live chain. The
+    # caller-supplied uuid is accepted (the operator authorised real to act as
+    # these names).
+    if isinstance(scope, (list, tuple)):
+        if author in scope:
+            return CapabilityVerdict(
+                True, author, author_id,
+                CallerIdentity(author, author_id), True, "explicit-target grant",
+            )
+        return CapabilityVerdict(
+            False, author, author_id, None, True,
+            f"{real.name!r} may impersonate {list(scope)!r}, not {author!r}",
+        )
+
+    # "caller" / "ancestor": the target must GENUINELY be in the live chain
+    # (you can only impersonate someone who actually caused this call). Match by
+    # name and adopt that frame's REAL uuid (caller cannot fake the uuid).
+    ancestry = chain[:-1]  # everyone above real (real == chain[-1])
+    if scope == "caller":
+        candidates = (ancestry[-1],) if ancestry else ()
+    elif scope == "ancestor":
+        candidates = ancestry
+    else:
+        return CapabilityVerdict(
+            False, author, author_id, None, True,
+            f"{real.name!r} has an unrecognised impersonation scope {scope!r}",
+        )
+    match = next((f for f in candidates if f.name == author), None)
+    if match is not None:
+        return CapabilityVerdict(
+            True, match.name, match.uuid, match, True, f"{scope} scope",
+        )
+    return CapabilityVerdict(
+        False, author, author_id, None, True,
+        f"{real.name!r} may impersonate its {scope} but {author!r} is not in the "
+        f"live caller chain",
+    )
+
+
+@contextmanager
+def asserted_identity_scope(ident: "Optional[CallerIdentity]"):
+    """Install ``ident`` as the active asserted identity for the block, then
+    restore. A no-op when ``ident`` is None (a self-call or a continue-same
+    assertion adds no new scope). Used by the gate to wrap a gated operation so
+    nested calls inherit the assertion (no-chaining + Step 3 charge-asserted)."""
+    if ident is None:
+        yield
+        return
+    token = _asserted_identity.set(ident)
+    try:
+        yield
+    finally:
+        _asserted_identity.reset(token)
 
 
 @contextmanager

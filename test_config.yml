@@ -116,6 +116,19 @@ plugins:
     enabled: true
     path: ./plugins_test/TestIdentityTarget
 
+  # Rate-limiter Step 2b capability-gate suite + its asserting actor (twice).
+  - name: TestCapabilitySuite
+    enabled: true
+    path: ./plugins_test/TestCapabilitySuite
+
+  - name: TestCapabilityActor
+    enabled: true
+    path: ./plugins_test/TestCapabilityActor
+
+  - name: TestCapabilityActor2          # second identity for the ancestry chain
+    enabled: true
+    path: ./plugins_test/TestCapabilityActor
+
   # PR2 fixture plugins — loaded on-demand by TestPR2Suite (§5.4 idiom).
   # enabled:false so they don't auto-start at test framework boot.
   - name: TestPR2Fixture

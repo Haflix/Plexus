@@ -1,0 +1,17 @@
+description: Rate-limiter Step 2b suite — drives the capability gate end-to-end through execute()
+version: "0.1.0"
+remote: false
+arguments:
+endpoints:
+  run:
+    internal_name: run
+    remote: false
+    accessible_by_other_plugins: true
+    description: Run the capability-gate cases and return a structured suite result dict
+    arguments:
+      - name: category
+      - name: host
+      - name: case_ids
+      - name: bug_ids
+      - name: skip_slow
+      - name: allow_destructive

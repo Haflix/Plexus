@@ -24,6 +24,7 @@ import yaml
 from .exceptions import (
     ConfigException,
     RequestException,
+    CapabilityException,
 )
 from .networking_classes import Node, RemotePlugin
 from .utils import LogUtil, Request, Plugin, ConfigUtil, GeneratorRequest, Event
@@ -70,6 +71,7 @@ from .helpers.config import (  # noqa: F401  (re-export shim)
     _normalize_hosts,
     _normalize_authors,
     _warn_redundant_host_combos,
+    parse_capabilities,
 )
 
 # Cross-cutting runtime primitives (sync-call-chain threadlocal, the
@@ -100,6 +102,10 @@ from .runtime import (  # noqa: F401  (re-export shim)
     seeded_sync_chain,
     current_caller_chain,
     establish_caller_chain,
+    # Rate-limiter Step 2b: capability gate primitives.
+    _asserted_identity,
+    evaluate_capability,
+    asserted_identity_scope,
 )
 
 from .events import EventMixin
@@ -171,6 +177,20 @@ class Plexus(EventMixin):
         # and the identity machinery ships wired but inert. Tests force it True
         # to exercise the stamping in isolation.
         self._identity_active: bool = False
+
+        # Rate-limiter Step 2b: capability grants + master switch. Grants map a
+        # plugin name -> {"system_caller": bool, "impersonation": "caller" |
+        # "ancestor" | [names] | None}, populated from the main-config
+        # ``capabilities:`` section. The gate (_gate_author) is INERT when no
+        # grant exists (author stays a plain routing label, the historical
+        # behaviour). When any grant is configured, identity stamping must be on
+        # so the gate can read the real caller -- _recompute_capability_active
+        # turns _identity_active on. Tests inject grants directly.
+        self._capability_grants: Dict[str, dict] = {}
+        self._capability_active: bool = False
+        # yaml_config was loaded above; parse the capabilities: section now so
+        # the gate is live from the first dispatch when grants are configured.
+        self._load_capability_grants()
 
         self.main_event_loop = None
         self.plugins = {}
@@ -5540,6 +5560,82 @@ class Plexus(EventMixin):
 
         return _seeded
 
+    def _load_capability_grants(self) -> None:
+        """Rate-limiter Step 2b: (re)load the main-config ``capabilities:``
+        section into the grant store and recompute the master switch. Called at
+        init; re-callable on hot-reload (grants are runtime-reconfigurable). A
+        malformed section raises at load via ``parse_capabilities`` -> ValueError
+        (fail loud, never a silent missing/over-broad grant)."""
+        raw = (self.yaml_config or {}).get("capabilities")
+        self._capability_grants = parse_capabilities(raw)
+        self._recompute_capability_active()
+        if self._capability_active:
+            self._logger.info(
+                "[CAPABILITY] gate active; grants configured for: %s",
+                sorted(self._capability_grants),
+            )
+
+    def _recompute_capability_active(self) -> None:
+        """Rate-limiter Step 2b: derive the capability master switch from the
+        grant store. When ANY grant exists the gate is live, which requires the
+        Step 2a identity stamping so the gate can read the real caller -- so this
+        also turns ``_identity_active`` on (it never turns it OFF: a rate limit,
+        or a test, may want stamping independently). Called after the config
+        ``capabilities:`` section is applied (and re-callable on hot-reload)."""
+        self._capability_active = bool(self._capability_grants)
+        if self._capability_active:
+            self._identity_active = True
+
+    def _gate_author(self, author, author_id):
+        """Rate-limiter Step 2b capability gate. Returns ``(effective_author,
+        effective_author_id, asserted)`` where ``asserted`` is the CallerIdentity
+        to install via ``asserted_identity_scope`` for the operation (None = no
+        new scope). Raises ``CapabilityException`` (fail CLOSED) on a denied
+        assertion. Pass-through no-op when capability is inactive OR the call has
+        no real plugin frame (empty chain = framework/system origin, trusted)."""
+        if not self._capability_active:
+            return author, author_id, None
+        chain = current_caller_chain()
+        if not chain:
+            return author, author_id, None
+        real = chain[-1]
+        grant = self._capability_grants.get(real.name, {})
+        verdict = evaluate_capability(
+            real, chain, author, author_id, grant, _asserted_identity.get()
+        )
+        if not verdict.allowed:
+            self._logger.warning("[CAPABILITY] DENY: %s", verdict.reason)
+            self._emit_identity_audit(
+                real, verdict.author, verdict.author_id, chain, verdict, True
+            )
+            raise CapabilityException(verdict.reason)
+        if verdict.is_assertion:
+            self._emit_identity_audit(
+                real, verdict.author, verdict.author_id, chain, verdict, False
+            )
+        return verdict.author, verdict.author_id, verdict.asserted
+
+    def _emit_identity_audit(
+        self, real, asserted_author, asserted_author_id, chain, verdict, denied
+    ) -> None:
+        """Emit the Section 9 audit event for an elevated/impersonated (or
+        denied) identity assertion onto the internal bus, best-effort. (Section
+        13 burst de-duplication is a later refinement; this emits per event.)"""
+        try:
+            self._internal_emit(
+                "_core/security/identity_asserted",
+                real_caller=real.name,
+                real_caller_id=real.uuid,
+                asserted=asserted_author,
+                asserted_id=asserted_author_id,
+                denied=denied,
+                reason=verdict.reason,
+                chain=[f.name for f in chain],
+                ts=time.time(),
+            )
+        except Exception:
+            pass
+
     async def _call_endpoint(
         self,
         func: Callable,
@@ -6495,42 +6591,50 @@ class Plexus(EventMixin):
         """
         hosts, blocked_hosts = self._validate_host_args(hosts, blocked_hosts)
 
+        # Rate-limiter Step 2b: capability gate on the RAW author claim, BEFORE
+        # the system->hostname rewrite below (the gate reasons about the raw
+        # claim). No-op when capability is inactive or the call is framework-
+        # origin (empty chain). asserted is scoped over the whole dispatch so
+        # nested calls inherit it (no-chaining + Step 3 charge-asserted).
+        author, author_id, _asserted = self._gate_author(author, author_id)
+
         if author == "system":
             author = self.hostname
             author_id = self.hostname
 
-        request = await self.create_request(
-            plugin,
-            method,
-            args,
-            plugin_uuid,
-            hosts,
-            blocked_hosts,
-            author,
-            author_id,
-            timeout,
-            author_host,
-            request_id,
-        )
-        try:
-            result, error, _ = await request.wait_for_result_async()
-            if error:
-                self._logger.warning(
-                    "Error executing %s.%s (Req-ID: %s): %s. You can check the logs for this Req-ID.",
-                    plugin,
-                    method,
-                    request.id,
-                    result,
-                )
-                raise RequestException(result)
-            return result
-        finally:
-            # B-073 Session 2 Step 3: done-callback eviction. Runs on
-            # normal return, RequestException, AND CancelledError —
-            # without this, a cancelled caller would leave the Request
-            # lingering in self.requests forever. Sync, GIL-atomic,
-            # idempotent with the producer-side pop in _process_request.
-            self.requests.pop(request.id, None)
+        with asserted_identity_scope(_asserted):
+            request = await self.create_request(
+                plugin,
+                method,
+                args,
+                plugin_uuid,
+                hosts,
+                blocked_hosts,
+                author,
+                author_id,
+                timeout,
+                author_host,
+                request_id,
+            )
+            try:
+                result, error, _ = await request.wait_for_result_async()
+                if error:
+                    self._logger.warning(
+                        "Error executing %s.%s (Req-ID: %s): %s. You can check the logs for this Req-ID.",
+                        plugin,
+                        method,
+                        request.id,
+                        result,
+                    )
+                    raise RequestException(result)
+                return result
+            finally:
+                # B-073 Session 2 Step 3: done-callback eviction. Runs on
+                # normal return, RequestException, AND CancelledError —
+                # without this, a cancelled caller would leave the Request
+                # lingering in self.requests forever. Sync, GIL-atomic,
+                # idempotent with the producer-side pop in _process_request.
+                self.requests.pop(request.id, None)
 
     @log_errors
     def execute_sync(

@@ -1,0 +1,36 @@
+description: Rate-limiter Step 2b fixture — makes asserting execute calls to drive the capability gate
+version: "0.1.0"
+remote: false
+arguments:
+endpoints:
+  echo:
+    internal_name: echo
+    remote: false
+    accessible_by_other_plugins: true
+    description: Victim sink — returns "echo"
+    arguments:
+      - name: value
+  do_assert:
+    internal_name: do_assert
+    remote: false
+    accessible_by_other_plugins: true
+    description: Make an asserting execute call with a claimed author/author_id
+    arguments:
+      - name: target
+      - name: method
+      - name: author
+      - name: author_id
+  try_reassert:
+    internal_name: try_reassert
+    remote: false
+    accessible_by_other_plugins: true
+    description: Under an active assertion, attempt a different one (no-chaining proof)
+    arguments:
+      - name: value
+  relay:
+    internal_name: relay
+    remote: false
+    accessible_by_other_plugins: true
+    description: Forward to an inner execute so the inner target sees this actor as ancestor
+    arguments:
+      - name: spec
