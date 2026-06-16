@@ -1281,7 +1281,7 @@ class EventMixin:
         # C-004: same-thread deadlock guard.
         self._check_not_loop_thread("publish_event_sync")
         chain = getattr(_sync_call_chain, "chain", ())
-        # Rate-limiter Step 2a: also carry the originating sync handler's
+        # Caller identity: also carry the originating sync handler's
         # IDENTITY across the bridge (distinct from `chain`/`_caller_chain`
         # above, which is the flat cycle-detection chain). Captured worker-side
         # via current_caller_chain(), re-seated loop-side by _with_caller_chain.
@@ -1597,7 +1597,7 @@ class EventMixin:
         # C-004: same-thread deadlock guard.
         self._check_not_loop_thread("request_event_sync")
         chain = getattr(_sync_call_chain, "chain", ())
-        # Rate-limiter Step 2a: carry the originating sync handler's IDENTITY
+        # Caller identity: carry the originating sync handler's IDENTITY
         # across the bridge (distinct from the flat cycle-detection `chain`).
         _req_coro = self._with_caller_chain(
             current_caller_chain(),
@@ -2072,7 +2072,7 @@ class EventMixin:
             timeout,
             _caller_chain=chain,
         )
-        # Rate-limiter Step 2a: capture the originating sync handler's IDENTITY
+        # Caller identity: capture the originating sync handler's IDENTITY
         # once (constant across the stream); re-seated loop-side on each pull
         # below so the open-charge (first __anext__) attributes to the right
         # caller. Distinct from the flat cycle-detection `chain` above.

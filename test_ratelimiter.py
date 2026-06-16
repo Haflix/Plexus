@@ -1,4 +1,4 @@
-"""Unit tests for plexus.ratelimiter (Step 1: pure Bucket + RateLimiter).
+"""Unit tests for plexus.ratelimiter (the pure Bucket + RateLimiter core).
 
 Standalone + deterministic: every test injects ``now`` so there are no sleeps
 and no wall-clock flakiness. Run with: python test_ratelimiter.py
@@ -11,8 +11,12 @@ PASS, FAIL = [], []
 
 
 def check(name, cond, detail=""):
-    (PASS if cond else FAIL).append(name)
-    print(f"  [{'PASS' if cond else 'FAIL'}] {name}{(' -- ' + detail) if detail else ''}")
+    if cond:
+        PASS.append(name)
+        print(f"  ok   {name}")
+    else:
+        FAIL.append(name)
+        print(f"  FAIL {name}  {detail}")
 
 
 def raises_config(fn):
@@ -163,17 +167,22 @@ def test_registry():
 
 def test_config_validation():
     rl = RateLimiter()
-    check("config: max=0 rejected", raises_config(lambda: rl.configure("d", "k", 0, 1)))
-    check("config: window=0 rejected", raises_config(lambda: rl.configure("d", "k", 5, 0)))
-    check("config: negative max rejected", raises_config(lambda: rl.configure("d", "k", -5, 1)))
-    check("config: non-numeric rejected", raises_config(lambda: rl.configure("d", "k", "abc", 1)))
-    # bool is an int subclass; float(True)==1.0 must NOT slip through as a 1-token bucket
-    check("config: max=True (bool) rejected", raises_config(lambda: rl.configure("d", "k", True, 1)))
-    check("config: window=False (bool) rejected", raises_config(lambda: rl.configure("d", "k", 5, False)))
-    # inf/nan slip past a bare `<= 0` check and create silently-broken buckets
-    check("config: max=inf rejected", raises_config(lambda: rl.configure("d", "k", float("inf"), 1)))
-    check("config: window=inf rejected", raises_config(lambda: rl.configure("d", "k", 5, float("inf"))))
-    check("config: max=nan rejected", raises_config(lambda: rl.configure("d", "k", float("nan"), 1)))
+
+    def rejects(max_tokens, window):
+        return raises_config(lambda: rl.configure("d", "k", max_tokens, window))
+
+    check("config: max=0 rejected", rejects(0, 1))
+    check("config: window=0 rejected", rejects(5, 0))
+    check("config: negative max rejected", rejects(-5, 1))
+    check("config: non-numeric rejected", rejects("abc", 1))
+    # bool is an int subclass; float(True)==1.0 must NOT slip through as a
+    # silent 1-token bucket.
+    check("config: max=True (bool) rejected", rejects(True, 1))
+    check("config: window=False (bool) rejected", rejects(5, False))
+    # inf/nan slip past a bare `<= 0` check and create silently-broken buckets.
+    check("config: max=inf rejected", rejects(float("inf"), 1))
+    check("config: window=inf rejected", rejects(5, float("inf")))
+    check("config: max=nan rejected", rejects(float("nan"), 1))
 
 
 # ── counters reflect true volume ───────────────────────────────────────
@@ -239,16 +248,19 @@ def test_admit_cost_guard():
 
 
 if __name__ == "__main__":
-    print("plexus.ratelimiter unit tests:")
-    for t in (test_refill, test_admit_commit_all, test_admit_reject_no_leak,
-              test_admit_boundary, test_admit_deterministic_order, test_admit_empty,
-              test_admit_refill_mid_charge, test_fractional_cost, test_reconfigure,
-              test_reconfigure_rate_effect, test_backward_now_is_noop,
-              test_admit_cost_guard, test_stream_weight,
-              test_registry, test_config_validation, test_counters):
+    tests = [
+        test_refill, test_admit_commit_all, test_admit_reject_no_leak,
+        test_admit_boundary, test_admit_deterministic_order, test_admit_empty,
+        test_admit_refill_mid_charge, test_fractional_cost, test_reconfigure,
+        test_reconfigure_rate_effect, test_backward_now_is_noop,
+        test_admit_cost_guard, test_stream_weight,
+        test_registry, test_config_validation, test_counters,
+    ]
+    for t in tests:
+        print(t.__name__)
         t()
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:
         print("FAILED:", ", ".join(FAIL))
         raise SystemExit(1)
-    print("ALL PASS")
+    print("ALL PASSED")

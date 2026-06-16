@@ -1,5 +1,5 @@
-description: Rate-limiter Step 2a fixture — disable/enable target for the lifecycle-exempt identity case
-version: "0.1.0"
+description: Caller-identity fixture — disable/enable target for the lifecycle-exempt identity case
+version: "0.1.1"
 remote: false
 arguments:
 endpoints:

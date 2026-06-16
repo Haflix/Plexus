@@ -1,10 +1,9 @@
-"""TestIdentityTarget — rate-limiter Step 2a lifecycle-exempt fixture.
+"""Caller-identity lifecycle-exempt fixture.
 
-A minimal plugin the suite can disable + re-enable while
-``_identity_active`` is forced on, so its ``on_enable`` / ``on_disable``
-run under stamping and capture the caller chain. Step 2a stamps an EXEMPT
-frame for lifecycle scope (design Section 8); these captures let the suite
-assert that.
+A minimal plugin the suite can disable + re-enable while ``_identity_active``
+is forced on, so its ``on_enable`` / ``on_disable`` run under stamping and
+capture the caller chain. The framework stamps an EXEMPT frame for lifecycle
+scope; these captures let the suite assert that.
 """
 import sys
 from pathlib import Path

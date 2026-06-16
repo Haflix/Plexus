@@ -1,4 +1,4 @@
-"""Unit tests for the caller-identity primitives (rate-limiter Step 2a).
+"""Unit tests for the caller-identity primitives.
 
 Pure tests of the runtime helpers in isolation: CallerIdentity, the async
 ContextVar push/isolate/establish scopes, the sync-worker seed, and the
@@ -15,7 +15,7 @@ import sys
 from plexus.runtime import (
     CallerIdentity,
     _caller_chain,
-    _sync_caller_chain,
+    _sync_identity_chain,
     caller_chain_scope,
     current_caller_chain,
     establish_caller_chain,
@@ -36,8 +36,8 @@ def check(name, cond, detail=""):
 def _reset():
     """Clear any leaked context between tests."""
     _caller_chain.set(())
-    if getattr(_sync_caller_chain, "chain", None):
-        _sync_caller_chain.chain = ()
+    if getattr(_sync_identity_chain, "chain", None):
+        _sync_identity_chain.chain = ()
 
 
 # ── CallerIdentity ────────────────────────────────────────────────────
@@ -72,13 +72,13 @@ def test_current_prefers_sync_threadlocal():
     cv_ident = CallerIdentity("Loop", "ul")
     tl_ident = CallerIdentity("Worker", "uw")
     _caller_chain.set((cv_ident,))
-    _sync_caller_chain.chain = (tl_ident,)
+    _sync_identity_chain.chain = (tl_ident,)
     check(
         "current prefers non-empty sync threadlocal",
         current_caller_chain() == (tl_ident,),
     )
     # Empty threadlocal falls back to the ContextVar.
-    _sync_caller_chain.chain = ()
+    _sync_identity_chain.chain = ()
     check(
         "current falls back to ContextVar when threadlocal empty",
         current_caller_chain() == (cv_ident,),

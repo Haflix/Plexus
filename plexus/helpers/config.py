@@ -586,8 +586,9 @@ def _warn_redundant_host_combos(hosts, blocked_hosts, logger) -> None:
 
 
 def parse_capabilities(raw: Any) -> dict:
-    """Rate-limiter Step 2b: validate + normalise the top-level main-config
-    ``capabilities:`` section into the runtime grant store shape:
+    """Validate and normalise the top-level main-config ``capabilities:``
+    section into the runtime grant store shape consumed by
+    ``runtime.evaluate_capability``:
 
         {plugin_name: {"system_caller": bool,
                        "impersonation": "caller" | "ancestor" | [names]}}

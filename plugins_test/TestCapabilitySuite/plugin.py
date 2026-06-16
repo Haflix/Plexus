@@ -1,19 +1,23 @@
-"""TestCapabilitySuite — rate-limiter Step 2b capability-gate integration.
+"""Capability-gate integration suite.
 
 Drives the gate END-TO-END through real ``execute()`` dispatches (the pure
 decision logic is exhaustively covered by test_capability.py; this proves the
 WIRING: that the gate is actually called at execute, reads the real caller
 chain, raises CapabilityException, scopes the assertion, and is inert when off).
 
-Grants are injected programmatically (like Step 2a forced _identity_active);
-config-loaded grants are covered by the parse_capabilities unit path.
+Grants are injected programmatically into the live Plexus; config-loaded grants
+are covered by the parse_capabilities unit path.
 
 Cases:
 - inert-off: no grant -> an asserting call passes through ungated.
 - system deny / allow (system_caller grant).
 - impersonation without grant -> deny.
 - ancestor scope allow (via a relay that puts the asserted plugin in the chain).
+- no-chaining deny (proves the asserted-identity scope propagates).
 - self-call passthrough while the gate is active.
+
+``TestCapabilityActor`` is loaded twice by the test config -- once as ACTOR,
+once as ACTOR2 -- to provide two distinct identities and an ancestry chain.
 """
 import sys
 from pathlib import Path
@@ -27,7 +31,7 @@ from plexus.decorators import async_log_errors, log_errors  # noqa: E402
 from _test_helpers import CaseRecorder  # noqa: E402
 
 
-SUITE_VERSION = "0.1.0"
+SUITE_VERSION = "0.1.1"
 ACTOR = "TestCapabilityActor"
 ACTOR2 = "TestCapabilityActor2"
 
@@ -88,7 +92,7 @@ class TestCapabilitySuite(Plugin):
             await self._case_ancestor_allow(rec, kw)
             await self._case_no_chaining_deny(rec, kw)
             await self._case_self_call_passthrough(rec, kw)
-            await self._case_sync_stream_ungated_stub(rec, kw)
+            await self._case_sync_stream_gating_deferred(rec, kw)
         finally:
             self._plexus._capability_grants = orig_grants
             self._plexus._capability_active = orig_cap
@@ -211,15 +215,15 @@ class TestCapabilitySuite(Plugin):
                 )
         await rec.run_case("capability.self_call.passthrough", body, **kw)
 
-    async def _case_sync_stream_ungated_stub(self, rec, kw):
+    async def _case_sync_stream_gating_deferred(self, rec, kw):
         async def body(c):
-            # Step 2b known gap: execute_sync / execute_stream assertions are NOT
-            # gated yet (they rewrite author worker-side / iterate as generators;
-            # the gate lands when the deferred _dispatch_request cleanup relocates
-            # those bodies loop-side -- see ratelimiter_design.md). This skip is
-            # the anchor to FLIP to an expect-denied case once that lands.
+            # Known gap: execute_sync / execute_stream assertions are NOT gated
+            # yet (they rewrite author worker-side / iterate as generators; the
+            # gate lands when the deferred dispatch-unify cleanup relocates those
+            # bodies loop-side). This skip is the anchor to FLIP to an
+            # expect-denied case once that lands.
             c.skip(
                 "execute_sync/execute_stream gating deferred to the "
-                "_dispatch_request cleanup; flip to expect-denied then"
+                "dispatch-unify cleanup; flip to expect-denied then"
             )
-        await rec.run_case("capability.sync_stream.ungated_until_cleanup", body, **kw)
+        await rec.run_case("capability.sync_stream.gating_deferred", body, **kw)

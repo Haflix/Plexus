@@ -1,5 +1,5 @@
-description: Rate-limiter Step 2b fixture — makes asserting execute calls to drive the capability gate
-version: "0.1.0"
+description: Capability-gate fixture — makes asserting execute calls to drive the gate
+version: "0.1.1"
 remote: false
 arguments:
 endpoints:

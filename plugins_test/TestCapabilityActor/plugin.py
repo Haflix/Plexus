@@ -1,4 +1,4 @@
-"""TestCapabilityActor — rate-limiter Step 2b gate-wiring fixture.
+"""Capability-gate wiring fixture.
 
 A plugin that makes ASSERTING execute calls on demand, so the suite can drive
 the capability gate end-to-end through a real ``execute()`` dispatch. Loaded

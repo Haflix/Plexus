@@ -95,14 +95,14 @@ from .runtime import (  # noqa: F401  (re-export shim)
     PLUGIN_EXECUTOR_THREAD_CEILING,
     SYNC_DISPATCHER_THREAD_CEILING,
     SYNC_STREAM_THREAD_CEILING,
-    # Rate-limiter Step 2a: framework-stamped caller-identity primitives.
+    # Caller identity: framework-stamped caller-identity primitives.
     CallerIdentity,
-    _sync_caller_chain,
+    _sync_identity_chain,
     caller_chain_scope,
     seeded_sync_chain,
     current_caller_chain,
     establish_caller_chain,
-    # Rate-limiter Step 2b: capability gate primitives.
+    # Capability gate: capability gate primitives.
     _asserted_identity,
     evaluate_capability,
     asserted_identity_scope,
@@ -168,17 +168,16 @@ class Plexus(EventMixin):
         # drain. See _spawn_fire_and_forget for the contract.
         self._fire_and_forget: set = set()
 
-        # Rate-limiter Step 2a: master switch for framework-stamped caller
-        # identity (runtime._caller_chain / _sync_caller_chain). When False
-        # (the default) every push/pop at a framework->plugin dispatch is
-        # skipped, so a default node pays zero per dispatch (design Section 11
-        # zero-overhead-when-off). Step 4 recomputes this from config whenever
-        # a rate limit OR capability grant is active; until then it stays off
-        # and the identity machinery ships wired but inert. Tests force it True
-        # to exercise the stamping in isolation.
+        # Master switch for framework-stamped caller identity
+        # (runtime._caller_chain / _sync_identity_chain). When False (the
+        # default) every push/pop at a framework->plugin dispatch is skipped, so
+        # a default node pays zero per dispatch. It is turned on whenever a rate
+        # limit OR a capability grant is configured (see
+        # _recompute_capability_active); otherwise the identity machinery is
+        # wired but inert. Tests force it True to exercise the stamping.
         self._identity_active: bool = False
 
-        # Rate-limiter Step 2b: capability grants + master switch. Grants map a
+        # Capability gate: capability grants + master switch. Grants map a
         # plugin name -> {"system_caller": bool, "impersonation": "caller" |
         # "ancestor" | [names] | None}, populated from the main-config
         # ``capabilities:`` section. The gate (_gate_author) is INERT when no
@@ -3537,7 +3536,7 @@ class Plexus(EventMixin):
             on_enable_timeout = getattr(
                 self, "plugin_enable_timeout", DEFAULT_PLUGIN_ENABLE_TIMEOUT
             )
-            # Rate-limiter Step 2a: lifecycle scope is exempt (Section 8). Stamp
+            # Caller identity: lifecycle scope is exempt from charging. Stamp
             # an exempt caller frame so execute/publish calls the plugin makes
             # from inside on_enable inherit the exemption down the chain. The
             # _core/ + system-origin exemption is a charge-site read (Step 3),
@@ -3660,8 +3659,8 @@ class Plexus(EventMixin):
                     "plugin_disable_timeout",
                     DEFAULT_PLUGIN_DISABLE_TIMEOUT,
                 )
-                # Rate-limiter Step 2a: rollback on_disable is lifecycle scope
-                # too -> exempt frame (Section 8).
+                # Caller identity: rollback on_disable is lifecycle scope
+                # too -> exempt frame.
                 _rb_ident = (
                     CallerIdentity(plugin.plugin_name, plugin.plugin_uuid, exempt=True)
                     if self._identity_active else None
@@ -3850,8 +3849,8 @@ class Plexus(EventMixin):
         # cancellation hitting during _unregister_plugin_subscriptions
         # would skip the transition and leave the plugin in a stuck
         # DISABLING state.
-        # Rate-limiter Step 2a: on_disable is lifecycle scope -> exempt frame
-        # (Section 8), same as on_enable.
+        # Caller identity: on_disable is lifecycle scope -> exempt frame,
+        # same as on_enable.
         _disable_ident = (
             CallerIdentity(plugin.plugin_name, plugin.plugin_uuid, exempt=True)
             if self._identity_active else None
@@ -4763,7 +4762,7 @@ class Plexus(EventMixin):
             author_host,
             request_id,
         )
-        # Rate-limiter Step 2a: carry the originating sync handler's identity
+        # Caller identity: carry the originating sync handler's identity
         # across the bridge (captured worker-side, re-seated loop-side).
         coro = self._with_caller_chain(current_caller_chain(), coro)
         future = asyncio.run_coroutine_threadsafe(coro, self.main_event_loop)
@@ -4889,7 +4888,7 @@ class Plexus(EventMixin):
             request_id,
             _post_construct_hook=_post_construct_hook,
         )
-        # Rate-limiter Step 2a: carry the originating sync handler's identity
+        # Caller identity: carry the originating sync handler's identity
         # across the bridge (captured worker-side, re-seated loop-side).
         coro = self._with_caller_chain(current_caller_chain(), coro)
         future = asyncio.run_coroutine_threadsafe(coro, self.main_event_loop)
@@ -5526,10 +5525,10 @@ class Plexus(EventMixin):
             self.requests.pop(request.id, None)
 
     async def _with_caller_chain(self, chain, coro):
-        """Rate-limiter Step 2a: re-seat a worker-captured caller chain onto the
+        """Caller identity: re-seat a worker-captured caller chain onto the
         loop for ``coro``'s lifetime (the sync-bridge handoff).
 
-        A plugin's sync handler carries its identity in the _sync_caller_chain
+        A plugin's sync handler carries its identity in the _sync_identity_chain
         threadlocal; that threadlocal is invisible once a sync mirror bridges
         the operation back onto the loop via run_coroutine_threadsafe. The
         mirror captures ``current_caller_chain()`` worker-side and passes it
@@ -5542,7 +5541,7 @@ class Plexus(EventMixin):
             return await coro
 
     def _seed_sync_hook(self, fn, seed):
-        """Rate-limiter Step 2a: wrap a bare sync callable (a lifecycle hook
+        """Caller identity: wrap a bare sync callable (a lifecycle hook
         dispatched via ``run_in_executor`` with no ``_tracked`` wrapper of its
         own) so it seeds the worker caller-identity threadlocal from ``seed``
         and clears it on return. Returns ``fn`` unchanged when ``seed`` is None
@@ -5552,16 +5551,16 @@ class Plexus(EventMixin):
             return fn
 
         def _seeded(*a, **kw):
-            _sync_caller_chain.chain = seed
+            _sync_identity_chain.chain = seed
             try:
                 return fn(*a, **kw)
             finally:
-                _sync_caller_chain.chain = ()
+                _sync_identity_chain.chain = ()
 
         return _seeded
 
     def _load_capability_grants(self) -> None:
-        """Rate-limiter Step 2b: (re)load the main-config ``capabilities:``
+        """Capability gate: (re)load the main-config ``capabilities:``
         section into the grant store and recompute the master switch. Called at
         init; re-callable on hot-reload (grants are runtime-reconfigurable). A
         malformed section raises at load via ``parse_capabilities`` -> ValueError
@@ -5576,18 +5575,18 @@ class Plexus(EventMixin):
             )
 
     def _recompute_capability_active(self) -> None:
-        """Rate-limiter Step 2b: derive the capability master switch from the
-        grant store. When ANY grant exists the gate is live, which requires the
-        Step 2a identity stamping so the gate can read the real caller -- so this
-        also turns ``_identity_active`` on (it never turns it OFF: a rate limit,
-        or a test, may want stamping independently). Called after the config
-        ``capabilities:`` section is applied (and re-callable on hot-reload)."""
+        """Derive the capability master switch from the grant store. When ANY
+        grant exists the gate is live, which requires caller-identity stamping so
+        the gate can read the real caller -- so this also turns
+        ``_identity_active`` on (it never turns it OFF: a rate limit, or a test,
+        may want stamping independently). Called after the ``capabilities:``
+        config is applied (and re-callable on hot-reload)."""
         self._capability_active = bool(self._capability_grants)
         if self._capability_active:
             self._identity_active = True
 
     def _gate_author(self, author, author_id):
-        """Rate-limiter Step 2b capability gate. Returns ``(effective_author,
+        """Capability gate. Returns ``(effective_author,
         effective_author_id, asserted)`` where ``asserted`` is the CallerIdentity
         to install via ``asserted_identity_scope`` for the operation (None = no
         new scope). Raises ``CapabilityException`` (fail CLOSED) on a denied
@@ -5618,9 +5617,8 @@ class Plexus(EventMixin):
     def _emit_identity_audit(
         self, real, asserted_author, asserted_author_id, chain, verdict, denied
     ) -> None:
-        """Emit the Section 9 audit event for an elevated/impersonated (or
-        denied) identity assertion onto the internal bus, best-effort. (Section
-        13 burst de-duplication is a later refinement; this emits per event.)"""
+        """Emit the audit event for an asserted (or denied) identity claim onto
+        the internal bus, best-effort."""
         try:
             self._internal_emit(
                 "_core/security/identity_asserted",
@@ -5654,7 +5652,7 @@ class Plexus(EventMixin):
         ``_plugin_executor``. The execute path (``request is None`` OR
         ``request.kind == "execute"``) takes ZERO new code paths.
         """
-        # Rate-limiter Step 2a: stamp the identity of the plugin we are about
+        # Caller identity: stamp the identity of the plugin we are about
         # to enter so its own callbacks into execute/publish read it as the
         # innermost caller. Identity comes from the RESOLVED plugin instance
         # bound to ``func`` (``func.__self__``), NOT request.target_plugin_uuid
@@ -5694,13 +5692,13 @@ class Plexus(EventMixin):
             def _tracked_event(ev):
                 _sync_call_chain.chain = call_chain
                 if _sync_seed is not None:
-                    _sync_caller_chain.chain = _sync_seed
+                    _sync_identity_chain.chain = _sync_seed
                 try:
                     return func(ev)
                 finally:
                     _sync_call_chain.chain = ()
                     if _sync_seed is not None:
-                        _sync_caller_chain.chain = ()
+                        _sync_identity_chain.chain = ()
 
             return await self.main_event_loop.run_in_executor(
                 self.sync_dispatcher.executor, _tracked_event, event
@@ -5721,13 +5719,13 @@ class Plexus(EventMixin):
         def _tracked(*a, **kw):
             _sync_call_chain.chain = call_chain
             if _sync_seed is not None:
-                _sync_caller_chain.chain = _sync_seed
+                _sync_identity_chain.chain = _sync_seed
             try:
                 return func(*a, **kw)
             finally:
                 _sync_call_chain.chain = ()
                 if _sync_seed is not None:
-                    _sync_caller_chain.chain = ()
+                    _sync_identity_chain.chain = ()
 
         if isinstance(args, tuple):
             return await self.main_event_loop.run_in_executor(
@@ -5876,7 +5874,7 @@ class Plexus(EventMixin):
                     )
                     return
 
-                # Rate-limiter Step 2a: stamp the target plugin's identity for
+                # Caller identity: stamp the target plugin's identity for
                 # the generator's lifetime (its code runs the plugin's). Local
                 # branch only -- a RemotePlugin stream runs on the peer and is
                 # gated by Nodes-IN there, not a local identity here. Identity
@@ -5947,13 +5945,13 @@ class Plexus(EventMixin):
                     def _next_with_chain(g, sent, ch):
                         _sync_call_chain.chain = ch
                         if _stream_seed is not None:
-                            _sync_caller_chain.chain = _stream_seed
+                            _sync_identity_chain.chain = _stream_seed
                         try:
                             return next(g, sent)
                         finally:
                             _sync_call_chain.chain = ()
                             if _stream_seed is not None:
-                                _sync_caller_chain.chain = ()
+                                _sync_identity_chain.chain = ()
 
                     sentinel = object()
                     while True:
@@ -6112,7 +6110,7 @@ class Plexus(EventMixin):
 
             first = True
 
-            # Rate-limiter Step 2a: identity of the subscriber plugin whose
+            # Caller identity: identity of the subscriber plugin whose
             # streaming handler we are about to pull. Stamped around each
             # generator pull (where the plugin's code runs), not across the
             # queue.put between pulls (framework code).
@@ -6205,13 +6203,13 @@ class Plexus(EventMixin):
                 def _next_with_chain(g, sent, ch):
                     _sync_call_chain.chain = ch
                     if _es_seed is not None:
-                        _sync_caller_chain.chain = _es_seed
+                        _sync_identity_chain.chain = _es_seed
                     try:
                         return next(g, sent)
                     finally:
                         _sync_call_chain.chain = ()
                         if _es_seed is not None:
-                            _sync_caller_chain.chain = ()
+                            _sync_identity_chain.chain = ()
 
                 try:
                     while True:
@@ -6373,7 +6371,7 @@ class Plexus(EventMixin):
         async def _emit_depth_isolated():
             token = _EMIT_DEPTH.set(0)
             try:
-                # Rate-limiter Step 2a note: the caller-identity chain is
+                # Caller-identity note: the caller-identity chain is
                 # deliberately NOT isolated here. create_task copies the parent
                 # context, and every _spawn_tracked callee is a PER-OPERATION
                 # task (request dispatch, fan-out delivery, stream producer), so
@@ -6478,7 +6476,7 @@ class Plexus(EventMixin):
         async def _emit_depth_isolated():
             token = _EMIT_DEPTH.set(0)
             try:
-                # Rate-limiter Step 2a note: the caller-identity chain is
+                # Caller-identity note: the caller-identity chain is
                 # deliberately NOT isolated here. create_task copies the parent
                 # context, and every _spawn_tracked callee is a PER-OPERATION
                 # task (request dispatch, fan-out delivery, stream producer), so
@@ -6591,7 +6589,7 @@ class Plexus(EventMixin):
         """
         hosts, blocked_hosts = self._validate_host_args(hosts, blocked_hosts)
 
-        # Rate-limiter Step 2b: capability gate on the RAW author claim, BEFORE
+        # Capability gate: capability gate on the RAW author claim, BEFORE
         # the system->hostname rewrite below (the gate reasons about the raw
         # claim). No-op when capability is inactive or the call is framework-
         # origin (empty chain). asserted is scoped over the whole dispatch so
@@ -6728,7 +6726,7 @@ class Plexus(EventMixin):
 
         depth_token = _EXECUTE_DEPTH.set(execute_depth + 1)
         try:
-            # Rate-limiter Step 2a: capture the originating sync handler's
+            # Caller identity: capture the originating sync handler's
             # identity worker-side, re-seat it loop-side across the bridge.
             _exec_coro = self._execute_sync_tracked(
                 chain + (target,),

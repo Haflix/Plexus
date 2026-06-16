@@ -83,44 +83,40 @@ _EXECUTE_DEPTH: ContextVar[int] = ContextVar("_aio_execute_depth", default=0)
 _MAX_EXECUTE_DEPTH: int = 16
 
 
-# ── Rate-limiter Step 2a: framework-stamped caller identity ───────────
+# ── Framework-stamped caller identity ─────────────────────────────────
 #
 # "Who is really making this call." At every framework->plugin dispatch the
-# framework PUSHES the identity of the plugin it is about to enter; a plugin
-# that then calls back into execute/publish/request sees its OWN identity as
-# the innermost frame. Read as the authoritative caller for rate-limit
-# attribution (Step 3) and the capability gate (Step 2b); the plugin's
-# ``author`` argument is a separate, gated CLAIM and is never trusted as the
-# identity (design ``ratelimiter_design.md`` Sections 2, 9).
+# framework pushes the identity of the plugin it is about to enter as the
+# innermost frame, so a plugin re-entering execute/publish/request sees its
+# OWN identity -- the authoritative caller, never the ``author`` argument
+# (that is a separate, gated CLAIM; see the capability gate below).
 #
-# Two parallel structures, same shape (a tuple of CallerIdentity,
-# outermost-first), because run_in_executor does NOT propagate a ContextVar
-# into the worker thread (verified in Phase 2b):
-#   _caller_chain        — async path: awaited handlers + tasks spawned via
-#                          create_task (contextvars copy into child tasks).
-#   _sync_caller_chain   — sync path: handlers dispatched onto a pool worker,
-#                          seeded from the loop-side chain captured at dispatch.
-# This is a SEPARATE structure from ``_sync_call_chain`` (the flat
-# "plugin.method" cycle-detection chain): Section 2 forbids reshaping that
-# one, since the ``target in chain`` membership tests depend on its shape.
+# Two parallel stores of the same shape (a tuple of CallerIdentity,
+# outermost-first), because run_in_executor does not propagate a ContextVar
+# into a worker thread:
+#   _caller_chain         — async path (awaited handlers; copied into child
+#                           tasks by create_task).
+#   _sync_identity_chain  — sync path (handlers on a pool worker), seeded from
+#                           the loop-side chain captured at dispatch.
+# Distinct from ``_sync_call_chain`` (the flat "plugin.method" cycle-detection
+# chain), whose ``target in chain`` membership tests depend on its shape.
 #
-# Stamping is CONDITIONAL on a per-Plexus ``_identity_active`` flag (default
-# False; Step 4 flips it from config). With it off, every push/pop below is
-# skipped, so a fully-default node pays nothing per dispatch (the Section 11
-# zero-overhead-when-off contract). Step 2a ships the seam wired but inert.
+# Stamping is gated by a per-Plexus ``_identity_active`` flag (default off):
+# when off, every push/pop below is skipped, so a default node pays nothing
+# per dispatch.
 
 class CallerIdentity(NamedTuple):
-    """One frame of the caller chain: the entered plugin's name + uuid, plus
-    an ``exempt`` origin marker (Section 8) set when the framework enters a
-    lifecycle hook / internal-origin scope so the whole sub-chain is exempt
-    from charging. ``exempt`` rides every nested frame via the chain."""
+    """One frame of the caller chain: the entered plugin's name + uuid, plus an
+    ``exempt`` marker set when the framework enters a lifecycle hook (so the
+    whole nested sub-chain is skipped by rate-limit charging). ``exempt`` rides
+    every nested frame via the chain."""
     name: str
     uuid: str
     exempt: bool = False
 
 
 _caller_chain: ContextVar[tuple] = ContextVar("_aio_caller_chain", default=())
-_sync_caller_chain = threading.local()
+_sync_identity_chain = threading.local()
 
 
 def current_caller_chain() -> tuple:
@@ -130,7 +126,7 @@ def current_caller_chain() -> tuple:
     seeded sync handler (the ContextVar is not visible there); otherwise the
     async ContextVar. Returns ``()`` when no plugin frame is active.
     """
-    sync = getattr(_sync_caller_chain, "chain", None)
+    sync = getattr(_sync_identity_chain, "chain", None)
     if sync:
         return sync
     return _caller_chain.get()
@@ -166,21 +162,21 @@ def seeded_sync_chain(active: bool, ident: "CallerIdentity"):
     return _caller_chain.get() + (ident,)
 
 
-# ── Rate-limiter Step 2b: capability gate (identity assertion) ────────
+# ── Capability gate (identity assertion) ──────────────────────────────
 #
-# Step 2a stamps WHO IS REALLY CALLING (the chain). Step 2b governs WHO A CALL
-# MAY CLAIM TO BE -- the ``author`` / ``author_id`` passed to execute / publish /
-# request. When any capability grant is configured (the gate is otherwise inert,
-# preserving the historical "author is a plain routing label" behaviour), an
-# author that differs from the real caller is an ASSERTION and must be
-# authorised: ``system_caller`` to claim "system", ``impersonation_allowed``
-# (scope caller | ancestor | [list]) to claim another plugin. Default-deny,
-# fail-closed (raises CapabilityException before dispatch), audited.
+# The caller chain above stamps who is really calling. This gate governs who a
+# call may CLAIM to be -- the ``author`` / ``author_id`` passed to execute. With
+# no grant configured the gate is inert (``author`` stays a plain routing
+# label, the historical behaviour); once any grant exists, an author that
+# differs from the real caller is an ASSERTION that must be authorised:
+# ``system_caller`` to claim "system", ``impersonation_allowed`` (scope
+# caller | ancestor | [list]) to claim another plugin. Default-deny, fail-closed
+# (raises CapabilityException before dispatch), audited.
 #
-# ``_asserted_identity`` carries the currently-active asserted identity down the
-# call chain (ContextVar -> copied into child tasks). It powers BOTH the
-# no-chaining rule (an already-impersonating chain may only continue the SAME
-# assertion) now, and the "charge the asserted identity" attribution in Step 3.
+# ``_asserted_identity`` carries the active asserted identity down the call
+# chain (a ContextVar, copied into child tasks). It drives the no-chaining rule
+# -- an already-impersonating chain may only continue the SAME assertion -- and
+# attribution of charges to the impersonated identity.
 
 _asserted_identity: ContextVar = ContextVar("_aio_asserted_identity", default=None)
 
@@ -188,15 +184,15 @@ _asserted_identity: ContextVar = ContextVar("_aio_asserted_identity", default=No
 class CapabilityVerdict(NamedTuple):
     """Outcome of ``evaluate_capability``.
 
-    allowed       -- False -> the caller (the gate) raises CapabilityException.
-    author/author_id -- the EFFECTIVE claim to carry forward (an impersonation of
-                     an in-chain plugin is normalised to that plugin's REAL uuid
-                     from the chain, never the caller-supplied one).
-    asserted      -- the CallerIdentity to install in ``_asserted_identity`` for
-                     the operation's duration (None = no new scope: a self-call,
-                     or continuing an assertion already active up the chain).
-    is_assertion  -- True when the claim differs from the real caller (audit it).
-    reason        -- human-readable basis (for audit / the deny message).
+    allowed      -- False -> the caller (the gate) raises CapabilityException.
+    author       -- effective name claim to carry forward.
+    author_id    -- effective uuid claim; for an in-chain impersonation this is
+                    the target frame's REAL uuid, not the caller-supplied value.
+    asserted     -- the CallerIdentity to install in ``_asserted_identity`` for
+                    the operation (None = no new scope: a self-call, or
+                    continuing an assertion already active up the chain).
+    is_assertion -- True when the claim differs from the real caller (audit it).
+    reason       -- human-readable basis (for audit / the deny message).
     """
     allowed: bool
     author: str
@@ -212,7 +208,7 @@ def _same_ident(ident: "CallerIdentity", name: str, uuid: str) -> bool:
 
 def evaluate_capability(real, chain, author, author_id, grant, active_asserted):
     """Pure capability decision. The framework-side gate handles the ContextVar
-    reads, audit, and raise; this function is side-effect-free and unit-tested.
+    reads, audit, and raise; this function is side-effect-free.
 
     real           -- CallerIdentity of the plugin making the call (chain's
                       innermost). The framework gate must short-circuit (no
@@ -305,7 +301,8 @@ def asserted_identity_scope(ident: "Optional[CallerIdentity]"):
     """Install ``ident`` as the active asserted identity for the block, then
     restore. A no-op when ``ident`` is None (a self-call or a continue-same
     assertion adds no new scope). Used by the gate to wrap a gated operation so
-    nested calls inherit the assertion (no-chaining + Step 3 charge-asserted)."""
+    nested calls inherit the assertion (for the no-chaining check and for
+    attributing charges to the impersonated identity)."""
     if ident is None:
         yield
         return
@@ -320,7 +317,7 @@ def asserted_identity_scope(ident: "Optional[CallerIdentity]"):
 def establish_caller_chain(chain: tuple):
     """REPLACE the async caller chain with ``chain`` for the block, then
     restore. Used by the sync-bridge handoff: a plugin's sync handler carries
-    its identity in the _sync_caller_chain threadlocal, which is invisible once
+    its identity in the _sync_identity_chain threadlocal, which is invisible once
     a sync mirror bridges the operation onto the loop via
     run_coroutine_threadsafe. The mirror captures the worker chain and re-seats
     it here so the loop-side dispatch attributes to the originating handler.

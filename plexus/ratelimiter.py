@@ -1,10 +1,8 @@
-"""Token-bucket rate limiter primitives for Plexus.
+"""Token-bucket rate-limiter primitives for Plexus.
 
-Step 1 of the rate-limiter build (see
-``_private/plans/ratelimiter_design.md``): the pure, framework-agnostic core,
-``Bucket`` + ``RateLimiter``. No event loop, no caller-identity context, no
-charge-set wiring; those arrive in later steps. This module is deliberately
-self-contained and unit-testable in isolation.
+The pure, framework-agnostic core: ``Bucket`` + ``RateLimiter``. Deliberately
+self-contained, with no asyncio dependency, so the token-bucket logic is
+unit-testable in isolation from the rest of the framework.
 
 Model: a ``Bucket`` is a token bucket with lazy continuous refill on a
 monotonic clock, configured as ``max`` + ``window`` (so ``rate = max / window``
@@ -56,9 +54,9 @@ class Bucket:
     counters.
 
     ``max_stream_weight`` is the largest stream cost registered against this
-    bucket (Section 7 of the design). It starts at 0.0 (NOT 1.0): a non-stream
-    bucket has no stream weight and must stay reconfigurable to any ``max > 0``,
-    including fractional values.
+    bucket (a stream may cost more than one token at open). It starts at 0.0
+    (NOT 1.0): a non-stream bucket has no stream weight and must stay
+    reconfigurable to any ``max > 0``, including fractional values.
     """
 
     __slots__ = (
@@ -107,13 +105,19 @@ class Bucket:
         # malformed weight fails loud here instead of silently leaving
         # max_stream_weight unchanged (nan slips a bare <=0 / >max check).
         if isinstance(weight, bool):
-            raise ConfigException(f"rate limit: stream_weight={weight!r} is a bool, not a number")
+            raise ConfigException(
+                f"rate limit: stream_weight={weight!r} is a bool, not a number"
+            )
         try:
             w = float(weight)
         except (TypeError, ValueError):
-            raise ConfigException(f"rate limit: stream_weight={weight!r} is not numeric")
+            raise ConfigException(
+                f"rate limit: stream_weight={weight!r} is not numeric"
+            )
         if not math.isfinite(w) or w <= 0:
-            raise ConfigException(f"rate limit: stream_weight must be a finite number > 0 (got {w})")
+            raise ConfigException(
+                f"rate limit: stream_weight must be a finite number > 0 (got {w})"
+            )
         if w > self.max:
             raise ConfigException(
                 f"rate limit: stream_weight {w} > bucket max {self.max}; this "
@@ -126,14 +130,12 @@ class Bucket:
 class RateLimiter:
     """Owns bucket namespaces keyed by ``(dimension, key)`` and runs admission.
 
-    Step 1 scope: bucket registry + configure + admit + counters. The
-    charge-set precompute, caller-identity context, and config parsing arrive
-    in later steps; here a caller hands ``admit()`` an explicit charge-set.
+    A caller registers buckets with ``configure`` and hands ``admit()`` an
+    explicit list of buckets to charge (the "charge-set").
 
-    Threading: NOT internally synchronized. All methods (admit AND the registry
-    mutators configure/remove) must be called from the single event-loop thread,
-    matching the framework's loop-side dispatch (design Sections 5, 11). There is
-    no lock by design; concurrent registry mutation from another thread would
+    Threading: NOT internally synchronized. Every method (admit AND the registry
+    mutators configure/remove) must be called from the single event-loop thread;
+    there is no lock by design, so concurrent mutation from another thread would
     race ``self._buckets``.
     """
 
@@ -165,8 +167,8 @@ class RateLimiter:
         Caller contract: discard any precomputed charge-set that referenced this
         bucket. A stale reference kept after remove (+ a later configure that
         creates a NEW object for the same key) would charge a dead, unregistered
-        bucket forever. Step 3 ties charge-set rebuild to re-registration (design
-        Section 3); until then, callers must not cache across a remove.
+        bucket forever. The framework rebuilds charge-sets at re-registration;
+        callers must not cache a charge-set across a remove.
         """
         self._buckets.pop((dimension, key), None)
 
@@ -178,8 +180,8 @@ class RateLimiter:
         FIRST dry bucket on reject (NOTHING committed -> no leak). Atomic only
         when called with no ``await`` between the peek and the commit
         (single-thread / loop-side). ``buckets`` must be a re-iterable sequence
-        already in the caller's pinned order (design Section 5); ``admit``
-        honors list order so the reported dry bucket is deterministic. An empty
+        already in the caller's pinned order; ``admit`` honors list order so the
+        reported dry bucket is deterministic. An empty
         charge-set admits (nothing to charge). ``cost`` must be > 0.
         """
         if cost <= 0:
@@ -194,7 +196,7 @@ class RateLimiter:
             # would be exhausted by the peek, so the commit charges nothing and
             # admit silently returns "admitted" without deducting a token -- the
             # worst possible failure mode for a limiter. The charge-set is a
-            # precomputed list (design Section 11); enforce that here.
+            # precomputed list; enforce that here.
             raise ConfigException(
                 "rate limit admit: buckets must be a list/tuple (re-iterable); "
                 f"got {type(buckets).__name__}"

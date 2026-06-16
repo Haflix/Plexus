@@ -1,5 +1,5 @@
-description: Rate-limiter Step 2a suite — asserts framework-stamped caller identity at every framework->plugin entry
-version: "0.1.0"
+description: Caller-identity suite — asserts framework-stamped caller identity at every framework->plugin entry
+version: "0.1.1"
 remote: false
 arguments:
 events:

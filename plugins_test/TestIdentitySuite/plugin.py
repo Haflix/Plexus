@@ -1,4 +1,4 @@
-"""TestIdentitySuite — rate-limiter Step 2a (caller-identity) integration.
+"""Caller-identity integration suite.
 
 Proves the framework STAMPS the caller-identity chain at every
 framework->plugin entry, with ``_identity_active`` forced on for the suite
@@ -6,7 +6,7 @@ framework->plugin entry, with ``_identity_active`` forced on for the suite
 ``current_caller_chain()`` from inside the entered handler, asserting the
 entered plugin is the innermost frame -- catching a mis-wired site.
 
-Coverage (design Section 2 / build-order 2a):
+Coverage:
 - execute push, async + sync (``_call_endpoint`` both branches)
 - request_event push, async + sync handler (event branch, both)
 - the sync-bridge handoff (execute_sync + request_event_sync from a sync
@@ -40,7 +40,7 @@ from plexus.runtime import current_caller_chain  # noqa: E402
 from _test_helpers import CaseRecorder  # noqa: E402
 
 
-SUITE_VERSION = "0.1.0"
+SUITE_VERSION = "0.1.1"
 SELF = "TestIdentitySuite"
 LIFECYCLE_TARGET = "TestIdentityTarget"
 
@@ -228,13 +228,13 @@ class TestIdentitySuite(Plugin):
             chunks = []
             async for ch in self.execute_stream(SELF, "capture_sync_stream"):
                 chunks.append(ch)
-            _assert_eq(chunks[0], [[SELF, uuid, False]], "execute_stream sync-gen (worker seed)")
+            _assert_eq(chunks[0], [[SELF, uuid, False]], "execute_stream sync-gen")
         await rec.run_case("identity.stream.sync", body, **kw)
 
     async def _case_lifecycle_exempt(self, rec, kw):
         async def body(c):
             # Re-enable the target UNDER stamping; on_enable captures an
-            # EXEMPT frame (Section 8).
+            # EXEMPT frame (lifecycle scope).
             await self._plexus.disable_plugin(LIFECYCLE_TARGET)
             await self._plexus.enable_plugin(LIFECYCLE_TARGET)
             chain = await self.execute(LIFECYCLE_TARGET, "get_enable_capture")
@@ -249,7 +249,7 @@ class TestIdentitySuite(Plugin):
 
     async def _case_inactive_zero_overhead(self, rec, kw):
         async def body(c):
-            # Flip stamping OFF -> no frame pushed at all (Section 11).
+            # Flip stamping OFF -> no frame pushed at all (zero-overhead path).
             self._plexus._identity_active = False
             try:
                 chain = await self.execute(SELF, "capture_async")

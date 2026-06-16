@@ -1,4 +1,4 @@
-"""Unit tests for the pure capability decision (rate-limiter Step 2b).
+"""Unit tests for the pure capability decision.
 
 Exercises ``evaluate_capability`` in isolation: self-calls, system_caller,
 the three impersonation scopes (caller / ancestor / explicit list), default-
@@ -139,8 +139,12 @@ def test_caller_scope_no_parent_denied():
 
 
 def test_parse_false_grant_is_inert():
-    # A `{system_caller: false}` (or empty) entry grants nothing and must NOT
-    # be stored -- else it would flip the gate on node-wide (review finding).
+    # An entry that grants NOTHING (only system_caller=false, or empty) must NOT
+    # be stored -- else it would flip the whole gate on node-wide while granting
+    # the plugin nothing. An entry that grants SOMETHING is stored as written,
+    # even if it also carries a redundant system_caller=false (see the last
+    # check below): the rule keys on "does this confer a capability", not on
+    # the value of any single field.
     check("parse: system_caller false -> no grant",
           parse_capabilities({"P": {"system_caller": False}}) == {})
     check("parse: system_caller true -> stored",
