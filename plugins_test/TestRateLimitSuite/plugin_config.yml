@@ -1,5 +1,5 @@
-description: Rate-limit charge-set precompute + OUT/IN/inbound-admit integration suite (Steps 3b/3c/3d/3e)
-version: "0.4.0"
+description: Rate-limit charge-set precompute + OUT/IN/inbound-admit + config-load integration suite (Steps 3b/3c/3d/3e/4)
+version: "0.5.0"
 remote: false
 arguments:
 events:

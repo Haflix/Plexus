@@ -1,10 +1,16 @@
 """Config-load / validation helpers for Plexus.
 
 Pure, stateless functions and constants extracted from core.py. They take
-no Plexus instance and import nothing from the plexus package, so core.py
-can re-import them without a circular dependency. core.py re-exports every
-name here for back-compat (``from plexus.core import <helper>`` and the
-bare-name references inside class Plexus methods keep resolving).
+no Plexus instance, so core.py can re-import them without a circular
+dependency. core.py re-exports every name here for back-compat
+(``from plexus.core import <helper>`` and the bare-name references inside
+class Plexus methods keep resolving).
+
+The one intra-package dependency is ``ratelimiter`` (dimension constants +
+key builders + the ``_validate`` numeric leaf check, reused by the
+``rate_limits:`` parsers so the config and runtime validators never drift).
+``ratelimiter`` imports only ``exceptions`` / ``math``, so it never references
+back into ``helpers`` or ``core`` -- no import cycle.
 
 Lives under plexus/helpers/ so future stateless extractions from core.py
 have a home alongside it rather than scattering top-level modules.
@@ -12,6 +18,19 @@ have a home alongside it rather than scattering top-level modules.
 
 import re
 from typing import Any, Optional, Union, List
+
+from ..exceptions import ConfigException
+from ..ratelimiter import (
+    _validate as _rl_validate,
+    DIM_FRAMEWORK_IN,
+    DIM_PLUGIN_IN,
+    DIM_PLUGIN_OUT,
+    DIM_ENDPOINT_IN,
+    DIM_EVENT_OUT,
+    FRAMEWORK_IN_KEY,
+    endpoint_key,
+    event_key,
+)
 
 
 # Reserved identifier names — disallowed as plugin names AND endpoint
@@ -652,3 +671,211 @@ def parse_capabilities(raw: Any) -> dict:
         if g.get("system_caller") or "impersonation" in g:
             grants[pname] = g
     return grants
+
+
+def _parse_rl_bucket(spec: Any, where: str) -> dict:
+    """Validate ONE rate-limit bucket spec ``{max, window}`` and return it.
+
+    Presence + mapping-type + unknown-key checks live HERE (the config layer).
+    The numeric discipline (reject bool / non-numeric / non-finite / <= 0) is
+    delegated to ``ratelimiter._validate`` so the config-load and runtime
+    validators can never drift. ``_validate`` raises ``ConfigException``;
+    re-raised as ``ValueError`` -- the config-layer convention (fail LOUD at
+    load). The explicit ``in`` presence check is what guarantees the admit hot
+    path's ``params["max"]`` / ``params["window"]`` can never ``KeyError`` at
+    runtime (the Step 3e finding this step closes)."""
+    if not isinstance(spec, dict):
+        raise ValueError(
+            f"{where}: must be a mapping with max + window, "
+            f"got {type(spec).__name__}"
+        )
+    missing = [k for k in ("max", "window") if k not in spec]
+    if missing:
+        raise ValueError(
+            f"{where}: missing required key(s) {missing}; "
+            f"both max and window are required"
+        )
+    unknown = set(spec) - {"max", "window"}
+    if unknown:
+        raise ValueError(
+            f"{where}: unknown key(s) {sorted(unknown)}; allowed: max, window"
+        )
+    # Config layer is STRICT on type: a quoted YAML number ("5") or any
+    # non-numeric value is an operator mistake -- reject it loud here rather
+    # than let the runtime _validate silently coerce it via float(). bool is an
+    # int subclass and slips this isinstance check, but _rl_validate rejects it
+    # next (so the bool rule lives in exactly one place).
+    for k in ("max", "window"):
+        v = spec[k]
+        if not isinstance(v, (int, float)):
+            raise ValueError(
+                f"{where}: {k}={v!r} must be a number (int/float), "
+                f"got {type(v).__name__}"
+            )
+    try:
+        _rl_validate(spec["max"], spec["window"], where)
+    except ConfigException as e:
+        raise ValueError(str(e)) from e
+    return {"max": spec["max"], "window": spec["window"]}
+
+
+def _parse_rl_plugin_block(name: str, block: Any, cfg: dict, sub_cfg: dict) -> None:
+    """Flatten ONE plugin's rate-limit sub-block into ``cfg`` / ``sub_cfg`` in
+    place. Shared by the main-config ``rate_limits.plugins.<name>`` loop AND a
+    plugin manifest's own top-level ``rate_limits:`` block (option a) -- both
+    carry the identical sub-shape ``{out, in, endpoints, events, subs}``.
+
+    Every key produced is namespaced to ``name`` (the dimension keys embed the
+    plugin name), so two plugins can NEVER collide on the same (dim, key) and a
+    plugin manifest can only ever declare limits for ITSELF. ``framework_in`` /
+    ``nodes_in`` are operator-global (main-config only) and are rejected here by
+    the unknown-key check."""
+    where = f"rate_limits for plugin {name!r}"
+    if not isinstance(block, dict):
+        raise ValueError(
+            f"{where}: must be a mapping, got {type(block).__name__}"
+        )
+    unknown = set(block) - {"out", "in", "endpoints", "events", "subs"}
+    if unknown:
+        raise ValueError(
+            f"{where}: unknown key(s) {sorted(unknown)}; "
+            f"allowed: out, in, endpoints, events, subs"
+        )
+    if "out" in block:
+        cfg[(DIM_PLUGIN_OUT, name)] = _parse_rl_bucket(
+            block["out"], f"{where} -> out"
+        )
+    if "in" in block:
+        cfg[(DIM_PLUGIN_IN, name)] = _parse_rl_bucket(
+            block["in"], f"{where} -> in"
+        )
+    for section, dim, key_fn in (
+        ("endpoints", DIM_ENDPOINT_IN, lambda item: endpoint_key(name, item)),
+        ("events", DIM_EVENT_OUT, lambda item: event_key(name, item)),
+    ):
+        sub = block.get(section)
+        if sub is None:
+            continue
+        if not isinstance(sub, dict):
+            raise ValueError(
+                f"{where} -> {section}: must be a mapping, "
+                f"got {type(sub).__name__}"
+            )
+        for item, ispec in sub.items():
+            cfg[(dim, key_fn(item))] = _parse_rl_bucket(
+                ispec, f"{where} -> {section}.{item}"
+            )
+    subs = block.get("subs")
+    if subs is not None:
+        if not isinstance(subs, dict):
+            raise ValueError(
+                f"{where} -> subs: must be a mapping, got {type(subs).__name__}"
+            )
+        for declared_id, sspec in subs.items():
+            sub_cfg[(name, declared_id)] = _parse_rl_bucket(
+                sspec, f"{where} -> subs.{declared_id}"
+            )
+
+
+def parse_rate_limits(raw: Any):
+    """Validate + FLATTEN the main-config top-level ``rate_limits:`` section
+    into the three in-process stores the charge path already consumes:
+
+        cfg:       {(dim, key): {max, window}}   -- framework_in + per-plugin
+                   out / in / endpoints / events
+        sub_cfg:   {(plugin, declared_id): {max, window}}   -- Sub-IN
+        nodes_cfg: {"default" | "<hostname>": {max, window}}   -- Nodes-IN
+
+    Returns ``(cfg, sub_cfg, nodes_cfg)``. ``None`` -> three empty dicts
+    (default off, opt-in). Raises ``ValueError`` at load on any malformed entry
+    so a bad limit fails LOUD, never as a silent zero-limit or a runtime crash.
+    """
+    cfg: dict = {}
+    sub_cfg: dict = {}
+    nodes_cfg: dict = {}
+    if raw is None:
+        return cfg, sub_cfg, nodes_cfg
+    if not isinstance(raw, dict):
+        raise ValueError("`rate_limits` must be a mapping")
+    unknown = set(raw) - {"framework_in", "nodes_in", "plugins"}
+    if unknown:
+        raise ValueError(
+            f"`rate_limits` has unknown key(s) {sorted(unknown)}; "
+            f"allowed: framework_in, nodes_in, plugins"
+        )
+
+    if "framework_in" in raw:
+        cfg[(DIM_FRAMEWORK_IN, FRAMEWORK_IN_KEY)] = _parse_rl_bucket(
+            raw["framework_in"], "rate_limits -> framework_in"
+        )
+
+    if "nodes_in" in raw:
+        ni = raw["nodes_in"]
+        if not isinstance(ni, dict):
+            raise ValueError(
+                f"rate_limits -> nodes_in: must be a mapping, "
+                f"got {type(ni).__name__}"
+            )
+        ni_unknown = set(ni) - {"default", "peers"}
+        if ni_unknown:
+            raise ValueError(
+                f"rate_limits -> nodes_in: unknown key(s) {sorted(ni_unknown)}; "
+                f"allowed: default, peers"
+            )
+        # default and peers are BOTH optional: a peers-only nodes_in caps only
+        # the named peers (all others unlimited); a default-only one caps every
+        # peer uniformly; both together = default with per-peer overrides.
+        if "default" in ni:
+            nodes_cfg["default"] = _parse_rl_bucket(
+                ni["default"], "rate_limits -> nodes_in.default"
+            )
+        peers = ni.get("peers")
+        if peers is not None:
+            if not isinstance(peers, dict):
+                raise ValueError(
+                    f"rate_limits -> nodes_in.peers: must be a mapping, "
+                    f"got {type(peers).__name__}"
+                )
+            for host, hspec in peers.items():
+                # "default" is the reserved fallback key in the flat nodes_in
+                # store (_rl_admit_inbound does cfg.get(peer, cfg.get("default"))).
+                # A peer literally named "default" would silently overwrite the
+                # global fallback -- reject it loud instead.
+                if host == "default":
+                    raise ValueError(
+                        "rate_limits -> nodes_in.peers: a peer may not be named "
+                        "'default' (it collides with the nodes_in.default "
+                        "fallback key)"
+                    )
+                nodes_cfg[host] = _parse_rl_bucket(
+                    hspec, f"rate_limits -> nodes_in.peers.{host}"
+                )
+
+    if "plugins" in raw:
+        plugins = raw["plugins"]
+        if not isinstance(plugins, dict):
+            raise ValueError(
+                f"rate_limits -> plugins: must be a mapping, "
+                f"got {type(plugins).__name__}"
+            )
+        for pname, block in plugins.items():
+            _parse_rl_plugin_block(pname, block, cfg, sub_cfg)
+
+    return cfg, sub_cfg, nodes_cfg
+
+
+def parse_plugin_rate_limits(name: str, raw: Any):
+    """Validate + flatten ONE plugin manifest's own top-level ``rate_limits:``
+    block (option a) into ``(cfg, sub_cfg)``. ``None`` -> two empty dicts. The
+    block carries the SAME sub-shape as main ``rate_limits.plugins.<name>``
+    (out / in / endpoints / events / subs); ``framework_in`` / ``nodes_in`` are
+    rejected by the block's unknown-key check (operator-global, main-only). The
+    operator overrides any value here via main ``rate_limits.plugins.<name>``,
+    which wins by precedence at merge time (main base checked before declared).
+    """
+    cfg: dict = {}
+    sub_cfg: dict = {}
+    if raw is None:
+        return cfg, sub_cfg
+    _parse_rl_plugin_block(name, raw, cfg, sub_cfg)
+    return cfg, sub_cfg

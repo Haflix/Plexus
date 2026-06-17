@@ -36,6 +36,15 @@ Cases (3c, OUT admit):
   when the bucket is dry; a non-exempt frame hits it.
 - out_asserted_attribution: an asserted (impersonation) identity wins the charge
   attribution over the chain caller (plugin_out keyed on the asserted name).
+
+Cases (Step 4, config load):
+- config_load_end_to_end: a YAML ``rate_limits:`` section flows through
+  ``_load_rate_limits`` into the three base dicts and ``_rebuild_charge_sets``
+  builds the buckets (all static dims + nodes_in sideband + declared-id Sub-IN).
+- plugin_declared_merge: a plugin's self-declared limit (no main config) produces
+  a bucket via the declared layer; it lands in the declared dict, not the base.
+- main_overrides_declared: main config wins over a plugin-declared value on an
+  overlapping (dim, key) (base checked before the declared layer).
 """
 import asyncio
 import sys
@@ -57,7 +66,7 @@ from plexus.ratelimiter import (  # noqa: E402
 
 from _test_helpers import CaseRecorder  # noqa: E402
 
-SUITE_VERSION = "0.4.0"
+SUITE_VERSION = "0.5.0"
 SUITE = "TestRateLimitSuite"
 TARGET = "TestRateLimitTarget"
 
@@ -141,6 +150,13 @@ class TestRateLimitSuite(Plugin):
         orig_active = px._rate_limits_active
         orig_id = px._identity_active
         orig_nodes_cfg = px._rate_limit_nodes_in_config
+        # Step 4: the plugin-declared layer. The declared dicts are recomputed
+        # from plugin attrs by _rebuild_charge_sets, but the suite's own
+        # _declared_rate_limits attr is mutated by the merge cases -- restore it
+        # before the finally rebuild so the recompute lands the boot-time value.
+        orig_decl_cfg = px._rate_limit_config_declared
+        orig_decl_sub = px._rate_limit_sub_config_declared
+        orig_suite_decl = getattr(self, "_declared_rate_limits", ({}, {}))
         runtime_subs: List[str] = []
         try:
             await self._case_endpoint_in_set(rec, kw)
@@ -168,6 +184,11 @@ class TestRateLimitSuite(Plugin):
             # two-node throttle lives in the remote suite once Step 4 makes the
             # subnode's nodes_in config injectable).
             await self._case_nodes_in_admit(rec, kw)
+            # Step 4 -- config load (YAML -> the three flat dicts) + the
+            # plugin-declared merge layer (main wins on overlapping keys).
+            await self._case_config_load_end_to_end(rec, kw)
+            await self._case_plugin_declared_merge(rec, kw)
+            await self._case_main_overrides_declared(rec, kw)
         finally:
             for su in runtime_subs:
                 try:
@@ -178,6 +199,11 @@ class TestRateLimitSuite(Plugin):
             px._rate_limit_config = orig_cfg
             px._rate_limit_sub_config = orig_subcfg
             px._rate_limit_nodes_in_config = orig_nodes_cfg
+            # Restore the suite's declared block BEFORE the rebuild so the
+            # declared-layer recompute reproduces the boot-time state.
+            self._declared_rate_limits = orig_suite_decl
+            px._rate_limit_config_declared = orig_decl_cfg
+            px._rate_limit_sub_config_declared = orig_decl_sub
             await px._rebuild_charge_sets()
             px._rate_limits_active = orig_active
             px._identity_active = orig_id
@@ -756,3 +782,103 @@ class TestRateLimitSuite(Plugin):
             if px._rl_admit_inbound("peerA", True, now) is not None:
                 raise AssertionError("empty nodes_in + no framework_in must no-op")
         await rec.run_case("ratelimit.nodes_in_admit", body, **kw)
+
+    async def _case_config_load_end_to_end(self, rec, kw):
+        async def body(c):
+            px = self._plexus
+            # End-to-end Step 4: a YAML rate_limits: section -> _load_rate_limits
+            # flattens it into the three base dicts -> _rebuild_charge_sets builds
+            # the buckets. Covers all the static dims + nodes_in sideband + the
+            # declared-id Sub-IN resolution, driven from real YAML shape.
+            px._rate_limiter = RateLimiter()
+            saved_yaml = px.yaml_config.get("rate_limits")
+            try:
+                px.yaml_config["rate_limits"] = {
+                    "framework_in": {"max": 1000, "window": 1},
+                    "nodes_in": {
+                        "default": {"max": 200, "window": 1},
+                        "peers": {"nodeB": {"max": 9, "window": 1}},
+                    },
+                    "plugins": {
+                        SUITE: {
+                            "in": {"max": 100, "window": 1},
+                            "endpoints": {"ep_a": {"max": 20, "window": 1}},
+                            "events": {"ev_x": {"max": 30, "window": 1}},
+                            "subs": {"xsub": {"max": 40, "window": 1}},
+                        },
+                    },
+                }
+                px._load_rate_limits()
+                await px._rebuild_charge_sets()
+                # 1) the flatten landed in the base dicts.
+                if px._rate_limit_config.get((DIM_FRAMEWORK_IN, FRAMEWORK_IN_KEY)) != {"max": 1000, "window": 1}:
+                    raise AssertionError("framework_in not flattened into the base config")
+                if px._rate_limit_nodes_in_config.get("nodeB") != {"max": 9, "window": 1}:
+                    raise AssertionError("nodes_in peer not flattened into the sideband")
+                if px._rate_limit_nodes_in_config.get("default") != {"max": 200, "window": 1}:
+                    raise AssertionError("nodes_in default not flattened into the sideband")
+                if px._rate_limit_sub_config.get((SUITE, "xsub")) != {"max": 40, "window": 1}:
+                    raise AssertionError("declared-id sub limit not flattened into the sub config")
+                # 2) the buckets were actually built from that config.
+                if px._rl_framework_in is None:
+                    raise AssertionError("framework_in bucket not built from YAML")
+                if px._rate_limiter.get(DIM_ENDPOINT_IN, endpoint_key(SUITE, "ep_a")) is None:
+                    raise AssertionError("endpoint_in bucket not built from YAML")
+                if px._rate_limiter.get(DIM_EVENT_OUT, event_key(SUITE, "ev_x")) is None:
+                    raise AssertionError("event_out bucket not built from YAML")
+                uuid = await self._xsub_uuid()
+                if px._rate_limiter.get(DIM_SUB_IN, uuid) is None:
+                    raise AssertionError("sub_in bucket not built/resolved from the declared-id YAML limit")
+                if not px._rate_limits_active:
+                    raise AssertionError("a configured rate_limits: section must flip _rate_limits_active on")
+            finally:
+                if saved_yaml is None:
+                    px.yaml_config.pop("rate_limits", None)
+                else:
+                    px.yaml_config["rate_limits"] = saved_yaml
+        await rec.run_case("ratelimit.config_load_end_to_end", body, **kw)
+
+    async def _case_plugin_declared_merge(self, rec, kw):
+        async def body(c):
+            px = self._plexus
+            # A plugin's SELF-declared limit (no main/base config) must produce a
+            # bucket: _rebuild_charge_sets reads _declared_rate_limits off the
+            # loaded plugin and _rl_configure falls back to the declared layer.
+            self._apply({}, {})                       # empty BASE (main/test) config
+            self._declared_rate_limits = (
+                {(DIM_PLUGIN_IN, SUITE): {"max": 7, "window": 1000}}, {}
+            )
+            await px._rebuild_charge_sets()
+            b = px._rate_limiter.get(DIM_PLUGIN_IN, SUITE)
+            if b is None:
+                raise AssertionError("a plugin-declared limit must produce a bucket")
+            if b.max != 7.0:
+                raise AssertionError(f"declared bucket max should be 7; got {b.max}")
+            if not px._rate_limits_active:
+                raise AssertionError("a declared-only limit must flip _rate_limits_active on")
+            # Layering: the declared limit lands in the DECLARED dict, never the
+            # base dict (so direct test/main injection is never clobbered).
+            if (DIM_PLUGIN_IN, SUITE) in px._rate_limit_config:
+                raise AssertionError("a declared limit must NOT leak into the base config dict")
+            if px._rate_limit_config_declared.get((DIM_PLUGIN_IN, SUITE)) != {"max": 7, "window": 1000}:
+                raise AssertionError("a declared limit must land in the declared-layer dict")
+        await rec.run_case("ratelimit.plugin_declared_merge", body, **kw)
+
+    async def _case_main_overrides_declared(self, rec, kw):
+        async def body(c):
+            px = self._plexus
+            # Main (base) config AND a plugin-declared limit BOTH set
+            # plugin_in(SUITE). Main must WIN by precedence (_rl_configure checks
+            # the base dict before the declared layer).
+            self._apply({(DIM_PLUGIN_IN, SUITE): {"max": 3, "window": 1000}}, {})
+            self._declared_rate_limits = (
+                {(DIM_PLUGIN_IN, SUITE): {"max": 99, "window": 1000}}, {}
+            )
+            await px._rebuild_charge_sets()
+            b = px._rate_limiter.get(DIM_PLUGIN_IN, SUITE)
+            if b is None or b.max != 3.0:
+                raise AssertionError(
+                    f"main config (max=3) must win over the plugin-declared value "
+                    f"(max=99); got max={b.max if b else None}"
+                )
+        await rec.run_case("ratelimit.main_overrides_declared", body, **kw)

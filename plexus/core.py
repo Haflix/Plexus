@@ -73,6 +73,8 @@ from .helpers.config import (  # noqa: F401  (re-export shim)
     _normalize_authors,
     _warn_redundant_host_combos,
     parse_capabilities,
+    parse_rate_limits,
+    parse_plugin_rate_limits,
 )
 
 # Cross-cutting runtime primitives (sync-call-chain threadlocal, the
@@ -241,6 +243,19 @@ class Plexus(EventMixin):
         # outside these dicts (the networking handler / the endpoint manifest).
         self._rate_limit_config: Dict[tuple, dict] = {}        # (dim, key) -> {max, window}
         self._rate_limit_sub_config: Dict[tuple, dict] = {}    # (plugin, declared_id) -> {max, window}
+        # Step 4 plugin-declared layer. A plugin manifest may self-declare its
+        # own limits (a top-level `rate_limits:` block); those are recomputed
+        # FROM SCRATCH at the top of every _rebuild_charge_sets (from the loaded
+        # plugins' stored _declared_rate_limits), kept SEPARATE from the two
+        # base dicts above. The base dicts are the MAIN-config + test-injected
+        # source of truth and are NEVER mutated by a rebuild; _rl_configure /
+        # _rl_build_sub consult BASE FIRST, DECLARED SECOND, so main wins by
+        # precedence, a removed plugin's declared limits vanish on the next
+        # rebuild, and direct test injection into the base dicts is never
+        # clobbered. framework_in / nodes_in have no declared layer (they are
+        # operator-global, main-config only).
+        self._rate_limit_config_declared: Dict[tuple, dict] = {}
+        self._rate_limit_sub_config_declared: Dict[tuple, dict] = {}
         # Nodes-IN SIDEBAND (Step 3e). Per-remote-peer intake limits, kept apart
         # from the flat dicts because Nodes-IN keys are dynamic peer hostnames
         # unknown at config-write time. `{"default": {max, window}}` + optional
@@ -256,6 +271,15 @@ class Plexus(EventMixin):
         self._rl_sub_in: Dict[str, list] = {}                  # sub_uuid -> [sub_in, endpoint_in, plugin_in]
         self._rl_event_out: Dict[tuple, object] = {}           # (plugin, event_id) -> event_out bucket
         self._rl_framework_in = None                           # the single global-intake bucket
+        # Step 4: flatten the main-config `rate_limits:` section into the base
+        # dicts now (yaml_config was loaded above; capabilities parse at ~217 in
+        # the same window). Buckets are NOT built here -- _rebuild_charge_sets
+        # builds them after plugins load (it also merges the plugin-declared
+        # layer). A malformed section raises ValueError at load (fail loud).
+        # Init-only, mirroring _load_capability_grants exactly: main-config live
+        # reload of rate_limits: is not wired (deferred), but plugin-declared
+        # limits DO hot-reload via _rebuild_charge_sets on plugin reload.
+        self._load_rate_limits()
         self._recompute_rate_limits_active()
 
         self.main_event_loop = None
@@ -2839,6 +2863,23 @@ class Plexus(EventMixin):
         plugin.endpoints = endpoints_cfg
         # Alias retained for backward-compatible callsite naming. Same dict.
         plugin._endpoint_by_access = plugin.endpoints
+
+        # Step 4: parse this plugin's self-declared `rate_limits:` block (option
+        # a) into its own flat (dim,key)->{max,window} dicts and stash them on
+        # the plugin. _rebuild_charge_sets reads _declared_rate_limits off every
+        # loaded plugin to recompute the declared layer (main config wins on any
+        # overlapping key). Block carries the same out/in/endpoints/events/subs
+        # sub-shape as main rate_limits.plugins.<name>; a malformed block fails
+        # the plugin load loud (like any other manifest validation). The block
+        # is namespaced to this plugin's name, so it can only limit itself.
+        try:
+            decl_cfg, decl_sub = parse_plugin_rate_limits(
+                name, merged_config.get("rate_limits")
+            )
+        except ValueError as e:
+            await error_config(f"rate_limits: {e}")
+            return
+        plugin._declared_rate_limits = (decl_cfg, decl_sub)
 
         # ── PR3 Stage B: parse events: and subscriptions: sections ─────
         # Both sections are optional, default to empty dict. Per LOCKED A.
@@ -5674,6 +5715,27 @@ class Plexus(EventMixin):
                 sorted(self._capability_grants),
             )
 
+    def _load_rate_limits(self) -> None:
+        """Step 4: (re)load the main-config ``rate_limits:`` section into the
+        three BASE rate-limit dicts. Mirrors ``_load_capability_grants``: parse
+        + assign, fail LOUD on a malformed section via ``parse_rate_limits`` ->
+        ValueError (never a silent zero-limit or a runtime KeyError). Does NOT
+        build buckets -- ``_rebuild_charge_sets`` does that after plugins load
+        (and merges the plugin-declared layer on top, main winning).
+
+        Called at init (mirroring ``_load_capability_grants``, which is itself
+        init-only -- main-config live reload of these sections is not wired).
+        The plugin-declared layer DOES hot-reload via ``_rebuild_charge_sets``
+        on plugin reload."""
+        cfg, sub_cfg, nodes_cfg = parse_rate_limits(
+            (self.yaml_config or {}).get("rate_limits")
+        )
+        # All THREE base stores are assigned here -- including the Nodes-IN
+        # sideband (operator-global; no plugin-declared layer).
+        self._rate_limit_config = cfg
+        self._rate_limit_sub_config = sub_cfg
+        self._rate_limit_nodes_in_config = nodes_cfg
+
     def _recompute_capability_active(self) -> None:
         """Derive the capability master switch from the grant store. When ANY
         grant exists the gate is live, which requires caller-identity stamping so
@@ -5699,10 +5761,16 @@ class Plexus(EventMixin):
 
     def _rl_configure(self, dim: str, key: str):
         """Configure (create-or-reconfigure) the bucket for ``(dim, key)`` from
-        ``_rate_limit_config``, or return None when that dimension has no
+        the rate-limit config, or return None when that dimension has no
         configured limit. The charge-set builder uses the returned bucket; an
-        unconfigured dimension is simply skipped (zero-overhead-off)."""
+        unconfigured dimension is simply skipped (zero-overhead-off).
+
+        Step 4: BASE (main-config + test-injected ``_rate_limit_config``) is
+        consulted FIRST so an operator's main limit wins; the plugin-declared
+        layer fills only slots main did not set."""
         params = self._rate_limit_config.get((dim, key))
+        if params is None:
+            params = self._rate_limit_config_declared.get((dim, key))
         if params is None:
             return None
         return self._rate_limiter.configure(
@@ -5720,9 +5788,15 @@ class Plexus(EventMixin):
         plugin), not created here. Shared by the full rebuild and the runtime
         subscribe path."""
         if sub.declared_id is not None:
+            # BASE (main + test) first, then the plugin-declared layer -- main
+            # wins on an overlapping (plugin, declared_id) Sub-IN limit.
             scfg = self._rate_limit_sub_config.get(
                 (sub.plugin_name, sub.declared_id)
             )
+            if scfg is None:
+                scfg = self._rate_limit_sub_config_declared.get(
+                    (sub.plugin_name, sub.declared_id)
+                )
             if scfg is not None:
                 sub_b = self._rate_limiter.configure(
                     DIM_SUB_IN, sub.sub_uuid, scfg["max"], scfg["window"]
@@ -5771,7 +5845,34 @@ class Plexus(EventMixin):
         self._rl_sub_in.clear()
         self._rl_event_out.clear()
         self._rl_framework_in = None
-        if not (self._rate_limit_config or self._rate_limit_sub_config):
+
+        # Step 4: recompute the plugin-declared layer FROM SCRATCH from the
+        # currently-loaded plugins. This MUST happen BEFORE the early-return
+        # guard below -- a node whose ONLY limits are plugin-declared (no main
+        # rate_limits:) would otherwise short-circuit with an empty declared
+        # layer and silently apply nothing. Recomputing fresh each rebuild is
+        # also how a removed plugin's declared limits disappear (it is simply no
+        # longer scanned). setdefault keeps it order-independent; cross-plugin
+        # (dim,key) collisions cannot occur because every declared key is
+        # namespaced to its own plugin (parse_plugin_rate_limits(name, ...)).
+        self._rate_limit_config_declared.clear()
+        self._rate_limit_sub_config_declared.clear()
+        for plugin in list(self.plugins.values()):
+            decl = getattr(plugin, "_declared_rate_limits", None)
+            if not decl:
+                continue
+            d_cfg, d_sub = decl
+            for k, v in d_cfg.items():
+                self._rate_limit_config_declared.setdefault(k, v)
+            for k, v in d_sub.items():
+                self._rate_limit_sub_config_declared.setdefault(k, v)
+
+        if not (
+            self._rate_limit_config
+            or self._rate_limit_sub_config
+            or self._rate_limit_config_declared
+            or self._rate_limit_sub_config_declared
+        ):
             # Zero-overhead-off: nothing configured, nothing to build.
             self._recompute_rate_limits_active()
             return
