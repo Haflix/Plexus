@@ -52,12 +52,12 @@ from plexus.runtime import CallerIdentity, caller_chain_scope  # noqa: E402
 from plexus.ratelimiter import (  # noqa: E402
     RateLimiter, endpoint_key, event_key,
     DIM_PLUGIN_IN, DIM_PLUGIN_OUT, DIM_ENDPOINT_IN, DIM_EVENT_OUT, DIM_SUB_IN,
-    DIM_FRAMEWORK_IN, FRAMEWORK_IN_KEY,
+    DIM_FRAMEWORK_IN, DIM_NODES_IN, FRAMEWORK_IN_KEY,
 )
 
 from _test_helpers import CaseRecorder  # noqa: E402
 
-SUITE_VERSION = "0.3.0"
+SUITE_VERSION = "0.4.0"
 SUITE = "TestRateLimitSuite"
 TARGET = "TestRateLimitTarget"
 
@@ -140,6 +140,7 @@ class TestRateLimitSuite(Plugin):
         orig_subcfg = px._rate_limit_sub_config
         orig_active = px._rate_limits_active
         orig_id = px._identity_active
+        orig_nodes_cfg = px._rate_limit_nodes_in_config
         runtime_subs: List[str] = []
         try:
             await self._case_endpoint_in_set(rec, kw)
@@ -163,6 +164,10 @@ class TestRateLimitSuite(Plugin):
             await self._case_in_sub_in_selection(rec, kw)
             await self._case_in_stream_weight(rec, kw)
             await self._case_in_publish_skip(rec, kw)
+            # Step 3e -- Nodes-IN inbound admit (white-box; the end-to-end
+            # two-node throttle lives in the remote suite once Step 4 makes the
+            # subnode's nodes_in config injectable).
+            await self._case_nodes_in_admit(rec, kw)
         finally:
             for su in runtime_subs:
                 try:
@@ -172,6 +177,7 @@ class TestRateLimitSuite(Plugin):
             px._rate_limiter = orig_limiter
             px._rate_limit_config = orig_cfg
             px._rate_limit_sub_config = orig_subcfg
+            px._rate_limit_nodes_in_config = orig_nodes_cfg
             await px._rebuild_charge_sets()
             px._rate_limits_active = orig_active
             px._identity_active = orig_id
@@ -676,3 +682,77 @@ class TestRateLimitSuite(Plugin):
                     f"regardless of the per-sub IN reject; n1={n1} n2={n2}"
                 )
         await rec.run_case("ratelimit.in_publish_skip", body, **kw)
+
+    async def _case_nodes_in_admit(self, rec, kw):
+        async def body(c):
+            px = self._plexus
+            # White-box exercise of _rl_admit_inbound (the networking inbound
+            # admit). Drives the helper directly: a real two-node throttle (the
+            # handlers calling it) lives in the remote suite -- the subnode is a
+            # separate process whose nodes_in config is not injectable until
+            # Step 4's YAML plumbing lands. Start from a fresh limiter; the
+            # sideband + framework_in are restored by run()'s finally.
+            px._rate_limiter = RateLimiter()
+            px._rate_limit_config = {}
+            px._rate_limit_sub_config = {}
+            px._rate_limit_nodes_in_config = {
+                "default": {"max": 2, "window": 1000},
+                "peerB": {"max": 1, "window": 1000},   # per-peer override
+            }
+            # framework_in for the include_framework path.
+            px._rate_limit_config = {(DIM_FRAMEWORK_IN, FRAMEWORK_IN_KEY): {"max": 3, "window": 1000}}
+            await px._rebuild_charge_sets()  # builds _rl_framework_in
+            now = time.monotonic()
+
+            # peer=None -> no-op (defensive direct-call path).
+            if px._rl_admit_inbound(None, False, now) is not None:
+                raise AssertionError("peer=None must no-op the Nodes-IN admit")
+
+            # Lazy get-or-create from "default" (max 2) for peerA; 3rd rejects.
+            r1 = px._rl_admit_inbound("peerA", False, now)
+            r2 = px._rl_admit_inbound("peerA", False, now)
+            nb_a = px._rate_limiter.get(DIM_NODES_IN, "peerA")
+            r3 = px._rl_admit_inbound("peerA", False, now)
+            if nb_a is None:
+                raise AssertionError("first contact must lazily create the peer bucket")
+            if r1 is not None or r2 is not None or r3 is not nb_a:
+                raise AssertionError(
+                    f"default max=2 -> admit 2 then reject on nodes_in(peerA); "
+                    f"r1={r1!r} r2={r2!r} r3={r3!r}"
+                )
+
+            # Per-peer ISOLATION + override: peerB has its own bucket (override
+            # max=1), unaffected by peerA being dry.
+            rb1 = px._rl_admit_inbound("peerB", False, now)
+            rb2 = px._rl_admit_inbound("peerB", False, now)
+            nb_b = px._rate_limiter.get(DIM_NODES_IN, "peerB")
+            if rb1 is not None or rb2 is not nb_b:
+                raise AssertionError(
+                    f"peerB override max=1 -> admit 1 then reject; isolated from "
+                    f"peerA; rb1={rb1!r} rb2={rb2!r}"
+                )
+            if nb_b is nb_a:
+                raise AssertionError("each peer must get a DISTINCT Nodes-IN bucket")
+
+            # include_framework=True -> atomic [nodes_in, framework_in]. Drain
+            # framework_in (max 3) via a fresh peer so nodes_in is not the binder.
+            fb = px._rl_framework_in
+            if fb is None:
+                raise AssertionError("framework_in bucket must be built")
+            fb.tokens = 0.0  # force framework_in dry
+            dry = px._rl_admit_inbound("peerC", True, now)
+            loc = px._rate_limiter.locate(dry) if dry is not None else None
+            if dry is not fb:
+                raise AssertionError(
+                    f"include_framework must charge framework_in; bound bucket "
+                    f"should be framework_in, got loc={loc!r}"
+                )
+
+            # Empty sideband -> no-op (zero-overhead-off for Nodes-IN).
+            px._rate_limiter = RateLimiter()
+            px._rate_limit_nodes_in_config = {}
+            px._rate_limit_config = {}
+            await px._rebuild_charge_sets()
+            if px._rl_admit_inbound("peerA", True, now) is not None:
+                raise AssertionError("empty nodes_in + no framework_in must no-op")
+        await rec.run_case("ratelimit.nodes_in_admit", body, **kw)

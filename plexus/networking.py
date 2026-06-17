@@ -20,6 +20,7 @@ from .exceptions import (
     NetworkRequestException,
     NodeException,
     NoLocalSubException,
+    RateLimitException,
     RequestException,
 )
 from .networking_classes import Node
@@ -1937,6 +1938,23 @@ class NetworkManager:
             if _denied:
                 return
 
+            # Step 3e: per-peer Nodes-IN admit. Framework-IN is NOT charged here
+            # -- the plexus.execute re-entry below charges it via the OUT admit on
+            # an EMPTY caller chain (this inbound handler task inherits the
+            # listener's empty _caller_chain; nothing in networking pushes a
+            # frame, so the re-entry skips Plugin-OUT and charges Framework-IN
+            # once). Do NOT dispatch this handler from inside a live plugin task
+            # or that invariant breaks. Reject -> send error so execute_remote
+            # gets a clean failure (mirrors the anti-spoof error above).
+            _peer = conn_context.get("peer_hostname")
+            _dry = self.plexus._rl_admit_inbound(_peer, False, time.monotonic())
+            if _dry is not None:
+                await self._send_error_pickled(
+                    writer,
+                    RateLimitException(self.plexus._rl_reject_message(_dry, 1.0)),
+                )
+                return
+
             self._logger.info(
                 f"[EXECUTE] Request: plugin={plugin}, method={method}, plugin_uuid={plugin_uuid}, "
                 f"author={author}, author_id={author_id}, author_host={author_host}, request_id={request_id}, "
@@ -2104,6 +2122,19 @@ class NetworkManager:
                 author, author_id, conn_context, writer, "[EXECUTE_STREAM]"
             )
             if _denied:
+                return
+
+            # Step 3e: per-peer Nodes-IN admit (Framework-IN comes via the
+            # execute_stream re-entry's OUT admit on an empty caller chain, same
+            # invariant as _handle_execute -- do NOT charge it here). Reject before
+            # any chunk so execute_remote_stream's MSG_ERROR branch raises cleanly.
+            _peer = conn_context.get("peer_hostname")
+            _dry = self.plexus._rl_admit_inbound(_peer, False, time.monotonic())
+            if _dry is not None:
+                await self._send_error_pickled(
+                    writer,
+                    RateLimitException(self.plexus._rl_reject_message(_dry, 1.0)),
+                )
                 return
 
             self._logger.info(
@@ -2726,6 +2757,16 @@ class NetworkManager:
             if _denied:
                 return
 
+            # Step 3e: per-peer Nodes-IN + Framework-IN admit (this handler calls
+            # _fanout_sub directly, bypassing the publish_event entry that would
+            # otherwise charge Framework-IN, so charge it here -- one atomic admit).
+            # Fire-and-forget: a throttled peer is dropped silently (no caller
+            # awaits a reply). Reciprocal advert exchange already ran above
+            # (control-plane stays open under a data-plane throttle, intended).
+            _peer = conn_context.get("peer_hostname")
+            if self.plexus._rl_admit_inbound(_peer, True, time.monotonic()) is not None:
+                return
+
             self._logger.debug(
                 "[PUBLISH_EVENT] topic=%r author=%s author_host=%s",
                 topic, author, author_host,
@@ -2835,6 +2876,19 @@ class NetworkManager:
                 author, author_id, conn_context, writer, "[REQUEST_EVENT]"
             )
             if _denied:
+                return
+
+            # Step 3e: per-peer Nodes-IN + Framework-IN admit (charge Framework-IN
+            # here -- this handler calls _fanout_sub directly, bypassing the
+            # request_event entry). 1:1: reject -> send error so the caller gets a
+            # clean throttle (terminal RequestException family).
+            _peer = conn_context.get("peer_hostname")
+            _dry = self.plexus._rl_admit_inbound(_peer, True, time.monotonic())
+            if _dry is not None:
+                await self._send_error_pickled(
+                    writer,
+                    RateLimitException(self.plexus._rl_reject_message(_dry, 1.0)),
+                )
                 return
 
             try:
@@ -3006,6 +3060,22 @@ class NetworkManager:
             if _denied:
                 return
 
+            # Step 3e: per-peer Nodes-IN + Framework-IN admit (charge Framework-IN
+            # here -- this handler does NOT go through _fanout_sub or the
+            # request_event_stream entry; it dispatches the generator directly
+            # below). The per-target IN-set is charged SEPARATELY further down
+            # (after find_endpoint), because this direct-dispatch path never
+            # reaches _call_endpoint / _process_request_event_stream. Reject before
+            # any chunk -> send error.
+            _peer = conn_context.get("peer_hostname")
+            _dry = self.plexus._rl_admit_inbound(_peer, True, time.monotonic())
+            if _dry is not None:
+                await self._send_error_pickled(
+                    writer,
+                    RateLimitException(self.plexus._rl_reject_message(_dry, 1.0)),
+                )
+                return
+
             try:
                 all_subs = await self.plexus.topic_registry.find_all(topic)
             except Exception as exc:
@@ -3078,6 +3148,43 @@ class NetworkManager:
                 await self._send_error_pickled(
                     writer,
                     RequestException("handler is not a generator function"),
+                )
+                return
+
+            # Step 3e: the per-target IN-set admit for the REMOTE streaming
+            # sub-dispatch. This handler dispatches the generator directly (it
+            # never reaches _call_endpoint / _process_request_event_stream), so
+            # without this the sub_in / endpoint_in / plugin_in limits the LOCAL
+            # path charges at the IN delivery would be bypassed for remote streams.
+            # cost = stream_weight (IN-only, Section 7) with the 3d defensive
+            # float() belt. SEPARATE from the Nodes-IN+Framework-IN intake admit
+            # above (attempt-vs-delivery; both must pass). Reject before the first
+            # chunk -> send error (Event-first invariant preserved).
+            _sw = endpoint.get("stream_weight") if isinstance(endpoint, dict) else None
+            try:
+                _sw_cost = float(_sw) if _sw is not None else 1.0
+            except (TypeError, ValueError):
+                await self._send_error_pickled(
+                    writer,
+                    RequestException(
+                        f"stream_weight for {target_plugin.plugin_name}."
+                        f"{local_match.target_access_name} is not numeric: {_sw!r}"
+                    ),
+                )
+                return
+            _in_dry = self.plexus._rl_admit_in(
+                target_plugin.plugin_name,
+                local_match.target_access_name,
+                local_match.sub_uuid,
+                _sw_cost,
+                time.monotonic(),
+            )
+            if _in_dry is not None:
+                await self._send_error_pickled(
+                    writer,
+                    RateLimitException(
+                        self.plexus._rl_reject_message(_in_dry, _sw_cost)
+                    ),
                 )
                 return
 

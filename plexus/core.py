@@ -121,6 +121,7 @@ from .ratelimiter import (
     DIM_ENDPOINT_IN,
     DIM_EVENT_OUT,
     DIM_SUB_IN,
+    DIM_NODES_IN,
 )
 
 # The STATIC bucket dimensions a full rebuild fully enumerates from config + the
@@ -240,6 +241,13 @@ class Plexus(EventMixin):
         # outside these dicts (the networking handler / the endpoint manifest).
         self._rate_limit_config: Dict[tuple, dict] = {}        # (dim, key) -> {max, window}
         self._rate_limit_sub_config: Dict[tuple, dict] = {}    # (plugin, declared_id) -> {max, window}
+        # Nodes-IN SIDEBAND (Step 3e). Per-remote-peer intake limits, kept apart
+        # from the flat dicts because Nodes-IN keys are dynamic peer hostnames
+        # unknown at config-write time. `{"default": {max, window}}` + optional
+        # per-peer `{"<hostname>": {max, window}}`. Step 4 flattens YAML
+        # `nodes_in:` into it; tests inject it directly. The per-peer bucket is
+        # lazily get-or-created on first contact in `_rl_admit_inbound`.
+        self._rate_limit_nodes_in_config: Dict[str, dict] = {}  # "default" | "<hostname>" -> {max, window}
         # Precomputed charge-sets, stored in PLEXUS-OWNED SIDE-TABLES (never on
         # the endpoint dict / Subscription -- those are pickle-shipped to peers,
         # which would leak live Bucket state onto the wire). The hot path reads
@@ -5938,6 +5946,47 @@ class Plexus(EventMixin):
         ``self._rl_reject(dry)`` (cost defaults to 1.0). Per Section 13 this does
         NOT log -- the first-per-window WARNING suppression is Step 5."""
         raise RateLimitException(self._rl_reject_message(dry, cost))
+
+    def _rl_admit_inbound(self, peer, include_framework, now=None):
+        """Networking inbound admit (Step 3e): per-remote-peer Nodes-IN, plus (for
+        the event handlers) Framework-IN, as ONE atomic admit. Returns the first
+        dry bucket (the handler rejects per its own convention) or None when
+        admitted / nothing configured.
+
+        Nodes-IN is the one DYNAMIC-key dimension: the per-peer bucket is lazily
+        get-or-created on first contact from the `_rate_limit_nodes_in_config`
+        sideband (per-peer override else "default"). Gated on the SIDEBAND (and
+        `_rl_framework_in`), NOT `_rate_limits_active` -- the first peer's bucket
+        does not exist yet, so the static-bucket master switch would be False
+        (chicken-and-egg). No identity / exempt logic: the key is the peer
+        hostname from the connection context, not the caller chain. `now` is a
+        FRESH `time.monotonic()` from the handler. Cost is 1 (op-rate cap; the
+        per-call stream_weight is charged separately at the IN-set delivery).
+
+        Pinned order: Nodes-IN then Framework-IN, so a per-peer flood is reported
+        as the Nodes-IN dimension rather than the global cap.
+
+        Execute handlers pass `include_framework=False` (Framework-IN is charged
+        by their re-entry into `plexus.execute` / `plexus.execute_stream`);
+        charging it here too would double-charge. Event handlers pass True.
+        """
+        buckets = []
+        cfg = self._rate_limit_nodes_in_config
+        if cfg and peer is not None:
+            nb = self._rate_limiter.get(DIM_NODES_IN, peer)
+            if nb is None:
+                params = cfg.get(peer, cfg.get("default"))   # per-peer else default
+                if params is not None:
+                    nb = self._rate_limiter.configure(
+                        DIM_NODES_IN, peer, params["max"], params["window"], now
+                    )
+            if nb is not None:
+                buckets.append(nb)
+        if include_framework and self._rl_framework_in is not None:
+            buckets.append(self._rl_framework_in)
+        if not buckets:
+            return None
+        return self._rate_limiter.admit(buckets, 1.0, now)
 
     def _gate_author(self, author, author_id):
         """Capability gate. Returns ``(effective_author,
