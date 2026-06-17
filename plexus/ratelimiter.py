@@ -198,6 +198,12 @@ class RateLimiter:
         before any work."""
         return len(self._buckets)
 
+    def keys(self) -> List[Tuple[str, str]]:
+        """A snapshot list of every configured ``(dimension, key)``. Used by the
+        framework's charge-set rebuild to prune orphan buckets left by removed
+        plugins (``configure`` only adds, so a shrink is driven from here)."""
+        return list(self._buckets.keys())
+
     def remove(self, dimension: str, key: str) -> None:
         """Tear a bucket down (unsubscribe / plugin hot-swap).
 

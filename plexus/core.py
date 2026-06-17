@@ -107,7 +107,28 @@ from .runtime import (  # noqa: F401  (re-export shim)
     evaluate_capability,
     asserted_identity_scope,
 )
-from .ratelimiter import RateLimiter
+from .ratelimiter import (
+    RateLimiter,
+    charge_set,
+    endpoint_key,
+    event_key,
+    FRAMEWORK_IN_KEY,
+    DIM_FRAMEWORK_IN,
+    DIM_PLUGIN_IN,
+    DIM_PLUGIN_OUT,
+    DIM_ENDPOINT_IN,
+    DIM_EVENT_OUT,
+    DIM_SUB_IN,
+)
+
+# The STATIC bucket dimensions a full rebuild fully enumerates from config + the
+# live plugin set. These are the only dims that can ORPHAN when a plugin is
+# removed (configure only adds): the rebuild prunes any static bucket it did not
+# re-configure. Sub-IN is torn down explicitly on unsubscribe/pop; Nodes-IN is a
+# dynamic runtime get-or-create -- neither is pruned here.
+_RL_STATIC_DIMS = frozenset({
+    DIM_FRAMEWORK_IN, DIM_PLUGIN_IN, DIM_PLUGIN_OUT, DIM_ENDPOINT_IN, DIM_EVENT_OUT,
+})
 
 from .events import EventMixin
 
@@ -205,6 +226,23 @@ class Plexus(EventMixin):
         # call _recompute_rate_limits_active().
         self._rate_limiter = RateLimiter()
         self._rate_limits_active: bool = False
+        # Internal flat rate-limit config (Step 4 / tests populate it; Step 4
+        # flattens the YAML `rate_limits:` section into these). Kept SEPARATE
+        # from the YAML because Sub-IN cannot be keyed by sub_uuid at config-write
+        # time (the uuid is minted at registration) -- so sub limits are staged by
+        # (plugin_name, declared_id) and resolved to a sub_uuid bucket in
+        # _rebuild_charge_sets. nodes_in.default + stream_weight are handled
+        # outside these dicts (the networking handler / the endpoint manifest).
+        self._rate_limit_config: Dict[tuple, dict] = {}        # (dim, key) -> {max, window}
+        self._rate_limit_sub_config: Dict[tuple, dict] = {}    # (plugin, declared_id) -> {max, window}
+        # Precomputed charge-sets, stored in PLEXUS-OWNED SIDE-TABLES (never on
+        # the endpoint dict / Subscription -- those are pickle-shipped to peers,
+        # which would leak live Bucket state onto the wire). The hot path reads
+        # one of these by a key it already knows (no dict walk, no key building).
+        self._rl_endpoint_in: Dict[tuple, list] = {}           # (plugin, access) -> [endpoint_in, plugin_in]
+        self._rl_sub_in: Dict[str, list] = {}                  # sub_uuid -> [sub_in, endpoint_in, plugin_in]
+        self._rl_event_out: Dict[tuple, object] = {}           # (plugin, event_id) -> event_out bucket
+        self._rl_framework_in = None                           # the single global-intake bucket
         self._recompute_rate_limits_active()
 
         self.main_event_loop = None
@@ -1930,6 +1968,11 @@ class Plexus(EventMixin):
 
         # Enable them
         await self.start_plugins()
+
+        # Rate limiter (Step 3): build the charge-set side-tables now that every
+        # plugin's endpoints / events / subscriptions are registered. No-op when
+        # no rate limit is configured (the default).
+        await self._rebuild_charge_sets()
 
         self._logger.info(f"Finished Loading plugins!")
 
@@ -4157,6 +4200,14 @@ class Plexus(EventMixin):
                     sys.path.remove(_path_entry)
                 except ValueError:
                     pass  # already removed by something else (defensive)
+
+        # Rate limiter (Step 3): with the plugin removed from self.plugins, a
+        # rebuild drops its now-orphan static + Sub-IN buckets and keeps the
+        # active master switch honest. Idempotent + no-op when off. (A reload
+        # rebuilds again after re-loading; the double rebuild is harmless.)
+        if self._rate_limits_active:
+            await self._rebuild_charge_sets()
+
         return True
 
     @async_log_errors
@@ -4467,6 +4518,20 @@ class Plexus(EventMixin):
                             "_unregister_plugin_subscriptions: broadcast failed",
                             exc_info=True,
                         )
+            # Rate limiter (Step 3): drop each sub's Sub-IN bucket BEFORE the
+            # bulk unsubscribe (sub_uuids are unique, so unremoved buckets would
+            # accumulate across resubscribes). No-op when rate limiting is off.
+            if self._rate_limits_active:
+                try:
+                    for sub in await self.topic_registry.get_plugin_subscriptions(
+                        plugin_uuid
+                    ):
+                        self._rl_teardown_sub(sub.sub_uuid)
+                except Exception:
+                    self._logger.debug(
+                        "_unregister_plugin_subscriptions: rate-limit teardown "
+                        "failed", exc_info=True,
+                    )
             await self.topic_registry.unsubscribe_plugin(plugin_uuid)
         plugin._sub_uuids = []
 
@@ -4619,6 +4684,12 @@ class Plexus(EventMixin):
                     plugin_name,
                     exc_info=True,
                 )
+
+            # Rate limiter (Step 3): the reloaded plugin has brand-new endpoint
+            # dicts + freshly-registered subs, so any cached charge-set that
+            # referenced its OLD buckets is stale. A full rebuild re-points every
+            # side-table entry at the live buckets (idempotent; no-op when off).
+            await self._rebuild_charge_sets()
 
             # R4-WW-5: a successful reload of `plugin_name` may unblock
             # previously cascade-failed dependents that were marked
@@ -5612,6 +5683,143 @@ class Plexus(EventMixin):
         self._rate_limits_active = len(self._rate_limiter) > 0
         if self._rate_limits_active:
             self._identity_active = True
+
+    def _rl_configure(self, dim: str, key: str):
+        """Configure (create-or-reconfigure) the bucket for ``(dim, key)`` from
+        ``_rate_limit_config``, or return None when that dimension has no
+        configured limit. The charge-set builder uses the returned bucket; an
+        unconfigured dimension is simply skipped (zero-overhead-off)."""
+        params = self._rate_limit_config.get((dim, key))
+        if params is None:
+            return None
+        return self._rate_limiter.configure(
+            dim, key, params["max"], params["window"]
+        )
+
+    def _rl_build_sub(self, sub) -> None:
+        """Build + store ONE subscription's IN-set charge-set. Keyed on the sub's
+        TARGET (where the dispatch lands), NOT the owner: a cross-plugin sub owned
+        by A targeting E@B charges B. A declared_id Sub-IN limit is resolved to a
+        sub_uuid-keyed bucket here (sub_uuid is unknown at config-write time);
+        runtime-only subs (declared_id None) get no Sub-IN, so the IN-set
+        naturally falls back to [endpoint_in, plugin_in]. The endpoint_in /
+        plugin_in buckets are looked up (configured already for the target
+        plugin), not created here. Shared by the full rebuild and the runtime
+        subscribe path."""
+        if sub.declared_id is not None:
+            scfg = self._rate_limit_sub_config.get(
+                (sub.plugin_name, sub.declared_id)
+            )
+            if scfg is not None:
+                self._rate_limiter.configure(
+                    DIM_SUB_IN, sub.sub_uuid, scfg["max"], scfg["window"]
+                )
+        self._rl_sub_in[sub.sub_uuid] = charge_set(
+            self._rate_limiter,
+            [
+                (DIM_SUB_IN, sub.sub_uuid),
+                (DIM_ENDPOINT_IN, endpoint_key(sub.target_plugin,
+                                               sub.target_access_name)),
+                (DIM_PLUGIN_IN, sub.target_plugin),
+            ],
+        )
+
+    async def _rebuild_charge_sets(self) -> None:
+        """(Re)build every precomputed charge-set side-table from the current
+        rate-limit config + the live plugin/sub set. Idempotent
+        clear-and-repopulate (never appends), so any trigger -- initial load,
+        hot-reload, config apply, or a test -- may call it unconditionally and
+        twice == once. Re-points every side-table entry at the LIVE bucket
+        objects, so a hot-swap that recreated buckets cannot leave a stale
+        reference. Ends by recomputing the active master switch.
+
+        Async because it reads the topic registry (get_plugin_subscriptions).
+        Charge-sets live in PLEXUS side-tables, never on the endpoint dict /
+        Subscription (those are pickle-shipped to peers).
+        """
+        self._rl_endpoint_in.clear()
+        self._rl_sub_in.clear()
+        self._rl_event_out.clear()
+        self._rl_framework_in = None
+        if not (self._rate_limit_config or self._rate_limit_sub_config):
+            # Zero-overhead-off: nothing configured, nothing to build.
+            self._recompute_rate_limits_active()
+            return
+
+        # Track every STATIC (dim, key) we configure this pass so the prune at
+        # the end can drop any static bucket left by a now-removed plugin.
+        wanted = set()
+
+        def cfg(dim, key):
+            b = self._rl_configure(dim, key)
+            if b is not None:
+                wanted.add((dim, key))
+            return b
+
+        self._rl_framework_in = cfg(DIM_FRAMEWORK_IN, FRAMEWORK_IN_KEY)
+
+        for plugin in list(self.plugins.values()):
+            p_name = plugin.plugin_name
+            cfg(DIM_PLUGIN_IN, p_name)
+            cfg(DIM_PLUGIN_OUT, p_name)
+            for access, ep in (getattr(plugin, "endpoints", None) or {}).items():
+                ek = endpoint_key(p_name, access)
+                cfg(DIM_ENDPOINT_IN, ek)
+                cs = charge_set(
+                    self._rate_limiter,
+                    [(DIM_ENDPOINT_IN, ek), (DIM_PLUGIN_IN, p_name)],
+                )
+                self._rl_endpoint_in[(p_name, access)] = cs
+                # A stream endpoint declares a per-call cost; register it against
+                # every bucket the stream charges so an over-weight stream fails
+                # LOUD at build (Section 7), not as a misleading congestion reject
+                # at open. Absent weight -> non-stream -> no registration.
+                weight = ep.get("stream_weight") if isinstance(ep, dict) else None
+                if weight is not None:
+                    for b in cs:
+                        b.register_stream_weight(weight)
+            for event_id in (getattr(plugin, "events", None) or {}):
+                b = cfg(DIM_EVENT_OUT, event_key(p_name, event_id))
+                if b is not None:
+                    self._rl_event_out[(p_name, event_id)] = b
+
+        wanted_subs = set()
+        for plugin in list(self.plugins.values()):
+            try:
+                subs = await self.topic_registry.get_plugin_subscriptions(
+                    plugin.plugin_uuid
+                )
+            except Exception:
+                subs = []
+            for sub in subs:
+                self._rl_build_sub(sub)
+                wanted_subs.add(sub.sub_uuid)
+
+        # Prune orphan buckets left by removed plugins / subs (configure only
+        # adds). Static dims are pruned against the configured set; Sub-IN
+        # against the live-sub set; Nodes-IN (dynamic runtime get-or-create) is
+        # never pruned here. Keeps len(limiter) -- which drives
+        # _rate_limits_active -- honest after a removal, while the
+        # reconfigure-in-place above preserved token state for surviving buckets.
+        for dim, key in self._rate_limiter.keys():
+            if dim in _RL_STATIC_DIMS:
+                if (dim, key) not in wanted:
+                    self._rate_limiter.remove(dim, key)
+            elif dim == DIM_SUB_IN and key not in wanted_subs:
+                self._rate_limiter.remove(dim, key)
+                self._rl_sub_in.pop(key, None)
+
+        self._recompute_rate_limits_active()
+
+    def _rl_teardown_sub(self, sub_uuid: str) -> None:
+        """Remove a subscription's Sub-IN bucket + drop its cached charge-set.
+        Called when a sub is removed (explicit unsubscribe or plugin disable/pop)
+        -- sub_uuids are unique per subscription, so without this their buckets
+        would accumulate across resubscribes. No-op when rate limiting is off."""
+        if not self._rate_limits_active:
+            return
+        self._rate_limiter.remove(DIM_SUB_IN, sub_uuid)
+        self._rl_sub_in.pop(sub_uuid, None)
 
     def _gate_author(self, author, author_id):
         """Capability gate. Returns ``(effective_author,

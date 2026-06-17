@@ -129,6 +129,14 @@ plugins:
     enabled: true
     path: ./plugins_test/TestCapabilityActor
 
+  - name: TestRateLimitSuite
+    enabled: true
+    path: ./plugins_test/TestRateLimitSuite
+
+  - name: TestRateLimitTarget           # cross-plugin sub/endpoint target
+    enabled: true
+    path: ./plugins_test/TestRateLimitTarget
+
   # PR2 fixture plugins — loaded on-demand by TestPR2Suite (§5.4 idiom).
   # enabled:false so they don't auto-start at test framework boot.
   - name: TestPR2Fixture

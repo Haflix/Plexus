@@ -1,0 +1,34 @@
+description: Rate-limit charge-set precompute integration suite (Step 3b)
+version: "0.1.0"
+remote: false
+arguments:
+events:
+  ev_x:
+    topic: "ratelimit/ev_x"
+    hosts: "local"
+subscriptions:
+  xsub:
+    topic: "ratelimit/xsub/topic"
+    target_plugin: TestRateLimitTarget
+    target_access_name: sink
+    hosts: "local"
+endpoints:
+  run:
+    internal_name: run
+    remote: false
+    accessible_by_other_plugins: true
+    description: Run the rate-limit charge-set cases and return a structured suite result dict
+    arguments:
+      - name: category
+      - name: host
+      - name: case_ids
+      - name: bug_ids
+      - name: skip_slow
+      - name: allow_destructive
+  ep_a:
+    internal_name: ep_a
+    remote: false
+    accessible_by_other_plugins: true
+    description: Probe endpoint for the endpoint-IN charge-set case
+    arguments:
+      - name: value

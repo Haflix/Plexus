@@ -2246,6 +2246,14 @@ class EventMixin:
                         exc_info=True,
                     )
 
+        # Rate limiter (Step 3): build the new sub's IN-set charge-set so a
+        # runtime subscribe (after the initial-load rebuild) is limited too.
+        # No-op when rate limiting is off.
+        if self._rate_limits_active:
+            rl_sub = await self.topic_registry.get_subscription(sub_uuid)
+            if rl_sub is not None:
+                self._rl_build_sub(rl_sub)
+
         return sub_uuid
 
     async def unsubscribe_event(self, sub_uuid: str) -> bool:
@@ -2278,6 +2286,9 @@ class EventMixin:
 
         ok = await self.topic_registry.unsubscribe(sub_uuid)
         if ok and sub is not None:
+            # Rate limiter (Step 3): drop the sub's Sub-IN bucket + cached
+            # charge-set. No-op when rate limiting is off.
+            self._rl_teardown_sub(sub_uuid)
             owner = self.plugins_by_uuid.get(sub.plugin_uuid)
             if owner is not None and hasattr(owner, "_sub_uuids"):
                 try:

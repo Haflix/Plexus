@@ -202,6 +202,8 @@ def test_registry():
     check("registry: re-configure of same key does NOT bump len", len(rl) == 1)
     rl.configure("plugin_in", "Q", max_tokens=5, window=1, now=0.0)
     check("registry: distinct key bumps len to 2", len(rl) == 2)
+    check("registry: keys() snapshots all configured (dim,key)",
+          set(rl.keys()) == {("plugin_out", "P"), ("plugin_in", "Q")})
     check("registry: get miss returns None", rl.get("plugin_out", "Z") is None)
     rl.remove("plugin_out", "P")
     check("registry: remove tears down bucket", rl.get("plugin_out", "P") is None)

@@ -1,0 +1,12 @@
+description: Rate-limit fixture — cross-plugin subscription/endpoint target
+version: "0.1.0"
+remote: false
+arguments:
+endpoints:
+  sink:
+    internal_name: sink
+    remote: false
+    accessible_by_other_plugins: true
+    description: Cross-plugin sub target endpoint
+    arguments:
+      - name: value
