@@ -25,6 +25,7 @@ from .exceptions import (
     ConfigException,
     RequestException,
     CapabilityException,
+    RateLimitException,
 )
 from .networking_classes import Node, RemotePlugin
 from .utils import LogUtil, Request, Plugin, ConfigUtil, GeneratorRequest, Event
@@ -5821,6 +5822,60 @@ class Plexus(EventMixin):
         self._rate_limiter.remove(DIM_SUB_IN, sub_uuid)
         self._rl_sub_in.pop(sub_uuid, None)
 
+    def _rl_charged_name(self, asserted, fallback_name=None):
+        """Resolve the identity NAME a Plugin-OUT charge is attributed to.
+
+        Priority: an asserted (impersonation) identity wins; else the in-hand
+        producer name the caller already holds (publisher for events); else the
+        real caller from the chain. Empty chain -> None (framework/system origin,
+        no plugin_out charge -- framework_in still applies at the admit site)."""
+        if asserted is not None:
+            return asserted.name
+        if fallback_name is not None:
+            return fallback_name
+        chain = current_caller_chain()
+        return chain[-1].name if chain else None
+
+    def _rl_admit_out(self, asserted, fallback_name=None, event_out_bucket=None, now=None):
+        """OUT-side (attempt) admit for one operation. Returns the first DRY
+        bucket (caller raises RateLimitException) or None when admitted.
+
+        Pinned bucket order: plugin_out, event_out, framework_in (OUT dims then
+        Framework-IN; Section 5). OUT cost is always 1.0 (one operation = one
+        attempt; stream weight is IN-only, Section 7). Charges the asserted name
+        on impersonation, else the in-hand producer name. No-op when rate
+        limiting is off, or when any frame in the live chain is exempt (lifecycle
+        origin)."""
+        if not self._rate_limits_active:
+            return None
+        if any(f.exempt for f in current_caller_chain()):
+            return None
+        charged = self._rl_charged_name(asserted, fallback_name)
+        buckets = []
+        if charged is not None:
+            pob = self._rate_limiter.get(DIM_PLUGIN_OUT, charged)
+            if pob is not None:
+                buckets.append(pob)
+        if event_out_bucket is not None:
+            buckets.append(event_out_bucket)
+        if self._rl_framework_in is not None:
+            buckets.append(self._rl_framework_in)
+        return self._rate_limiter.admit(buckets, 1.0, now)
+
+    def _rl_reject(self, dry):
+        """Raise ``RateLimitException`` for a dry bucket returned by
+        ``_rl_admit_out``. Reverse-maps the bucket to its dimension/key (Bucket
+        carries no identity) and folds dimension/key + remaining tokens into the
+        message, so the throttle reason round-trips through the request/future
+        boundary as a string. Per Section 13 this does NOT log -- the
+        first-per-window WARNING suppression is Step 5."""
+        loc = self._rate_limiter.locate(dry)
+        where = f"{loc[0]}:{loc[1]}" if loc is not None else "rate_limit"
+        raise RateLimitException(
+            f"rate limit exceeded on {where} "
+            f"({dry.tokens:.3f}/{dry.max:.0f} tokens available, need 1.0)"
+        )
+
     def _gate_author(self, author, author_id):
         """Capability gate. Returns ``(effective_author,
         effective_author_id, asserted)`` where ``asserted`` is the CallerIdentity
@@ -7028,6 +7083,14 @@ class Plexus(EventMixin):
         # asserted is scoped over the whole dispatch so nested calls inherit it
         # (the no-chaining check + Step 3 charge-the-asserted attribution).
         with asserted_identity_scope(asserted):
+            # Step 3c: OUT (attempt) admit BEFORE the request is created. Charges
+            # plugin_out(asserted-or-caller) + framework_in. Raising here is clean
+            # -- no request exists yet, the asserted scope unwinds on raise, and
+            # the exception crosses the sync bridge via future.result like the
+            # CapabilityException already does.
+            dry = self._rl_admit_out(asserted, now=time.monotonic())
+            if dry is not None:
+                self._rl_reject(dry)
             request = await self.create_request(
                 plugin,
                 method,
@@ -7119,6 +7182,12 @@ class Plexus(EventMixin):
         # The producer is spawned inside create_gen_request, so wrapping it in the
         # asserted scope makes the producer inherit the assertion at create_task.
         with asserted_identity_scope(asserted):
+            # Step 3c: OUT (attempt) admit BEFORE the gen-request is built (one
+            # admit per stream-open, OUT cost 1.0; the stream_weight charge is
+            # IN-only, Section 7). Same clean raise point as _dispatch_request.
+            dry = self._rl_admit_out(asserted, now=time.monotonic())
+            if dry is not None:
+                self._rl_reject(dry)
             return await self.create_gen_request(
                 plugin,
                 method,

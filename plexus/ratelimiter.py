@@ -191,6 +191,19 @@ class RateLimiter:
     def get(self, dimension: str, key: str) -> Optional[Bucket]:
         return self._buckets.get((dimension, key))
 
+    def locate(self, bucket: Bucket) -> Optional[Tuple[str, str]]:
+        """Reverse-map a live ``Bucket`` object back to its ``(dimension, key)``.
+
+        ``admit`` returns the dry bucket but not its identity; the reject site
+        needs the dimension/key to name the binding limit in its exception. A
+        linear scan by object identity is fine: it runs only on the reject path,
+        and the registry is small (one bucket per configured dimension/key).
+        Returns ``None`` if the bucket is not (or no longer) registered."""
+        for k, b in self._buckets.items():
+            if b is bucket:
+                return k
+        return None
+
     def __len__(self) -> int:
         """Number of configured buckets. Drives the framework's
         ``_rate_limits_active`` master switch (zero-overhead-off): a limiter with

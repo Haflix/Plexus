@@ -53,6 +53,7 @@ from .runtime import (
     DEFAULT_PLUGIN_READY_TIMEOUT,
     _EMIT_DEPTH,
     _MAX_EMIT_DEPTH,
+    _asserted_identity,
     _bridge_wait,
     _held_permit,
     _sync_call_chain,
@@ -927,6 +928,23 @@ class EventMixin:
         # whether local fan-out happens at all (e.g. hosts="remote"
         # means peer-only, no local delivery).
 
+        # Step 3c: OUT (attempt) admit BEFORE any fan-out (local or remote).
+        # Charges plugin_out(asserted-or-publisher) + event_out(publisher,event)
+        # + framework_in. Placed after validation so a malformed call still
+        # raises its ValueError rather than a throttle. Raising here is
+        # consistent with publish_event's existing pre-fan-out raises (undeclared
+        # / disabled event); a return-0 would collide with "0 subs matched".
+        dry = self._rl_admit_out(
+            _asserted_identity.get(),
+            fallback_name=publisher.plugin_name,
+            event_out_bucket=self._rl_event_out.get(
+                (publisher.plugin_name, event_id)
+            ),
+            now=time.monotonic(),
+        )
+        if dry is not None:
+            self._rl_reject(dry)
+
         # Publisher-level gate: skip local fan-out if publisher's
         # hosts/blocked_hosts exclude local delivery. PR3 Stage C still
         # runs remote dispatch even when local is skipped.
@@ -1374,6 +1392,25 @@ class EventMixin:
             else event_entry.get("blocked_hosts")
         )
         _warn_redundant_host_combos(eff_hosts, eff_blocked, self._logger)
+
+        # Step 3c: OUT (attempt) admit BEFORE local-match + remote fall-through.
+        # Charges plugin_out(asserted-or-publisher) + event_out(publisher,event)
+        # + framework_in. A distinct RateLimitException (subclass of
+        # RequestException) so the remote fall-through -- which catches only
+        # (NetworkRequestException, NoLocalSubException) then re-raises
+        # RequestException -- propagates the throttle TERMINALLY, never shunts it
+        # to a peer.
+        dry = self._rl_admit_out(
+            _asserted_identity.get(),
+            fallback_name=publisher.plugin_name,
+            event_out_bucket=self._rl_event_out.get(
+                (publisher.plugin_name, event_id)
+            ),
+            now=time.monotonic(),
+        )
+        if dry is not None:
+            self._rl_reject(dry)
+
         local_targets = self._publisher_targets_local(eff_hosts, eff_blocked)
 
         # Capture timestamp once so all per-sub Requests built off this
@@ -1676,6 +1713,26 @@ class EventMixin:
             else event_entry.get("blocked_hosts")
         )
         _warn_redundant_host_combos(eff_hosts, eff_blocked, self._logger)
+
+        # Step 3c: OUT (attempt) admit BEFORE the "started" lifecycle emit and
+        # any fan-out, so a throttled stream produces no lifecycle events. One
+        # admit per stream-open (OUT cost 1.0; the stream_weight charge is
+        # IN-only, Section 7). Charges plugin_out(asserted-or-publisher) +
+        # event_out(publisher,event) + framework_in. Raised before the first
+        # yield, like the disabled-event raise above (surfaces on first
+        # __anext__); the RateLimitException subclass propagates terminally
+        # through the remote fall-through.
+        dry = self._rl_admit_out(
+            _asserted_identity.get(),
+            fallback_name=publisher.plugin_name,
+            event_out_bucket=self._rl_event_out.get(
+                (publisher.plugin_name, event_id)
+            ),
+            now=time.monotonic(),
+        )
+        if dry is not None:
+            self._rl_reject(dry)
+
         local_targets = self._publisher_targets_local(eff_hosts, eff_blocked)
 
         # Capture timestamp once (consistency with publish_event /

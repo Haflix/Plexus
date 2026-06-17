@@ -211,6 +211,23 @@ def test_registry():
     check("registry: remove missing is a no-op", rl.remove("x", "y") is None)
 
 
+def test_locate():
+    # locate() reverse-maps a live Bucket back to its (dimension, key) so the
+    # reject site can name the binding limit (admit returns the bucket but not
+    # its identity). Used only on the reject path.
+    rl = RateLimiter()
+    a = rl.configure("plugin_out", "P", max_tokens=10, window=1, now=0.0)
+    b = rl.configure("framework_in", "global", max_tokens=5, window=1, now=0.0)
+    check("locate: maps bucket A to its key", rl.locate(a) == ("plugin_out", "P"))
+    check("locate: maps bucket B to its key",
+          rl.locate(b) == ("framework_in", "global"))
+    # a bucket not in this registry (or removed) -> None
+    stray = Bucket(3, 1, 0.0)
+    check("locate: unregistered bucket -> None", rl.locate(stray) is None)
+    rl.remove("plugin_out", "P")
+    check("locate: removed bucket -> None", rl.locate(a) is None)
+
+
 def test_config_validation():
     rl = RateLimiter()
 
@@ -300,7 +317,7 @@ if __name__ == "__main__":
         test_admit_refill_mid_charge, test_fractional_cost, test_reconfigure,
         test_reconfigure_rate_effect, test_backward_now_is_noop,
         test_admit_cost_guard, test_stream_weight,
-        test_registry, test_config_validation, test_counters,
+        test_registry, test_locate, test_config_validation, test_counters,
         test_key_helpers, test_charge_set,
     ]
     for t in tests:

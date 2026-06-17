@@ -1,5 +1,5 @@
-description: Rate-limit charge-set precompute integration suite (Step 3b)
-version: "0.1.0"
+description: Rate-limit charge-set precompute + OUT-admit integration suite (Steps 3b/3c)
+version: "0.2.0"
 remote: false
 arguments:
 events:
@@ -32,3 +32,11 @@ endpoints:
     description: Probe endpoint for the endpoint-IN charge-set case
     arguments:
       - name: value
+  _rl_drive:
+    internal_name: _rl_drive
+    remote: false
+    accessible_by_other_plugins: true
+    description: One-hop nested execute helper so a real caller frame exists at the OUT admit (plugin_out / self-call cases)
+    arguments:
+      - name: target
+      - name: method

@@ -40,7 +40,7 @@ Submodules:
     networking_classes  — Node + RemotePlugin data classes
 """
 
-__version__ = "0.56.0"
+__version__ = "0.57.0"
 
 from .core import Plexus
 from .utils import (
@@ -58,6 +58,7 @@ from .exceptions import (
     NetworkRequestException,
     NoLocalSubException,
     CapabilityException,
+    RateLimitException,
     NodeException,
     PluginTypeMismatchError,
     PluginDependencyError,
@@ -121,6 +122,7 @@ __all__ = [
     "NetworkRequestException",
     "NoLocalSubException",
     "CapabilityException",
+    "RateLimitException",
     "NodeException",
     "PluginTypeMismatchError",
     "PluginDependencyError",
