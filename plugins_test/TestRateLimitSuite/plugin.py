@@ -337,7 +337,12 @@ class TestRateLimitSuite(Plugin):
             # Each _rl_drive invocation runs ONE nested self-execute (SUITE.ep_a)
             # whose OUT admit charges plugin_out(SUITE) once. The OUTER dispatch
             # into _rl_drive is charged to the empty run() chain (-> None ->
-            # plugin_out skipped), so it does not consume the budget.
+            # plugin_out skipped), so it does not consume the budget. framework_in
+            # is unconfigured, so plugin_out(SUITE) is the ONLY binding dimension.
+            # Reaching a {"rate_limited": ...} marker on every iteration also
+            # proves the OUTER call is never charged: if it were, the 4th outer
+            # dispatch would raise RateLimitException uncaught (before entering
+            # _rl_drive) and crash the loop instead of returning a marker.
             results = []
             for _ in range(4):
                 m = await self.execute(
@@ -355,8 +360,9 @@ class TestRateLimitSuite(Plugin):
     async def _case_out_framework_in(self, rec, kw):
         async def body(c):
             px = self._plexus
-            # framework_in only. A direct dispatch from run() has an empty chain
-            # (-> charged None -> plugin_out skipped), so only the global
+            # framework_in only. The isolation relies on the dispatch being
+            # framework-origin: a direct execute from run() has an empty caller
+            # chain (-> charged None -> plugin_out skipped), so only the global
             # framework_in bucket binds. The RateLimitException is raised at the
             # OUT site before the request is created, so it reaches this await as
             # its real type (not re-wrapped).
@@ -404,7 +410,11 @@ class TestRateLimitSuite(Plugin):
         async def body(c):
             px = self._plexus
             # A dry plugin_out(SUITE) bucket: a non-exempt frame hits it, but an
-            # exempt (lifecycle-origin) frame must skip the admit entirely.
+            # exempt (lifecycle-origin) frame must skip the admit entirely. This
+            # proves the admit RESPECTS an exempt frame; that the framework
+            # actually stamps lifecycle entries exempt=True is proven end-to-end
+            # by TestIdentitySuite (identity.lifecycle.exempt). caller_chain_scope
+            # here is the same primitive core.py uses at those lifecycle entries.
             self._apply({(DIM_PLUGIN_OUT, SUITE): {"max": 1, "window": 1000}})
             await px._rebuild_charge_sets()
             b = px._rate_limiter.get(DIM_PLUGIN_OUT, SUITE)

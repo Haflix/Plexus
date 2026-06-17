@@ -215,9 +215,12 @@ class Plexus(EventMixin):
         self._load_capability_grants()
 
         # Rate limiter (Step 3). The limiter owns the token buckets keyed by
-        # (dimension, key); the charge sites (Section 12: _dispatch_request /
-        # _create_gen_request_gated / _call_endpoint / networking inbound)
-        # consult it. ``_rate_limits_active`` is the zero-overhead-off master
+        # (dimension, key). Section 12 charge sites: the OUT sites
+        # _dispatch_request + _create_gen_request_gated + the publish_event /
+        # request_event / request_event_stream entries are WIRED (Step 3c); the
+        # IN sites _call_endpoint (Step 3d) and the networking inbound handler
+        # (Step 3e, Nodes-IN) will consult it once those steps land.
+        # ``_rate_limits_active`` is the zero-overhead-off master
         # switch: False while no bucket is configured, so the charge path
         # short-circuits before any work. Like the capability gate, an active
         # limit needs caller-identity stamping (to attribute a charge to the real
@@ -5869,8 +5872,11 @@ class Plexus(EventMixin):
         message, so the throttle reason round-trips through the request/future
         boundary as a string. Per Section 13 this does NOT log -- the
         first-per-window WARNING suppression is Step 5."""
+        # locate() can only miss if the bucket was unregistered between the
+        # admit and this raise; that cannot happen loop-side (no await between),
+        # but fall back to a clear label rather than a bare object repr.
         loc = self._rate_limiter.locate(dry)
-        where = f"{loc[0]}:{loc[1]}" if loc is not None else "rate_limit"
+        where = f"{loc[0]}:{loc[1]}" if loc is not None else "(unregistered bucket)"
         raise RateLimitException(
             f"rate limit exceeded on {where} "
             f"({dry.tokens:.3f}/{dry.max:.0f} tokens available, need 1.0)"
