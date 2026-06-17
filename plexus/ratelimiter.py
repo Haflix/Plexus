@@ -17,9 +17,39 @@ from __future__ import annotations
 
 import math
 import time
-from typing import Dict, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from .exceptions import ConfigException
+
+
+# ── Bucket dimensions + key conventions (Section 3) ───────────────────────
+#
+# Seven bucket namespaces. Each (dimension, key) pair names one bucket in the
+# RateLimiter registry. The charge sites build the keys with the helpers below
+# so the configure-time key and the lookup-time key are formatted identically.
+DIM_FRAMEWORK_IN = "framework_in"   # one global bucket, key FRAMEWORK_IN_KEY
+DIM_NODES_IN = "nodes_in"           # per remote peer, key = peer hostname
+DIM_PLUGIN_IN = "plugin_in"         # per plugin (target), key = plugin name
+DIM_PLUGIN_OUT = "plugin_out"       # per plugin (caller/asserted), key = name
+DIM_EVENT_OUT = "event_out"         # per (plugin, event_id)
+DIM_ENDPOINT_IN = "endpoint_in"     # per (plugin, access_name)
+DIM_SUB_IN = "sub_in"               # per subscription, key = sub_uuid
+
+# The single global-intake bucket's key (Framework-IN is one bucket).
+FRAMEWORK_IN_KEY = "global"
+
+# Composite-key separator. Plugin / endpoint / event identifiers are validated
+# identifiers (letters, digits, underscore -- see _validate_identifier_name), so
+# ":" can never appear inside a part and the joined key is unambiguous.
+_KEY_SEP = ":"
+
+
+def endpoint_key(plugin: str, access_name: str) -> str:
+    return f"{plugin}{_KEY_SEP}{access_name}"
+
+
+def event_key(plugin: str, event_id: str) -> str:
+    return f"{plugin}{_KEY_SEP}{event_id}"
 
 
 def _validate(max_tokens, window, where: str) -> None:
@@ -161,6 +191,13 @@ class RateLimiter:
     def get(self, dimension: str, key: str) -> Optional[Bucket]:
         return self._buckets.get((dimension, key))
 
+    def __len__(self) -> int:
+        """Number of configured buckets. Drives the framework's
+        ``_rate_limits_active`` master switch (zero-overhead-off): a limiter with
+        no buckets means nothing is configured, so the charge path short-circuits
+        before any work."""
+        return len(self._buckets)
+
     def remove(self, dimension: str, key: str) -> None:
         """Tear a bucket down (unsubscribe / plugin hot-swap).
 
@@ -214,3 +251,25 @@ class RateLimiter:
             b.tokens -= cost
             b.charged += 1
         return None
+
+
+def charge_set(limiter: RateLimiter,
+               specs: Sequence[Tuple[str, str]]) -> List[Bucket]:
+    """Assemble a precomputed charge-set from ordered ``(dimension, key)`` specs.
+
+    Returns the configured buckets for ``specs`` IN THE SAME ORDER, skipping any
+    dimension that has no bucket configured (no limit on that axis). ``specs`` is
+    the caller's pinned admit order (Section 5: OUT dims, then Framework-IN, then
+    IN dims) so ``admit`` reports the first dry bucket deterministically. A spec
+    list whose dimensions are all unconfigured yields an empty list -> ``admit``
+    no-ops (zero-overhead-off). The result is a plain ``list`` (re-iterable, as
+    ``admit`` requires) of direct bucket references, so the hot path does no key
+    formatting or dict lookups per call -- only this one-time assembly at
+    registration / rebuild.
+    """
+    out: List[Bucket] = []
+    for dim, key in specs:
+        b = limiter.get(dim, key)
+        if b is not None:
+            out.append(b)
+    return out

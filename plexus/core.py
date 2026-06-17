@@ -107,6 +107,7 @@ from .runtime import (  # noqa: F401  (re-export shim)
     evaluate_capability,
     asserted_identity_scope,
 )
+from .ratelimiter import RateLimiter
 
 from .events import EventMixin
 
@@ -190,6 +191,21 @@ class Plexus(EventMixin):
         # yaml_config was loaded above; parse the capabilities: section now so
         # the gate is live from the first dispatch when grants are configured.
         self._load_capability_grants()
+
+        # Rate limiter (Step 3). The limiter owns the token buckets keyed by
+        # (dimension, key); the charge sites (Section 12: _dispatch_request /
+        # _create_gen_request_gated / _call_endpoint / networking inbound)
+        # consult it. ``_rate_limits_active`` is the zero-overhead-off master
+        # switch: False while no bucket is configured, so the charge path
+        # short-circuits before any work. Like the capability gate, an active
+        # limit needs caller-identity stamping (to attribute a charge to the real
+        # caller / asserted identity), so _recompute_rate_limits_active turns
+        # _identity_active on. Config-driven bucket setup arrives in Step 4; tests
+        # configure buckets directly via self._rate_limiter.configure(...) then
+        # call _recompute_rate_limits_active().
+        self._rate_limiter = RateLimiter()
+        self._rate_limits_active: bool = False
+        self._recompute_rate_limits_active()
 
         self.main_event_loop = None
         self.plugins = {}
@@ -5583,6 +5599,18 @@ class Plexus(EventMixin):
         config is applied (and re-callable on hot-reload)."""
         self._capability_active = bool(self._capability_grants)
         if self._capability_active:
+            self._identity_active = True
+
+    def _recompute_rate_limits_active(self) -> None:
+        """Derive the rate-limit master switch from the limiter's bucket count.
+        When ANY bucket is configured the charge path is live, which requires
+        caller-identity stamping (to attribute a charge to the real caller / the
+        asserted identity) -- so this also turns ``_identity_active`` on (it never
+        turns it OFF: the capability gate, or a test, may want stamping
+        independently). Called after buckets are (re)configured -- the Step 4
+        config-apply / hot-reload path, or directly from tests."""
+        self._rate_limits_active = len(self._rate_limiter) > 0
+        if self._rate_limits_active:
             self._identity_active = True
 
     def _gate_author(self, author, author_id):

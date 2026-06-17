@@ -4,7 +4,10 @@ Standalone + deterministic: every test injects ``now`` so there are no sleeps
 and no wall-clock flakiness. Run with: python test_ratelimiter.py
 Exit code 0 = all pass.
 """
-from plexus.ratelimiter import Bucket, RateLimiter
+from plexus.ratelimiter import (
+    Bucket, RateLimiter, charge_set, endpoint_key, event_key,
+    DIM_PLUGIN_IN, DIM_ENDPOINT_IN, DIM_FRAMEWORK_IN, FRAMEWORK_IN_KEY,
+)
 from plexus.exceptions import ConfigException
 
 PASS, FAIL = [], []
@@ -149,19 +152,60 @@ def test_stream_weight():
 
 
 # ── RateLimiter registry: configure / get / remove / live reconfigure ──
+def test_key_helpers():
+    check("key: endpoint_key joins plugin:access",
+          endpoint_key("LLM", "complete") == "LLM:complete")
+    check("key: event_key joins plugin:event",
+          event_key("Orch", "response") == "Orch:response")
+
+
+def test_charge_set():
+    rl = RateLimiter()
+    # Configure two of three dimensions; the unconfigured one is skipped.
+    ep = rl.configure(DIM_ENDPOINT_IN, endpoint_key("Q", "E"), 20, 1, now=0.0)
+    pin = rl.configure(DIM_PLUGIN_IN, "Q", 100, 1, now=0.0)
+    specs = [
+        (DIM_ENDPOINT_IN, endpoint_key("Q", "E")),
+        (DIM_PLUGIN_IN, "Q"),
+        (DIM_FRAMEWORK_IN, FRAMEWORK_IN_KEY),   # NOT configured -> skipped
+    ]
+    cs = charge_set(rl, specs)
+    check("charge_set: returns configured buckets in spec order",
+          cs == [ep, pin])
+    check("charge_set: is a re-iterable list (admit requirement)",
+          isinstance(cs, list))
+    # Now configure framework_in too -> it appears LAST (spec order preserved).
+    fin = rl.configure(DIM_FRAMEWORK_IN, FRAMEWORK_IN_KEY, 1000, 1, now=0.0)
+    cs2 = charge_set(rl, specs)
+    check("charge_set: newly-configured dim joins in pinned spec order",
+          cs2 == [ep, pin, fin])
+    # All-unconfigured -> empty -> admit no-ops (zero-overhead-off).
+    empty = charge_set(rl, [(DIM_PLUGIN_IN, "Nope"), (DIM_ENDPOINT_IN, "x:y")])
+    check("charge_set: all-unconfigured yields empty list", empty == [])
+    check("charge_set: empty set admits (no-op)", rl.admit(empty, 1.0, 0.0) is None)
+
+
 def test_registry():
     rl = RateLimiter()
+    # __len__ is the bucket count that drives the framework's
+    # _rate_limits_active master switch (zero-overhead-off).
+    check("registry: empty len 0 (rate_limits_active stays off)", len(rl) == 0)
     b = rl.configure("plugin_out", "P", max_tokens=10, window=1, now=0.0)
     check("registry: configure creates bucket", rl.get("plugin_out", "P") is b)
+    check("registry: len 1 after first configure", len(rl) == 1)
     # configure again reconfigures the SAME bucket (does not replace) and the
     # clamp-on-shrink fires via the registry path (tokens 8 -> new max 5).
     b.tokens = 8.0
     b2 = rl.configure("plugin_out", "P", max_tokens=5, window=1, now=0.0)
     check("registry: re-configure reuses bucket + clamps tokens to new max",
           b2 is b and b.max == 5.0 and b.tokens == 5.0, f"tokens={b.tokens}")
-    check("registry: get miss returns None", rl.get("plugin_out", "Q") is None)
+    check("registry: re-configure of same key does NOT bump len", len(rl) == 1)
+    rl.configure("plugin_in", "Q", max_tokens=5, window=1, now=0.0)
+    check("registry: distinct key bumps len to 2", len(rl) == 2)
+    check("registry: get miss returns None", rl.get("plugin_out", "Z") is None)
     rl.remove("plugin_out", "P")
     check("registry: remove tears down bucket", rl.get("plugin_out", "P") is None)
+    check("registry: len drops to 1 after remove", len(rl) == 1)
     check("registry: remove missing is a no-op", rl.remove("x", "y") is None)
 
 
@@ -255,6 +299,7 @@ if __name__ == "__main__":
         test_reconfigure_rate_effect, test_backward_now_is_noop,
         test_admit_cost_guard, test_stream_weight,
         test_registry, test_config_validation, test_counters,
+        test_key_helpers, test_charge_set,
     ]
     for t in tests:
         print(t.__name__)
