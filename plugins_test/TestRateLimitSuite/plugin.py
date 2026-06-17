@@ -45,6 +45,13 @@ Cases (Step 4, config load):
   a bucket via the declared layer; it lands in the declared dict, not the base.
 - main_overrides_declared: main config wins over a plugin-declared value on an
   overlapping (dim, key) (base checked before the declared layer).
+
+Cases (Step 5, observability):
+- reject_log_suppression: the first reject per (dim, key) logs a WARNING, further
+  in-window rejects are suppressed (counter still tracks them), and the first
+  reject after the window emits a suppressed-count summary + a fresh WARNING.
+- stats_snapshot: RateLimiter.stats() reflects real charged/rejected/tokens/max
+  after a live admit+reject dispatch sequence.
 """
 import asyncio
 import sys
@@ -58,6 +65,7 @@ from plexus.utils import Plugin  # noqa: E402
 from plexus.decorators import async_gen_log_errors, async_log_errors, log_errors  # noqa: E402
 from plexus.exceptions import RateLimitException, RequestException  # noqa: E402
 from plexus.runtime import CallerIdentity, caller_chain_scope  # noqa: E402
+from plexus.core import RL_REJECT_LOG_WINDOW  # noqa: E402
 from plexus.ratelimiter import (  # noqa: E402
     RateLimiter, endpoint_key, event_key,
     DIM_PLUGIN_IN, DIM_PLUGIN_OUT, DIM_ENDPOINT_IN, DIM_EVENT_OUT, DIM_SUB_IN,
@@ -66,7 +74,7 @@ from plexus.ratelimiter import (  # noqa: E402
 
 from _test_helpers import CaseRecorder  # noqa: E402
 
-SUITE_VERSION = "0.5.0"
+SUITE_VERSION = "0.6.0"
 SUITE = "TestRateLimitSuite"
 TARGET = "TestRateLimitTarget"
 
@@ -189,6 +197,9 @@ class TestRateLimitSuite(Plugin):
             await self._case_config_load_end_to_end(rec, kw)
             await self._case_plugin_declared_merge(rec, kw)
             await self._case_main_overrides_declared(rec, kw)
+            # Step 5 -- observability (reject-log suppression + stats()).
+            await self._case_reject_log_suppression(rec, kw)
+            await self._case_stats_snapshot(rec, kw)
         finally:
             for su in runtime_subs:
                 try:
@@ -207,6 +218,9 @@ class TestRateLimitSuite(Plugin):
             await px._rebuild_charge_sets()
             px._rate_limits_active = orig_active
             px._identity_active = orig_id
+            # Step 5: drop suppression state accumulated by the reject cases so it
+            # does not leak across runs (benign, but keeps the table boot-clean).
+            px._rl_reject_log.clear()
         return rec.to_dict()
 
     async def _case_endpoint_in_set(self, rec, kw):
@@ -882,3 +896,117 @@ class TestRateLimitSuite(Plugin):
                     f"(max=99); got max={b.max if b else None}"
                 )
         await rec.run_case("ratelimit.main_overrides_declared", body, **kw)
+
+    async def _case_reject_log_suppression(self, rec, kw):
+        async def body(c):
+            import logging
+            px = self._plexus
+            # framework_in max=1: first execute admits, the rest reject at the OUT
+            # site (RateLimitException raised to the caller). Drives the Step 5
+            # suppression state machine end-to-end through a real dispatch.
+            self._apply({(DIM_FRAMEWORK_IN, FRAMEWORK_IN_KEY): {"max": 1, "window": 1000}})
+            await px._rebuild_charge_sets()
+            px._rl_reject_log.clear()
+            loc = (DIM_FRAMEWORK_IN, FRAMEWORK_IN_KEY)
+
+            captured = []
+
+            class _Cap(logging.Handler):
+                def emit(self, r):
+                    try:
+                        msg = r.getMessage()
+                    except Exception:
+                        msg = ""
+                    if "[RATELIMIT]" in msg:
+                        captured.append(msg)
+
+            handler = _Cap(level=logging.WARNING)
+            px._logger.addHandler(handler)
+            try:
+                await self.execute(TARGET, "sink")        # admit (framework_in 1 -> 0)
+                rejects = 0
+                for _ in range(3):                        # 3 in-window rejects
+                    try:
+                        await self.execute(TARGET, "sink")
+                    except RateLimitException:
+                        rejects += 1
+                if rejects != 3:
+                    raise AssertionError(f"expected 3 rejects; got {rejects}")
+                # First reject logs ONCE; the next two are suppressed.
+                if len(captured) != 1:
+                    raise AssertionError(
+                        f"in-window must emit exactly 1 WARNING (first reject); "
+                        f"got {len(captured)}: {captured}"
+                    )
+                st = px._rl_reject_log.get(loc)
+                if st is None or st["rejected_at_warn"] != 1:
+                    raise AssertionError(
+                        f"first reject must record suppression state "
+                        f"(rejected_at_warn=1); got {st!r}"
+                    )
+
+                # Force the window to have elapsed, then one more reject: it must
+                # emit a SUMMARY of the 2 suppressed + a fresh first-of-window
+                # WARNING (2 new records).
+                captured.clear()
+                st["last_warn"] -= (RL_REJECT_LOG_WINDOW + 1.0)
+                try:
+                    await self.execute(TARGET, "sink")
+                except RateLimitException:
+                    pass
+                if len(captured) != 2:
+                    raise AssertionError(
+                        f"post-window reject must emit a suppressed-count summary "
+                        f"+ a new WARNING (2 records); got {len(captured)}: {captured}"
+                    )
+                if not any("further" in m for m in captured):
+                    raise AssertionError(
+                        f"post-window must emit the suppressed-count summary; "
+                        f"got {captured}"
+                    )
+                # The summary names the count actually suppressed (2).
+                if not any("2 further" in m for m in captured):
+                    raise AssertionError(
+                        f"summary must report 2 suppressed rejects; got {captured}"
+                    )
+            finally:
+                px._logger.removeHandler(handler)
+        await rec.run_case("ratelimit.reject_log_suppression", body, **kw)
+
+    async def _case_stats_snapshot(self, rec, kw):
+        async def body(c):
+            px = self._plexus
+            # stats() must reflect real charge/reject volume after live dispatch.
+            # framework_in max=2: 2 admits then rejects.
+            self._apply({(DIM_FRAMEWORK_IN, FRAMEWORK_IN_KEY): {"max": 2, "window": 1000}})
+            await px._rebuild_charge_sets()
+            px._rl_reject_log.clear()
+            oks = 0
+            rejects = 0
+            for _ in range(4):
+                try:
+                    await self.execute(TARGET, "sink")
+                    oks += 1
+                except RateLimitException:
+                    rejects += 1
+            recs = px._rate_limiter.stats()
+            fw = next(
+                (r for r in recs
+                 if r["dim"] == DIM_FRAMEWORK_IN and r["key"] == FRAMEWORK_IN_KEY),
+                None,
+            )
+            if fw is None:
+                raise AssertionError(f"stats() must include the framework_in bucket; got {recs}")
+            if fw["charged"] != 2 or fw["rejected"] != 2:
+                raise AssertionError(
+                    f"stats() must report charged=2/rejected=2 after 2 admits + 2 "
+                    f"rejects; got charged={fw['charged']} rejected={fw['rejected']}"
+                )
+            if fw["max"] != 2.0 or fw["tokens"] != 0.0:
+                raise AssertionError(
+                    f"stats() must report max=2 and drained tokens=0; "
+                    f"got max={fw['max']} tokens={fw['tokens']}"
+                )
+            if oks != 2 or rejects != 2:
+                raise AssertionError(f"expected 2 admit + 2 reject; got {oks}/{rejects}")
+        await rec.run_case("ratelimit.stats_snapshot", body, **kw)

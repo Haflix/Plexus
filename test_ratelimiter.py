@@ -260,6 +260,35 @@ def test_counters():
     check("counters: rejected counts rejects", b.rejected == 2, f"rejected={b.rejected}")
 
 
+def test_stats():
+    rl = RateLimiter()
+    # empty limiter -> empty list.
+    check("stats: empty -> []", rl.stats() == [])
+    rl.configure(DIM_PLUGIN_IN, "P", 2, 1, now=0.0)
+    rl.configure(DIM_ENDPOINT_IN, endpoint_key("P", "e"), 5, 1, now=0.0)
+    pin = rl.get(DIM_PLUGIN_IN, "P")
+    rl.admit([pin], 1.0, 0.0)            # charge (tokens 2 -> 1)
+    rl.admit([pin], 1.0, 0.0)            # charge (1 -> 0)
+    rl.admit([pin], 1.0, 0.0)            # reject (0 tokens)
+    recs = rl.stats()
+    check("stats: one record per bucket", len(recs) == 2, f"got {len(recs)}")
+    check("stats: list of dict records",
+          all(isinstance(r, dict) for r in recs))
+    by_key = {(r["dim"], r["key"]): r for r in recs}
+    pr = by_key[(DIM_PLUGIN_IN, "P")]
+    check("stats: charged reported", pr["charged"] == 2, f"charged={pr['charged']}")
+    check("stats: rejected reported", pr["rejected"] == 1, f"rejected={pr['rejected']}")
+    check("stats: max reported", pr["max"] == 2.0, f"max={pr['max']}")
+    check("stats: raw tokens (no refill side effect)", pr["tokens"] == 0.0,
+          f"tokens={pr['tokens']}")
+    # stats() must not have mutated the bucket (no refill).
+    check("stats: pure (tokens unchanged after stats)", pin.tokens == 0.0,
+          f"tokens={pin.tokens}")
+    # the idle, never-charged endpoint bucket reports its full starting tokens.
+    er = by_key[(DIM_ENDPOINT_IN, endpoint_key("P", "e"))]
+    check("stats: untouched bucket full", er["tokens"] == 5.0 and er["charged"] == 0)
+
+
 def test_admit_refill_mid_charge():
     # admit() must refill before peeking: a bucket too dry at t0 admits at t1
     # because time advanced. This is the runtime path; the bare refill() tests
@@ -318,7 +347,7 @@ if __name__ == "__main__":
         test_reconfigure_rate_effect, test_backward_now_is_noop,
         test_admit_cost_guard, test_stream_weight,
         test_registry, test_locate, test_config_validation, test_counters,
-        test_key_helpers, test_charge_set,
+        test_stats, test_key_helpers, test_charge_set,
     ]
     for t in tests:
         print(t.__name__)

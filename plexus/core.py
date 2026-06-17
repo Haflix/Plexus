@@ -135,6 +135,15 @@ _RL_STATIC_DIMS = frozenset({
     DIM_FRAMEWORK_IN, DIM_PLUGIN_IN, DIM_PLUGIN_OUT, DIM_ENDPOINT_IN, DIM_EVENT_OUT,
 })
 
+# Step 5: reject-log suppression window (seconds). A runaway caller hitting a cap
+# at many times its rate would otherwise emit one WARNING per rejected call and
+# make the logger itself the bottleneck. The first reject per (dim, key) per
+# window logs at WARNING; further rejects in the window only bump the per-bucket
+# counter (which carries the true volume); the next reject AFTER the window emits
+# a one-line summary of what was suppressed, then a fresh WARNING. Config-tunable
+# is deferred -- a module constant is the v1 contract.
+RL_REJECT_LOG_WINDOW = 10.0
+
 from .events import EventMixin
 
 
@@ -271,6 +280,18 @@ class Plexus(EventMixin):
         self._rl_sub_in: Dict[str, list] = {}                  # sub_uuid -> [sub_in, endpoint_in, plugin_in]
         self._rl_event_out: Dict[tuple, object] = {}           # (plugin, event_id) -> event_out bucket
         self._rl_framework_in = None                           # the single global-intake bucket
+        # Step 5: reject-log suppression state, keyed by the dry bucket's
+        # (dim, key). {"last_warn": monotonic_ts, "rejected_at_warn": int}. The
+        # per-bucket Bucket.rejected counter carries the true volume; this only
+        # gates how often a WARNING is emitted (RL_REJECT_LOG_WINDOW). Loop-side
+        # only (every reject site runs on the event loop). Not pruned on bucket
+        # removal, and that is safe because the keyspace is bounded by config:
+        # the six static dims come from plugin config/registration, and Nodes-IN
+        # keys are peer hostnames that can ONLY be a configured peer (an
+        # unconfigured peer fails the mTLS fingerprint pin before peer_hostname is
+        # set, so it never reaches the admit). No wire input can grow this dict.
+        # A stale entry after a hot-swap re-create is benign (see _rl_log_reject).
+        self._rl_reject_log: Dict[tuple, dict] = {}
         # Step 4: flatten the main-config `rate_limits:` section into the base
         # dicts now (yaml_config was loaded above; capabilities parse at ~217 in
         # the same window). Buckets are NOT built here -- _rebuild_charge_sets
@@ -6023,29 +6044,89 @@ class Plexus(EventMixin):
             return None
         return self._rate_limiter.admit(cs, cost, now)
 
-    def _rl_reject_message(self, dry, cost=1.0):
+    def _rl_build_reject_str(self, dry, cost=1.0, loc=None):
         """Build the RateLimitException message for a dry bucket returned by an
         admit. Reverse-maps the bucket to its dimension/key (Bucket carries no
         identity) and folds dimension/key + remaining tokens + the binding cost
         into the message, so the throttle reason round-trips through the
-        request/future boundary as a string. Shared by ``_rl_reject`` (which
-        raises) and the stream producers (which resolve the gen-request with this
-        string). ``cost`` is 1.0 for the OUT/non-stream IN path and the
-        stream_weight for a stream open, so a weight-rejected stream is legible."""
+        request/future boundary as a string. ``cost`` is 1.0 for the OUT/non-stream
+        IN path and the stream_weight for a stream open, so a weight-rejected
+        stream is legible. ``loc`` may be passed pre-resolved by the caller to
+        avoid a second ``locate`` scan (``_rl_reject_message`` does this); when
+        None it is resolved here so the builder stays callable standalone.
+
+        PURE: no side effect. ``_rl_reject_message`` is the logging wrapper around
+        this; any future caller that needs the string for a NON-reject reason
+        (introspection, a dry-run) uses this builder directly and emits no WARNING.
+        """
         # locate() can only miss if the bucket was unregistered between the admit
         # and here; that cannot happen loop-side (no await between), but fall back
         # to a clear label rather than a bare object repr.
-        loc = self._rate_limiter.locate(dry)
+        if loc is None:
+            loc = self._rate_limiter.locate(dry)
         where = f"{loc[0]}:{loc[1]}" if loc is not None else "(unregistered bucket)"
         return (
             f"rate limit exceeded on {where} "
             f"({dry.tokens:.3f}/{dry.max:.0f} tokens available, need {cost})"
         )
 
+    def _rl_log_reject(self, dry, loc=None) -> None:
+        """Step 5: emit a SUPPRESSED WARNING for a rejected bucket. First reject
+        per (dim, key) per ``RL_REJECT_LOG_WINDOW`` logs; further rejects in the
+        window are silent (the ``Bucket.rejected`` counter carries the volume);
+        the next reject after the window emits a one-line summary of what was
+        suppressed, then a fresh WARNING. Self-contained so it is callable from
+        every reject path -- the message sites (via ``_rl_reject_message``, which
+        passes ``loc`` pre-resolved) AND the silent fire-and-forget peer-publish
+        drop in the networking layer (which passes no ``loc``). Never raises on
+        the reject path (a logging fault must not mask a throttle).
+        """
+        if loc is None:
+            loc = self._rate_limiter.locate(dry)
+        if loc is None:
+            # Unregistered between admit and here -- cannot happen loop-side, but a
+            # missing identity is not worth crashing the reject path over.
+            return
+        where = f"{loc[0]}:{loc[1]}"
+        now = time.monotonic()
+        st = self._rl_reject_log.get(loc)
+        if st is None or (now - st["last_warn"]) >= RL_REJECT_LOG_WINDOW:
+            if st is not None:
+                # rejected_at_warn was dry.rejected AT the previous WARNING (which
+                # already included that warned reject); dry.rejected now includes
+                # THIS reject. Subtracting both endpoints counts exactly the
+                # in-window suppressed rejects. The -1 is intentional; do NOT
+                # "fix" it.
+                suppressed = dry.rejected - st["rejected_at_warn"] - 1
+                if suppressed > 0:
+                    self._logger.warning(
+                        "[RATELIMIT] %d further reject(s) on %s in the last ~%.0fs",
+                        suppressed, where, RL_REJECT_LOG_WINDOW,
+                    )
+            self._logger.warning(
+                "[RATELIMIT] reject on %s (%.3f/%.0f tokens); suppressing further "
+                "warnings ~%.0fs (counter still tracks every reject)",
+                where, dry.tokens, dry.max, RL_REJECT_LOG_WINDOW,
+            )
+            self._rl_reject_log[loc] = {"last_warn": now, "rejected_at_warn": dry.rejected}
+        # else: in-window -> suppressed; Bucket.rejected already carries it.
+
+    def _rl_reject_message(self, dry, cost=1.0):
+        """Logging wrapper: emit the suppressed reject WARNING (Step 5) and return
+        the round-trip reject string (Step 3). Every message-building reject site
+        (the raising ``_rl_reject`` + the stream producers + the networking
+        handlers) already calls this exactly once per reject, so the WARNING fires
+        once per reject without each site needing its own log call. The bucket
+        identity is resolved ONCE here and shared with both helpers so the reject
+        path does a single ``locate`` scan, not two."""
+        loc = self._rate_limiter.locate(dry)
+        self._rl_log_reject(dry, loc)
+        return self._rl_build_reject_str(dry, cost, loc)
+
     def _rl_reject(self, dry, cost=1.0):
         """Raise ``RateLimitException`` for a dry bucket. OUT callers keep calling
-        ``self._rl_reject(dry)`` (cost defaults to 1.0). Per Section 13 this does
-        NOT log -- the first-per-window WARNING suppression is Step 5."""
+        ``self._rl_reject(dry)`` (cost defaults to 1.0). The WARNING is emitted by
+        ``_rl_reject_message`` (Step 5 suppression)."""
         raise RateLimitException(self._rl_reject_message(dry, cost))
 
     def _rl_admit_inbound(self, peer, include_framework, now=None):

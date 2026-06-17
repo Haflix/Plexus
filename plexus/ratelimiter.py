@@ -231,6 +231,26 @@ class RateLimiter:
         plugins (``configure`` only adds, so a shrink is driven from here)."""
         return list(self._buckets.keys())
 
+    def stats(self) -> List[dict]:
+        """A snapshot of every bucket's counters + current state, as a list of
+        records (JSON-serialisable, natural to iterate -- the read seam for the
+        TUI / a metrics exporter; Section 13). NO refill: ``tokens`` is the raw
+        last-committed value, so ``stats`` has ZERO side effects and never mutates
+        a bucket (an idle bucket may read lower than its true refilled level; a
+        display layer can refill-for-show itself). ``charged`` / ``rejected`` are
+        the lifetime counters maintained by ``admit``."""
+        return [
+            {
+                "dim": dim,
+                "key": key,
+                "charged": b.charged,
+                "rejected": b.rejected,
+                "tokens": b.tokens,
+                "max": b.max,
+            }
+            for (dim, key), b in self._buckets.items()
+        ]
+
     def remove(self, dimension: str, key: str) -> None:
         """Tear a bucket down (unsubscribe / plugin hot-swap).
 

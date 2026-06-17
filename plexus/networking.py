@@ -2760,11 +2760,17 @@ class NetworkManager:
             # Step 3e: per-peer Nodes-IN + Framework-IN admit (this handler calls
             # _fanout_sub directly, bypassing the publish_event entry that would
             # otherwise charge Framework-IN, so charge it here -- one atomic admit).
-            # Fire-and-forget: a throttled peer is dropped silently (no caller
-            # awaits a reply). Reciprocal advert exchange already ran above
+            # Fire-and-forget: a throttled peer is dropped silently to the CALLER
+            # (no reply awaited). Reciprocal advert exchange already ran above
             # (control-plane stays open under a data-plane throttle, intended).
+            # Step 5: this is the one reject path that builds NO message (the
+            # others log via _rl_reject_message), so log the suppressed WARNING
+            # directly -- otherwise a peer flooding publish_event would be a silent
+            # observability blind spot.
             _peer = conn_context.get("peer_hostname")
-            if self.plexus._rl_admit_inbound(_peer, True, time.monotonic()) is not None:
+            _dry = self.plexus._rl_admit_inbound(_peer, True, time.monotonic())
+            if _dry is not None:
+                self.plexus._rl_log_reject(_dry)
                 return
 
             self._logger.debug(
