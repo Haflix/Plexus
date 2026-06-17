@@ -37,6 +37,7 @@ Cases (3c, OUT admit):
 - out_asserted_attribution: an asserted (impersonation) identity wins the charge
   attribution over the chain caller (plugin_out keyed on the asserted name).
 """
+import asyncio
 import sys
 import time
 from pathlib import Path
@@ -45,8 +46,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from typing import Any, Dict, List, Optional  # noqa: E402
 
 from plexus.utils import Plugin  # noqa: E402
-from plexus.decorators import async_log_errors, log_errors  # noqa: E402
-from plexus.exceptions import RateLimitException  # noqa: E402
+from plexus.decorators import async_gen_log_errors, async_log_errors, log_errors  # noqa: E402
+from plexus.exceptions import RateLimitException, RequestException  # noqa: E402
 from plexus.runtime import CallerIdentity, caller_chain_scope  # noqa: E402
 from plexus.ratelimiter import (  # noqa: E402
     RateLimiter, endpoint_key, event_key,
@@ -56,7 +57,7 @@ from plexus.ratelimiter import (  # noqa: E402
 
 from _test_helpers import CaseRecorder  # noqa: E402
 
-SUITE_VERSION = "0.2.0"
+SUITE_VERSION = "0.3.0"
 SUITE = "TestRateLimitSuite"
 TARGET = "TestRateLimitTarget"
 
@@ -77,6 +78,13 @@ class TestRateLimitSuite(Plugin):
     @async_log_errors
     async def ep_a(self, value: Any = None) -> str:
         return "ep_a"
+
+    @async_gen_log_errors
+    async def ep_stream(self, value: Any = None):
+        """Streaming probe (async generator) for the IN stream_weight case. Its
+        manifest declares stream_weight=2, so one open costs 2 IN tokens."""
+        yield "s1"
+        yield "s2"
 
     @async_log_errors
     async def _rl_drive(self, target: str = None, method: str = None) -> Dict[str, Any]:
@@ -148,6 +156,13 @@ class TestRateLimitSuite(Plugin):
             await self._case_out_event_out(rec, kw)
             await self._case_out_lifecycle_exempt(rec, kw)
             await self._case_out_asserted_attribution(rec, kw)
+            # Step 3d -- IN admit.
+            await self._case_in_endpoint_in(rec, kw)
+            await self._case_in_plugin_in(rec, kw)
+            await self._case_in_self_plugin_in(rec, kw)
+            await self._case_in_sub_in_selection(rec, kw)
+            await self._case_in_stream_weight(rec, kw)
+            await self._case_in_publish_skip(rec, kw)
         finally:
             for su in runtime_subs:
                 try:
@@ -463,3 +478,201 @@ class TestRateLimitSuite(Plugin):
             if px._rl_charged_name(None, fallback_name="Pub") != "Pub":
                 raise AssertionError("_rl_charged_name must use fallback_name when no assertion")
         await rec.run_case("ratelimit.out_asserted_attribution", body, **kw)
+
+    async def _case_in_endpoint_in(self, rec, kw):
+        async def body(c):
+            px = self._plexus
+            # endpoint_in(TARGET:sink) only. A direct execute(TARGET, sink) charges
+            # the IN-set at _call_endpoint (endpoint_in + plugin_in; plugin_in
+            # unconfigured -> skipped). The IN reject is raised at _call_endpoint
+            # and caught by _process_request, which stringifies it into the
+            # request error -> the caller sees a plain RequestException, NOT
+            # RateLimitException (the documented IN-local degrade).
+            self._apply({
+                (DIM_ENDPOINT_IN, endpoint_key(TARGET, "sink")): {"max": 3, "window": 1000},
+            })
+            await px._rebuild_charge_sets()
+            oks = 0
+            outcome = None
+            for _ in range(4):
+                try:
+                    await self.execute(TARGET, "sink")
+                    oks += 1
+                except RateLimitException:
+                    outcome = "ratelimit"  # must NOT happen on the IN-local path
+                    break
+                except RequestException as e:
+                    outcome = "req" if "endpoint_in" in str(e) else f"req?{e}"
+                    break
+            if oks != 3 or outcome != "req":
+                raise AssertionError(
+                    f"endpoint_in must admit 3 then reject the 4th as a plain "
+                    f"RequestException naming endpoint_in; oks={oks} outcome={outcome!r}"
+                )
+        await rec.run_case("ratelimit.in_endpoint_in", body, **kw)
+
+    async def _case_in_plugin_in(self, rec, kw):
+        async def body(c):
+            px = self._plexus
+            # plugin_in(TARGET) only; endpoint_in skipped -> plugin_in is the sole
+            # binding IN dimension.
+            self._apply({(DIM_PLUGIN_IN, TARGET): {"max": 3, "window": 1000}})
+            await px._rebuild_charge_sets()
+            oks = 0
+            named = False
+            for _ in range(4):
+                try:
+                    await self.execute(TARGET, "sink")
+                    oks += 1
+                except RequestException as e:
+                    named = "plugin_in" in str(e)
+                    break
+            if oks != 3 or not named:
+                raise AssertionError(
+                    f"plugin_in must admit 3 then reject naming plugin_in; "
+                    f"oks={oks} named={named}"
+                )
+        await rec.run_case("ratelimit.in_plugin_in", body, **kw)
+
+    async def _case_in_self_plugin_in(self, rec, kw):
+        async def body(c):
+            px = self._plexus
+            # Section 4 self-call: a plugin executing its OWN endpoint charges
+            # plugin_out(P) at OUT (proven in 3c) AND plugin_in(P) at IN. Here a
+            # direct execute(SUITE, ep_a) targets the suite itself; with only
+            # plugin_in(SUITE) configured, the IN admit binds on it.
+            self._apply({(DIM_PLUGIN_IN, SUITE): {"max": 3, "window": 1000}})
+            await px._rebuild_charge_sets()
+            oks = 0
+            named = False
+            for _ in range(4):
+                try:
+                    await self.execute(SUITE, "ep_a")
+                    oks += 1
+                except RequestException as e:
+                    named = "plugin_in" in str(e)
+                    break
+            if oks != 3 or not named:
+                raise AssertionError(
+                    f"self-call must charge plugin_in(SUITE) at IN and reject the "
+                    f"4th; oks={oks} named={named}"
+                )
+        await rec.run_case("ratelimit.in_self_plugin_in", body, **kw)
+
+    async def _case_in_sub_in_selection(self, rec, kw):
+        async def body(c):
+            px = self._plexus
+            # _rl_admit_in must select the SUB IN-set (_rl_sub_in[sub_uuid]) when a
+            # sub_uuid is given, and the ENDPOINT IN-set otherwise. Drive the helper
+            # directly (driving a real sub fan-out end-to-end needs a publisher
+            # event whose topic matches the sub; the publish-1:N skip itself rides
+            # the existing fire-and-forget swallow). Build a sub via the declared
+            # xsub + a tight sub_in, then assert the charge-set selection + that a
+            # dry sub_in binds, while an exempt frame skips.
+            self._apply(
+                {
+                    (DIM_ENDPOINT_IN, endpoint_key(TARGET, "sink")): {"max": 50, "window": 1000},
+                    (DIM_PLUGIN_IN, TARGET): {"max": 50, "window": 1000},
+                },
+                {(SUITE, "xsub"): {"max": 1, "window": 1000}},
+            )
+            await px._rebuild_charge_sets()
+            uuid = await self._xsub_uuid()
+            sub_b = px._rate_limiter.get(DIM_SUB_IN, uuid)
+            if sub_b is None:
+                raise AssertionError("sub_in bucket not configured for xsub")
+            # sub_uuid path -> sub IN-set; drain the tight sub_in and expect a dry
+            # bucket that IS the sub_in bucket.
+            d1 = px._rl_admit_in(TARGET, "sink", uuid, 1.0, None)   # admits (1->0)
+            d2 = px._rl_admit_in(TARGET, "sink", uuid, 1.0, None)   # sub_in dry
+            if d1 is not None or d2 is not sub_b:
+                raise AssertionError(
+                    f"sub_uuid must select the sub IN-set and bind on sub_in; "
+                    f"d1={d1!r} d2={d2!r}"
+                )
+            # sub_uuid=None -> endpoint IN-set (endpoint_in+plugin_in, both large)
+            # -> admits.
+            if px._rl_admit_in(TARGET, "sink", None, 1.0, None) is not None:
+                raise AssertionError("endpoint IN-set (no sub_uuid) should admit")
+            # exempt frame -> skip regardless of dry sub_in.
+            from plexus.runtime import CallerIdentity, caller_chain_scope
+            with caller_chain_scope(CallerIdentity(SUITE, self.plugin_uuid, exempt=True), True):
+                if px._rl_admit_in(TARGET, "sink", uuid, 1.0, None) is not None:
+                    raise AssertionError("an exempt frame must skip the IN admit")
+        await rec.run_case("ratelimit.in_sub_in_selection", body, **kw)
+
+    async def _case_in_stream_weight(self, rec, kw):
+        async def body(c):
+            px = self._plexus
+            # ep_stream declares stream_weight=2. With endpoint_in(SUITE:ep_stream)
+            # max=2, one stream open costs 2 (drains to 0) and the next open is
+            # IN-rejected at _process_request_stream -> the gen-request resolves
+            # with an error -> consuming raises a RequestException naming
+            # endpoint_in. Proves the stream IN site + cost=stream_weight.
+            self._apply({
+                (DIM_ENDPOINT_IN, endpoint_key(SUITE, "ep_stream")): {"max": 2, "window": 1000},
+            })
+            await px._rebuild_charge_sets()
+            # first open admits (cost 2 -> 0) and yields.
+            chunks = []
+            async for x in self.execute_stream(SUITE, "ep_stream"):
+                chunks.append(x)
+            if chunks != ["s1", "s2"]:
+                raise AssertionError(f"first stream open should yield fully; got {chunks}")
+            # second open: cost 2, bucket 0 -> reject before the first chunk.
+            named = False
+            try:
+                async for _ in self.execute_stream(SUITE, "ep_stream"):
+                    pass
+            except RequestException as e:
+                named = "endpoint_in" in str(e)
+            if not named:
+                raise AssertionError(
+                    "second stream open must reject (cost=stream_weight=2 vs 0 "
+                    "tokens) naming endpoint_in"
+                )
+        await rec.run_case("ratelimit.in_stream_weight", body, **kw)
+
+    async def _case_in_publish_skip(self, rec, kw):
+        async def body(c):
+            px = self._plexus
+            # End-to-end 1:N fan-out skip: publishing ev_sub (topic matches the
+            # declared xsub sub) fans out to TestRateLimitTarget.sink. With a tight
+            # sub_in(SUITE,xsub) the FIRST delivery lands and the SECOND is
+            # IN-rejected at _call_endpoint -> the per-sub fire-and-forget Request
+            # errors and is SWALLOWED (publish still returns its scheduled count;
+            # the handler is NOT invoked for the throttled delivery). This also
+            # pins the origin_sub_uuid wiring: the fan-out must stamp sub.sub_uuid
+            # for the sub IN-set lookup to bind.
+            target = px.plugins.get(TARGET)
+            target._sink_calls = 0
+            # sub_in(xsub) only -> the sub IN-set is [sub_in] (endpoint_in /
+            # plugin_in unconfigured -> skipped). max=1: one delivery, then dry.
+            self._apply({}, {(SUITE, "xsub"): {"max": 1, "window": 1000}})
+            await px._rebuild_charge_sets()
+
+            async def _wait_until(pred, ticks):
+                for _ in range(ticks):
+                    if pred():
+                        return True
+                    await asyncio.sleep(0.005)
+                return pred()
+
+            n1 = await self.publish_event("ev_sub", {"n": 1})
+            # Let the first fan-out delivery land (sink_calls -> 1).
+            await _wait_until(lambda: target._sink_calls >= 1, 200)
+            n2 = await self.publish_event("ev_sub", {"n": 2})
+            # Give the second delivery a chance to (NOT) land; it must stay at 1.
+            await _wait_until(lambda: target._sink_calls >= 2, 60)
+
+            if target._sink_calls != 1:
+                raise AssertionError(
+                    f"the IN-throttled second sub delivery must be skipped "
+                    f"(handler not invoked); sink_calls={target._sink_calls}"
+                )
+            if n1 != 1 or n2 != 1:
+                raise AssertionError(
+                    f"publish must return its SCHEDULED count (1 matched sub) "
+                    f"regardless of the per-sub IN reject; n1={n1} n2={n2}"
+                )
+        await rec.run_case("ratelimit.in_publish_skip", body, **kw)

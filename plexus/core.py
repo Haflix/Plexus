@@ -113,6 +113,7 @@ from .ratelimiter import (
     charge_set,
     endpoint_key,
     event_key,
+    validate_stream_weight,
     FRAMEWORK_IN_KEY,
     DIM_FRAMEWORK_IN,
     DIM_PLUGIN_IN,
@@ -5715,9 +5716,26 @@ class Plexus(EventMixin):
                 (sub.plugin_name, sub.declared_id)
             )
             if scfg is not None:
-                self._rate_limiter.configure(
+                sub_b = self._rate_limiter.configure(
                     DIM_SUB_IN, sub.sub_uuid, scfg["max"], scfg["window"]
                 )
+                # 3d fold-in: if the sub's TARGET endpoint is a stream, register
+                # its weight against the Sub-IN bucket too. A streaming
+                # sub-dispatch charges the sub IN-set at cost=stream_weight, so
+                # sub_in must carry max_stream_weight for the reconfigure
+                # revalidation (Section 7) to catch sub_in.max < weight LOUD at
+                # build instead of as a silent permanent reject at open.
+                tgt = self.plugins.get(sub.target_plugin)
+                tep = (
+                    (getattr(tgt, "endpoints", None) or {}).get(
+                        sub.target_access_name
+                    )
+                    if tgt is not None
+                    else None
+                )
+                tw = tep.get("stream_weight") if isinstance(tep, dict) else None
+                if tw is not None:
+                    sub_b.register_stream_weight(tw)
         self._rl_sub_in[sub.sub_uuid] = charge_set(
             self._rate_limiter,
             [
@@ -5780,6 +5798,11 @@ class Plexus(EventMixin):
                 # at open. Absent weight -> non-stream -> no registration.
                 weight = ep.get("stream_weight") if isinstance(ep, dict) else None
                 if weight is not None:
+                    # Validate numeric UNCONDITIONALLY (even when cs is empty so
+                    # no bucket gets register_stream_weight): a malformed weight
+                    # must fail at build, not as a ValueError in the stream
+                    # producer at dispatch (Step 3d fold-in).
+                    validate_stream_weight(weight, f"endpoint {ek}")
                     for b in cs:
                         b.register_stream_weight(weight)
             for event_id in (getattr(plugin, "events", None) or {}):
@@ -5865,22 +5888,56 @@ class Plexus(EventMixin):
             buckets.append(self._rl_framework_in)
         return self._rate_limiter.admit(buckets, 1.0, now)
 
-    def _rl_reject(self, dry):
-        """Raise ``RateLimitException`` for a dry bucket returned by
-        ``_rl_admit_out``. Reverse-maps the bucket to its dimension/key (Bucket
-        carries no identity) and folds dimension/key + remaining tokens into the
-        message, so the throttle reason round-trips through the request/future
-        boundary as a string. Per Section 13 this does NOT log -- the
-        first-per-window WARNING suppression is Step 5."""
-        # locate() can only miss if the bucket was unregistered between the
-        # admit and this raise; that cannot happen loop-side (no await between),
-        # but fall back to a clear label rather than a bare object repr.
+    def _rl_admit_in(self, plugin_name, access, sub_uuid, cost=1.0, now=None):
+        """IN-side (delivery) admit for one dispatch. Returns the first DRY
+        bucket (caller raises / resolves the request) or None when admitted.
+
+        Charge-set is looked up FRESH from the side-tables (live bucket refs, so a
+        hot-swap that rebuilt buckets between fan-out and delivery cannot leave a
+        stale reference): the sub IN-set [sub_in, endpoint_in, plugin_in] when this
+        is a sub-dispatch (``sub_uuid`` set at the fan-out site), else the endpoint
+        IN-set [endpoint_in, plugin_in]. ``cost`` is 1.0 for a normal call and the
+        endpoint's stream_weight for a stream open (Section 7, IN-only). ``now`` is
+        a FRESH ``time.monotonic()`` captured at the IN site (never the OUT
+        ``now``). No-op when rate limiting is off, when any frame in the live chain
+        is exempt (lifecycle origin), or when nothing is configured for this
+        target (empty / missing charge-set)."""
+        if not self._rate_limits_active:
+            return None
+        if any(f.exempt for f in current_caller_chain()):
+            return None
+        if sub_uuid is not None:
+            cs = self._rl_sub_in.get(sub_uuid)
+        else:
+            cs = self._rl_endpoint_in.get((plugin_name, access))
+        if not cs:
+            return None
+        return self._rate_limiter.admit(cs, cost, now)
+
+    def _rl_reject_message(self, dry, cost=1.0):
+        """Build the RateLimitException message for a dry bucket returned by an
+        admit. Reverse-maps the bucket to its dimension/key (Bucket carries no
+        identity) and folds dimension/key + remaining tokens + the binding cost
+        into the message, so the throttle reason round-trips through the
+        request/future boundary as a string. Shared by ``_rl_reject`` (which
+        raises) and the stream producers (which resolve the gen-request with this
+        string). ``cost`` is 1.0 for the OUT/non-stream IN path and the
+        stream_weight for a stream open, so a weight-rejected stream is legible."""
+        # locate() can only miss if the bucket was unregistered between the admit
+        # and here; that cannot happen loop-side (no await between), but fall back
+        # to a clear label rather than a bare object repr.
         loc = self._rate_limiter.locate(dry)
         where = f"{loc[0]}:{loc[1]}" if loc is not None else "(unregistered bucket)"
-        raise RateLimitException(
+        return (
             f"rate limit exceeded on {where} "
-            f"({dry.tokens:.3f}/{dry.max:.0f} tokens available, need 1.0)"
+            f"({dry.tokens:.3f}/{dry.max:.0f} tokens available, need {cost})"
         )
+
+    def _rl_reject(self, dry, cost=1.0):
+        """Raise ``RateLimitException`` for a dry bucket. OUT callers keep calling
+        ``self._rl_reject(dry)`` (cost defaults to 1.0). Per Section 13 this does
+        NOT log -- the first-per-window WARNING suppression is Step 5."""
+        raise RateLimitException(self._rl_reject_message(dry, cost))
 
     def _gate_author(self, author, author_id):
         """Capability gate. Returns ``(effective_author,
@@ -5966,6 +6023,26 @@ class Plexus(EventMixin):
             if _id_active else None
         )
         _sync_seed = seeded_sync_chain(_id_active, ident)
+
+        # Step 3d: IN (delivery) admit, the single choke point for non-stream
+        # dispatch (execute + event handlers; streams have their own producers).
+        # Charged BEFORE entering the target so a dry IN-set rejects without
+        # invoking the handler. cost 1.0; sub-dispatch uses the sub IN-set
+        # (request.origin_sub_uuid), else the endpoint IN-set. Uses the in-scope
+        # _tname (the resolved target) and a FRESH now. Raising here is caught by
+        # _process_request's except -> _set_request_result(error): the 1:1 caller
+        # sees it (degraded to RequestException across the boundary), a publish
+        # 1:N per-sub reject is swallowed (the sub is skipped, publish continues).
+        if request is not None and _tname is not None:
+            dry = self._rl_admit_in(
+                _tname,
+                request.target_method,
+                request.origin_sub_uuid,
+                1.0,
+                time.monotonic(),
+            )
+            if dry is not None:
+                self._rl_reject(dry)
 
         # PR3 Stage A: kind-aware Event branch. Only fires for event
         # kinds; the execute path (kind="execute" or no request) falls
@@ -6194,7 +6271,46 @@ class Plexus(EventMixin):
                     )
                     return
 
-                elif inspect.isasyncgenfunction(func):
+                # Step 3d: IN (delivery) admit for the stream OPEN, charged ONCE
+                # at cost = stream_weight (Section 7, IN-only) before the first
+                # pull. Gated on func actually being a generator so the
+                # coroutine-error path above and any sync non-generator callable
+                # never charge. Reject by resolving the gen-request with an error
+                # (mirrors the sibling guards); the consumer sees a clean
+                # RequestException. The OUT admit already charged 1 at open
+                # (attempt-vs-delivery): a dry IN-set still spent the OUT token.
+                if inspect.isasyncgenfunction(func) or inspect.isgeneratorfunction(
+                    func
+                ):
+                    _w = endpoint.get("stream_weight") if isinstance(endpoint, dict) else None
+                    # Defensive belt: validate_stream_weight already fails LOUD at
+                    # build, but guard the float() so a value that slipped through
+                    # (post-build mutation / pre-rebuild race) names the endpoint
+                    # instead of an opaque TypeError deep in the producer.
+                    try:
+                        _cost = float(_w) if _w is not None else 1.0
+                    except (TypeError, ValueError):
+                        await self._set_gen_request_result(
+                            request,
+                            f"stream_weight for {plugin.plugin_name}.{function_name} "
+                            f"is not numeric: {_w!r}",
+                            True,
+                        )
+                        return
+                    _dry = self._rl_admit_in(
+                        plugin.plugin_name,
+                        function_name,
+                        request.origin_sub_uuid,
+                        _cost,
+                        time.monotonic(),
+                    )
+                    if _dry is not None:
+                        await self._set_gen_request_result(
+                            request, self._rl_reject_message(_dry, _cost), True
+                        )
+                        return
+
+                if inspect.isasyncgenfunction(func):
                     with caller_chain_scope(_stream_ident, _stream_active):
                         if isinstance(request.args, tuple):
                             async for result in func(*request.args):
@@ -6384,6 +6500,39 @@ class Plexus(EventMixin):
                     request,
                     "request_event_stream: handler is not a generator function",
                     True,
+                )
+                return
+
+            # Step 3d: IN (delivery) admit for the streaming SUB-dispatch open,
+            # charged ONCE at cost = stream_weight before the first pull (and
+            # before the phase="first_chunk" emit, preserving the Event-first
+            # invariant: a throttled stream rejects before any chunk). func is
+            # confirmed a generator above. Sub-dispatch -> request.origin_sub_uuid
+            # selects the sub IN-set. Reject by resolving the gen-request with an
+            # error (the consumer sees a clean RequestException).
+            _w = endpoint.get("stream_weight") if isinstance(endpoint, dict) else None
+            # Defensive belt (see _process_request_stream): name the endpoint
+            # rather than crash the producer with an opaque TypeError.
+            try:
+                _cost = float(_w) if _w is not None else 1.0
+            except (TypeError, ValueError):
+                await self._set_gen_request_result(
+                    request,
+                    f"stream_weight for {target_plugin.plugin_name}."
+                    f"{request.target_method} is not numeric: {_w!r}",
+                    True,
+                )
+                return
+            _dry = self._rl_admit_in(
+                target_plugin.plugin_name,
+                request.target_method,
+                request.origin_sub_uuid,
+                _cost,
+                time.monotonic(),
+            )
+            if _dry is not None:
+                await self._set_gen_request_result(
+                    request, self._rl_reject_message(_dry, _cost), True
                 )
                 return
 

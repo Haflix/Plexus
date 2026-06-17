@@ -16,7 +16,9 @@ from plexus.decorators import async_log_errors, log_errors  # noqa: E402
 class TestRateLimitTarget(Plugin):
     @log_errors
     def on_load(self, *args, **kwargs):
-        pass
+        # Step 3d: invocation counter so the suite's in_publish_skip case can
+        # prove an IN-throttled fan-out delivery does NOT reach the handler.
+        self._sink_calls = 0
 
     @async_log_errors
     async def on_enable(self):
@@ -28,4 +30,5 @@ class TestRateLimitTarget(Plugin):
 
     @async_log_errors
     async def sink(self, value: Any = None) -> str:
+        self._sink_calls += 1
         return "sink"

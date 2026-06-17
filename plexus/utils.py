@@ -2265,6 +2265,12 @@ class Request:
         origin_subscription_id: Optional[str] = None,
         timestamp: Optional[float] = None,
         requester_id: Optional[str] = None,
+        # Rate-limiter Step 3d: the UNAMBIGUOUS sub_uuid this Request was fanned
+        # out for (None on the execute path). Distinct from
+        # origin_subscription_id, which is declared_id-or-sub_uuid and so cannot
+        # key the sub-IN charge-set (_rl_sub_in is keyed by sub_uuid). Set at the
+        # fan-out sites; read at the IN-admit site to pick the sub charge-set.
+        origin_sub_uuid: Optional[str] = None,
     ) -> None:
         self.author_host = author_host
         self.author = author
@@ -2292,6 +2298,7 @@ class Request:
         self.kind = kind
         self.topic = topic
         self.origin_subscription_id = origin_subscription_id
+        self.origin_sub_uuid = origin_sub_uuid
         self.timestamp = timestamp if timestamp is not None else time.time()
         self.requester_id = requester_id
 
@@ -2436,6 +2443,10 @@ class GeneratorRequest:
         origin_subscription_id: Optional[str] = None,
         timestamp: Optional[float] = None,
         requester_id: Optional[str] = None,
+        # Rate-limiter Step 3d: see Request.__init__ for semantics. The streaming
+        # sub-dispatch producer (_process_request_event_stream) reads this to pick
+        # the sub-IN charge-set.
+        origin_sub_uuid: Optional[str] = None,
     ) -> None:
         self.author_host = author_host
         self.author = author
@@ -2458,6 +2469,7 @@ class GeneratorRequest:
         self.kind = kind
         self.topic = topic
         self.origin_subscription_id = origin_subscription_id
+        self.origin_sub_uuid = origin_sub_uuid
         self.timestamp = timestamp if timestamp is not None else time.time()
         self.requester_id = requester_id
 

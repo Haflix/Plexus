@@ -1,10 +1,15 @@
-description: Rate-limit charge-set precompute + OUT-admit integration suite (Steps 3b/3c)
-version: "0.2.0"
+description: Rate-limit charge-set precompute + OUT/IN-admit integration suite (Steps 3b/3c/3d)
+version: "0.3.0"
 remote: false
 arguments:
 events:
   ev_x:
     topic: "ratelimit/ev_x"
+    hosts: "local"
+  ev_sub:
+    # Topic matches the xsub subscription below so publishing ev_sub fans out to
+    # xsub -> TestRateLimitTarget.sink (drives the in_publish_skip IN case).
+    topic: "ratelimit/xsub/topic"
     hosts: "local"
 subscriptions:
   xsub:
@@ -40,3 +45,11 @@ endpoints:
     arguments:
       - name: target
       - name: method
+  ep_stream:
+    internal_name: ep_stream
+    remote: false
+    accessible_by_other_plugins: true
+    stream_weight: 2
+    description: Streaming probe endpoint for the IN stream_weight case (cost-2 open)
+    arguments:
+      - name: value

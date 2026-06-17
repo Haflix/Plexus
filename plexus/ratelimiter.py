@@ -52,6 +52,34 @@ def event_key(plugin: str, event_id: str) -> str:
     return f"{plugin}{_KEY_SEP}{event_id}"
 
 
+def validate_stream_weight(weight, where: str = "stream_weight") -> float:
+    """Numeric validation for a stream weight; returns the float on success.
+
+    Rejects bool / non-numeric / non-finite / <= 0 (same discipline as
+    ``_validate``: ``float(True)`` and ``nan`` must not slip through). Shared by
+    ``Bucket.register_stream_weight`` AND the charge-set rebuild, so a declared
+    ``stream_weight`` is validated even when the endpoint has NO configured
+    bucket -- otherwise a malformed weight would surface as a ``ValueError`` in
+    the stream producer at dispatch instead of a clear ``ConfigException`` at
+    build (Step 3d).
+    """
+    if isinstance(weight, bool):
+        raise ConfigException(
+            f"rate limit {where}: stream_weight={weight!r} is a bool, not a number"
+        )
+    try:
+        w = float(weight)
+    except (TypeError, ValueError):
+        raise ConfigException(
+            f"rate limit {where}: stream_weight={weight!r} is not numeric"
+        )
+    if not math.isfinite(w) or w <= 0:
+        raise ConfigException(
+            f"rate limit {where}: stream_weight must be a finite number > 0 (got {w})"
+        )
+    return w
+
+
 def _validate(max_tokens, window, where: str) -> None:
     """Reject non-numeric / non-positive ``max`` or ``window`` BEFORE a Bucket
     exists. "No limit on a dimension" is expressed by OMITTING it, never by
@@ -131,23 +159,9 @@ class Bucket:
         """Record a stream endpoint's cost against this bucket. Rejects a weight
         the bucket's ``max`` can never admit (a permanent silent block,
         diagnosed at registration instead of at call time)."""
-        # Same numeric discipline as _validate (bool/non-finite rejected), so a
-        # malformed weight fails loud here instead of silently leaving
-        # max_stream_weight unchanged (nan slips a bare <=0 / >max check).
-        if isinstance(weight, bool):
-            raise ConfigException(
-                f"rate limit: stream_weight={weight!r} is a bool, not a number"
-            )
-        try:
-            w = float(weight)
-        except (TypeError, ValueError):
-            raise ConfigException(
-                f"rate limit: stream_weight={weight!r} is not numeric"
-            )
-        if not math.isfinite(w) or w <= 0:
-            raise ConfigException(
-                f"rate limit: stream_weight must be a finite number > 0 (got {w})"
-            )
+        # Numeric discipline shared with the charge-set rebuild (so a weight is
+        # validated even when no bucket is configured for the endpoint).
+        w = validate_stream_weight(weight)
         if w > self.max:
             raise ConfigException(
                 f"rate limit: stream_weight {w} > bucket max {self.max}; this "

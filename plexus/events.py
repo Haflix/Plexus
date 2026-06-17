@@ -1215,6 +1215,12 @@ class EventMixin:
             origin_subscription_id=(
                 sub.declared_id if sub.declared_id is not None else sub.sub_uuid
             ),
+            # Rate-limiter Step 3d: the UNAMBIGUOUS sub_uuid (always the uuid, not
+            # declared_id) so the IN admit at _call_endpoint can key the sub IN-set
+            # _rl_sub_in[sub_uuid]. Covers publish_event + request_event + the
+            # remote _handle_publish_event / _handle_request_event paths (all route
+            # through _fanout_sub).
+            origin_sub_uuid=sub.sub_uuid,
             timestamp=timestamp,
             requester_id=sub.plugin_uuid,  # C18
         )
@@ -2021,6 +2027,10 @@ class EventMixin:
             kind="request_event_stream",
             topic=resolved_topic,
             origin_subscription_id=event_meta.subscription_id,
+            # Rate-limiter Step 3d: the UNAMBIGUOUS sub_uuid (NOT
+            # event_meta.subscription_id, which is declared_id-or-sub_uuid) so
+            # _process_request_event_stream keys the sub IN-set correctly.
+            origin_sub_uuid=local_match.sub_uuid,
             timestamp=now_ts,
             requester_id=local_match.plugin_uuid,
         )
