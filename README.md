@@ -257,6 +257,8 @@ more endpoints, more events, more subscriptions.
 | [docs/notifier.md](docs/notifier.md) | event-system users | publish vs request, topic templating, filter chain, runtime subs |
 | [docs/networking.md](docs/networking.md) | multi-node operators | mTLS, peers, cert pinning, remote semantics, wire protocol |
 | [docs/configuration.md](docs/configuration.md) | operators | full `config.yml` reference and per-plugin overrides |
+| [docs/rate_limiting.md](docs/rate_limiting.md) | operators | the token-bucket rate limiter: dimensions, `rate_limits:` config, observability |
+| [docs/capabilities.md](docs/capabilities.md) | operators | caller identity + the `capabilities:` impersonation / system-caller grant model |
 
 ---
 

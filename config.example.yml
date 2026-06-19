@@ -66,8 +66,7 @@ networking:
     auto_discoverable: true
     # peers:
     #   - hostname: other-node
-    #     ip: 10.0.0.5
-    #     port: 9876
+    #     address: 10.0.0.5:9876
     #     cert_pem: |
     #       -----BEGIN CERTIFICATE-----
     #       ...
