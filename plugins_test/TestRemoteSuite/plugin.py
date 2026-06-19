@@ -121,6 +121,29 @@ class TestRemoteSuite(Plugin):
         )
         return False
 
+    # ── Step 6: rate-limit control over the wire (topology A) ───────────
+    async def _subnode_rl_configure(self, rate_limits) -> dict:
+        """Apply (dict) or CLEAR (None) a rate_limits config on the subnode via
+        its r_rl_configure control endpoint. The endpoint runs the real Step-4
+        parser + rebuild on the subnode; the configuring call itself is admitted
+        against the still-empty sideband, so it is never self-throttled."""
+        return await self.execute(
+            "TestRemoteTarget", "r_rl_configure",
+            {"rate_limits": rate_limits}, hosts="remote", timeout=10.0,
+        )
+
+    async def _subnode_rl_reset(self) -> None:
+        """Clear the subnode's rate-limit config (topology-A teardown). The clear
+        call is itself an inbound execute charged against the (now dry) bucket, so
+        REFILL-WAIT first: all topology-A cases use window=2.0, and ~2.2s refills
+        any drained Nodes-IN / Framework-IN bucket fully so the clear is admitted.
+        Best-effort + idempotent (the subnode dies at suite end regardless)."""
+        await asyncio.sleep(2.2)
+        try:
+            await self._subnode_rl_configure(None)
+        except Exception as e:
+            self._logger.warning("TestRemoteSuite: subnode rl reset failed: %s", e)
+
     async def _spawn_subnode(self) -> None:
         """Spawn the peer subprocess and wait for the ready-file."""
         try:
@@ -1025,9 +1048,172 @@ class TestRemoteSuite(Plugin):
                         f"{uuid}: {prev} -> {now}"
                     )
 
+        # ── Step 6: rate-limit two-node throttle (topology A) ───────────
+        # The subnode is the RECEIVER; the parent fires N+1 remote ops and the
+        # (N+1)th is rejected by the subnode's limiter, surfacing to the parent's
+        # own call as a RateLimitException-derived RequestException. Per-case the
+        # subnode limit is injected via r_rl_configure (no static config that
+        # would throttle the other ~30 remote cases) and cleared (refill-wait) in
+        # finally. window=2.0 (>> the sub-second probe) so no mid-probe refill.
+        from plexus.exceptions import RequestException as _ReqExc
+
+        async def body_rl_nodes_in_throttle(c):
+            if not self._remote_available:
+                c.skip(UNAVAILABLE_REASON)
+            # nodes_in(default=3): probes 1-3 admit, the 4th is rejected on the
+            # subnode's Nodes-IN(parent) bucket; the throttle round-trips the wire.
+            await self._subnode_rl_configure(
+                {"nodes_in": {"default": {"max": 3, "window": 2}}}
+            )
+            try:
+                oks, throttled = 0, False
+                for _ in range(4):
+                    try:
+                        await self.execute(
+                            "TestRemoteTarget", "r_open", {"value": "x"},
+                            hosts="remote", timeout=10.0,
+                        )
+                        oks += 1
+                    except _ReqExc as e:
+                        if "rate limit" in str(e).lower():
+                            throttled = True
+                            break
+                        raise
+                if oks != 3 or not throttled:
+                    raise AssertionError(
+                        f"nodes_in(default=3): expected 3 admits then a rate-limit "
+                        f"reject over the wire; oks={oks} throttled={throttled}"
+                    )
+            finally:
+                await self._subnode_rl_reset()
+
+        async def body_rl_execute_framework_in_once(c):
+            if not self._remote_available:
+                c.skip(UNAVAILABLE_REASON)
+            # framework_in(max=3), NO nodes_in. A remote execute charges
+            # Framework-IN exactly ONCE via the subnode's re-entry (the execute
+            # handler passes include_framework=False). max=3 is LOAD-BEARING: with
+            # 4 probes, single-charge rejects on call 4; a double-charge (2
+            # tokens/call) would reject on call 2. Distinguishable only at max=3.
+            await self._subnode_rl_configure(
+                {"framework_in": {"max": 3, "window": 2}}
+            )
+            try:
+                oks, throttled = 0, False
+                for _ in range(4):
+                    try:
+                        await self.execute(
+                            "TestRemoteTarget", "r_open", {"value": "x"},
+                            hosts="remote", timeout=10.0,
+                        )
+                        oks += 1
+                    except _ReqExc as e:
+                        if "rate limit" in str(e).lower():
+                            throttled = True
+                            break
+                        raise
+                if oks != 3 or not throttled:
+                    raise AssertionError(
+                        f"framework_in(max=3) must admit exactly 3 remote executes "
+                        f"then reject the 4th (proves Framework-IN charged ONCE per "
+                        f"remote execute via re-entry); oks={oks} throttled={throttled}"
+                    )
+            finally:
+                await self._subnode_rl_reset()
+
+        def _fw_charged(stats):
+            from plexus.ratelimiter import DIM_FRAMEWORK_IN, FRAMEWORK_IN_KEY
+            for r in (stats or []):
+                if r.get("dim") == DIM_FRAMEWORK_IN and r.get("key") == FRAMEWORK_IN_KEY:
+                    return r.get("charged", 0)
+            return 0
+
+        async def body_rl_event_framework_in(c):
+            if not self._remote_available:
+                c.skip(UNAVAILABLE_REASON)
+            # Remote-event Framework-IN carve-out (Step 3e) proven by COUNTING the
+            # subnode's Framework-IN charges, NOT by throttle timing: a remote
+            # request_event must charge Framework-IN EXACTLY ONCE. publish_event's
+            # reject is silent post-Step-5 and its readback would compete for the
+            # same bucket, so request_event is the observable path. A generous
+            # framework_in (no throttle) sidesteps the teardown-throttle trap; the
+            # r_rl_stats readback execute itself charges Framework-IN once (proven
+            # deterministic by the execute_framework_in_once case), so the final
+            # read's own +1 is subtracted.
+            await self._subnode_rl_configure(
+                {"framework_in": {"max": 100000, "window": 1000}}
+            )
+            try:
+                s0 = await self.execute(
+                    "TestRemoteTarget", "r_rl_stats", {}, hosts="remote", timeout=10.0,
+                )
+                fw0 = _fw_charged(s0)
+                for _ in range(3):
+                    await self.request_event(
+                        "r_request_basic", payload={"v": "x"},
+                        hosts="remote", timeout=10.0,
+                    )
+                s1 = await self.execute(
+                    "TestRemoteTarget", "r_rl_stats", {}, hosts="remote", timeout=10.0,
+                )
+                fw1 = _fw_charged(s1)
+                # delta = 3 request_events + 1 (the s1 read execute's own charge).
+                event_charges = (fw1 - fw0) - 1
+                if event_charges != 3:
+                    raise AssertionError(
+                        f"3 remote request_events must charge Framework-IN exactly "
+                        f"3 times (once each -- the carve-out); got {event_charges} "
+                        f"(fw0={fw0} fw1={fw1})"
+                    )
+            finally:
+                await self._subnode_rl_reset()
+
+        async def body_rl_execute_stream_nodes_in(c):
+            if not self._remote_available:
+                c.skip(UNAVAILABLE_REASON)
+            # _handle_execute_stream charges Nodes-IN with its OWN admit + a
+            # reject-BEFORE-first-chunk path (no e2e coverage before Step 6).
+            # nodes_in(default=3): 3 stream opens admit + yield; the 4th open is
+            # rejected before any chunk -> the async-for raises.
+            await self._subnode_rl_configure(
+                {"nodes_in": {"default": {"max": 3, "window": 2}}}
+            )
+            try:
+                opens, throttled = 0, False
+                for _ in range(4):
+                    try:
+                        chunks = []
+                        async for x in self.execute_stream(
+                            "TestRemoteTarget", "r_async_gen", {"n": 2},
+                            hosts="remote",
+                        ):
+                            chunks.append(x)
+                        opens += 1
+                    except _ReqExc as e:
+                        if "rate limit" in str(e).lower():
+                            throttled = True
+                            break
+                        raise
+                if opens != 3 or not throttled:
+                    raise AssertionError(
+                        f"nodes_in(default=3): expected 3 remote stream opens then "
+                        f"a reject-before-first-chunk on the 4th; opens={opens} "
+                        f"throttled={throttled}"
+                    )
+            finally:
+                await self._subnode_rl_reset()
+
         # Run all cases in order (each declares hosts=("remote",); recorder
         # auto-skips when remote_available=False).
         cases = [
+            ("remote.ratelimit.nodes_in_throttle", body_rl_nodes_in_throttle,
+             ("ratelimit", "slow"), ()),
+            ("remote.ratelimit.execute_framework_in_once",
+             body_rl_execute_framework_in_once, ("ratelimit", "slow"), ()),
+            ("remote.ratelimit.event_framework_in", body_rl_event_framework_in,
+             ("ratelimit", "slow"), ()),
+            ("remote.ratelimit.execute_stream_nodes_in",
+             body_rl_execute_stream_nodes_in, ("ratelimit", "slow"), ()),
             ("remote.execute.basic", body_remote_open, ("basic",), ()),
             ("remote.execute.remote_false_blocked",
              body_remote_false_blocked, ("access",), ()),

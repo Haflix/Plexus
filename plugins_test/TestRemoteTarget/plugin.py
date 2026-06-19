@@ -74,6 +74,68 @@ class TestRemoteTarget(Plugin):
     async def r_open(self, value: Any = None) -> Any:
         return value
 
+    @async_log_errors
+    async def r_rl_configure(self, rate_limits: Any = None) -> dict:
+        """Step 6 control endpoint: apply a `rate_limits` config (Section-10 shape)
+        or CLEAR it (None) live on THIS node. Lets TestRemoteSuite drive a real
+        two-node throttle without a static config that would throttle the other
+        ~30 remote cases. Reuses the real Step-4 `parse_rate_limits` (so this also
+        exercises Step 4 over the wire). The inbound admit for THIS call already
+        ran against the still-empty sideband before this body executes, so
+        configuring is never self-throttled."""
+        from plexus.helpers.config import parse_rate_limits
+        from plexus.ratelimiter import RateLimiter
+        px = self._plexus
+        cfg, sub_cfg, nodes_cfg = parse_rate_limits(rate_limits)
+        # Reset to a FRESH limiter so each configure starts with full buckets and
+        # no stale-token carryover from a prior case. (_rebuild_charge_sets
+        # early-returns before pruning when nothing is configured, so a
+        # clear-then-reconfigure would otherwise reconfigure the OLD bucket in
+        # place -- reconfigure clamps tokens, never refills up -- inheriting the
+        # prior case's drained level. Same pattern as TestRateLimitSuite._apply.)
+        px._rate_limiter = RateLimiter()
+        px._rate_limit_config = cfg
+        px._rate_limit_sub_config = sub_cfg
+        px._rate_limit_nodes_in_config = nodes_cfg
+        await px._rebuild_charge_sets()
+        return {"active": px._rate_limits_active}
+
+    @async_log_errors
+    async def r_rl_stats(self) -> list:
+        """Step 6 readback: this node's RateLimiter.stats() snapshot. Lets the
+        parent count exact per-bucket charges over the wire (e.g. Framework-IN
+        charged once per remote request_event -- the carve-out + once property --
+        without depending on throttle timing)."""
+        return self._plexus._rate_limiter.stats()
+
+    @async_log_errors
+    async def r_call_parent(
+        self, parent_hostname: Any = None, target_plugin: Any = None,
+        method: Any = None, n: int = 1,
+    ) -> dict:
+        """Step 6 reverse-call: execute `method` on `target_plugin` at the PARENT
+        `n` times and return {"ok": int, "throttled": int}. Drives the per-peer
+        isolation e2e where the PARENT is the receiver and this subnode is one of
+        two sender peers. The subnode's sole peer is the parent, so `hosts="remote"`
+        routes there (parent_hostname is kept for explicitness / multi-peer
+        futures). Throttle detection catches `RateLimitException` SPECIFICALLY (a
+        `RequestException` subclass that round-trips the wire) so a routing/timeout
+        error is never miscounted as a throttle -- it lands in neither tally."""
+        from plexus.exceptions import RateLimitException
+        ok = 0
+        throttled = 0
+        for _ in range(max(0, int(n))):
+            try:
+                await self.execute(target_plugin, method, {}, hosts="remote")
+                ok += 1
+            except RateLimitException:
+                throttled += 1
+            except Exception:
+                # Not a throttle (routing/timeout/etc.) -> neither tally; the
+                # caller detects a wiring fault as ok+throttled < n.
+                pass
+        return {"ok": ok, "throttled": throttled}
+
     @async_gen_log_errors
     async def r_async_gen(self, n: int = 3):
         for i in range(max(0, int(n))):

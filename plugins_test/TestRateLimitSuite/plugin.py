@@ -74,7 +74,7 @@ from plexus.ratelimiter import (  # noqa: E402
 
 from _test_helpers import CaseRecorder  # noqa: E402
 
-SUITE_VERSION = "0.6.0"
+SUITE_VERSION = "0.7.0"
 SUITE = "TestRateLimitSuite"
 TARGET = "TestRateLimitTarget"
 
@@ -200,6 +200,9 @@ class TestRateLimitSuite(Plugin):
             # Step 5 -- observability (reject-log suppression + stats()).
             await self._case_reject_log_suppression(rec, kw)
             await self._case_stats_snapshot(rec, kw)
+            # Step 6 -- coverage sweep (local gap: Framework-IN charged once per
+            # 1:N publish, NOT once per delivered sub).
+            await self._case_framework_in_fanout_once(rec, kw)
         finally:
             for su in runtime_subs:
                 try:
@@ -1010,3 +1013,64 @@ class TestRateLimitSuite(Plugin):
             if oks != 2 or rejects != 2:
                 raise AssertionError(f"expected 2 admit + 2 reject; got {oks}/{rejects}")
         await rec.run_case("ratelimit.stats_snapshot", body, **kw)
+
+    async def _case_framework_in_fanout_once(self, rec, kw):
+        async def body(c):
+            px = self._plexus
+            # Framework-IN is charged ONCE at the publish OUT admit, NOT once per
+            # delivered subscriber. A 1:N fan-out (here N=2: the declared xsub plus
+            # a 2nd runtime sub on the SAME topic, both -> TARGET.sink) from ONE
+            # publish must consume exactly ONE Framework-IN token. (in_publish_skip
+            # configures no framework_in, so it cannot prove this -- review gap.)
+            target = px.plugins.get(TARGET)
+            target._sink_calls = 0
+            # framework_in generous so the publish admits; IN-sets unconfigured so
+            # BOTH deliveries land (proving 2 deliveries vs 1 framework_in charge).
+            self._apply({(DIM_FRAMEWORK_IN, FRAMEWORK_IN_KEY): {"max": 100, "window": 1000}})
+            await px._rebuild_charge_sets()
+            fb = px._rl_framework_in
+            if fb is None:
+                raise AssertionError("framework_in bucket must be built")
+            charged0 = fb.charged
+            su = await px.subscribe_event(
+                topic="ratelimit/xsub/topic", plugin_name=self.plugin_name,
+                plugin_uuid=self.plugin_uuid, target_access_name="sink",
+                target_plugin=TARGET, hosts="local",
+            )
+            try:
+                async def _wait_until(pred, ticks):
+                    for _ in range(ticks):
+                        if pred():
+                            return True
+                        await asyncio.sleep(0.005)
+                    return pred()
+
+                n = await self.publish_event("ev_sub", {"n": 1})
+                # Framework-IN is charged SYNCHRONOUSLY at the publish OUT admit,
+                # BEFORE the fan-out tasks run -- capture the delta NOW so a
+                # background charge during the delivery-wait below cannot skew it.
+                # The two deliveries charge their IN-sets at _call_endpoint, NOT
+                # framework_in; a per-sub framework_in charge would make the delta
+                # 3 (1 OUT + 2 deliveries), the correct single-charge makes it 1.
+                delta = fb.charged - charged0
+                await _wait_until(lambda: target._sink_calls >= 2, 200)
+                if target._sink_calls != 2:
+                    raise AssertionError(
+                        f"one publish to a 2-sub topic must deliver TWICE; "
+                        f"sink_calls={target._sink_calls}"
+                    )
+                if delta != 1:
+                    raise AssertionError(
+                        f"framework_in must be charged ONCE per publish regardless "
+                        f"of fan-out width; charged delta={delta} (expected 1)"
+                    )
+                if n != 2:
+                    raise AssertionError(
+                        f"publish should schedule 2 matched subs; got {n}"
+                    )
+            finally:
+                try:
+                    await px.unsubscribe_event(su)
+                except Exception:
+                    pass
+        await rec.run_case("ratelimit.framework_in_fanout_once", body, **kw)

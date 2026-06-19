@@ -1,5 +1,5 @@
-description: Phase 5 fixture — remote=True endpoints + topic handlers used by TestRemoteSuite cases
-version: 0.3.4
+description: Phase 5 fixture — remote=True endpoints + topic handlers used by TestRemoteSuite cases (+ Step 6 rate-limit control + reverse-call)
+version: 0.4.0
 remote: True
 arguments:
 subscriptions:
@@ -20,6 +20,35 @@ endpoints:
     description: Plain remote-callable endpoint
     arguments:
       - name: value
+
+  r_rl_configure:
+    internal_name: r_rl_configure
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Step 6 control endpoint — apply/clear a rate_limits config live on this node (drives the two-node throttle without a static config)
+    arguments:
+      - name: rate_limits
+
+  r_rl_stats:
+    internal_name: r_rl_stats
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Step 6 readback — this node's RateLimiter.stats() over the wire (exact per-bucket charge counts)
+    arguments:
+
+  r_call_parent:
+    internal_name: r_call_parent
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Step 6 reverse-call — execute a parent endpoint n times and return an ok/throttled tally (drives the per-peer isolation e2e where the parent is the receiver)
+    arguments:
+      - name: parent_hostname
+      - name: target_plugin
+      - name: method
+      - name: n
 
   r_async_gen:
     internal_name: r_async_gen
