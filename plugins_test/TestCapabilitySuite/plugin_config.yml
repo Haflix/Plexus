@@ -1,5 +1,5 @@
 description: Capability-gate suite — drives the gate end-to-end through execute()
-version: "0.1.1"
+version: "0.2.0"
 remote: false
 arguments:
 endpoints:

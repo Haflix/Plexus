@@ -144,6 +144,19 @@ _RL_STATIC_DIMS = frozenset({
 # is deferred -- a module constant is the v1 contract.
 RL_REJECT_LOG_WINDOW = 10.0
 
+# Identity-assertion audit suppression window (seconds). The capability gate
+# emits a `_core/security/identity_asserted` bus event on every allowed assertion
+# or deny; a hot impersonation or a denied-assertion flood would otherwise spam
+# the audit stream. First emit per (real, asserted, denied) per window fires;
+# in-window repeats only bump a counter; the next emit after the window carries
+# the suppressed count (Section 13, the audit half of the reject-log suppression).
+IDENTITY_AUDIT_WINDOW = 10.0
+# Soft cap on the identity-audit side-table. On the DENY path the asserted name is
+# caller-supplied, so a local grant-holder rotating distinct fake names could grow
+# the table without bound; past this size, stale (window-elapsed) entries are
+# pruned on the next emit. Generous so a legitimate working set never trips it.
+_IDENTITY_AUDIT_MAX_KEYS = 4096
+
 from .events import EventMixin
 
 
@@ -223,6 +236,23 @@ class Plexus(EventMixin):
         # turns _identity_active on. Tests inject grants directly.
         self._capability_grants: Dict[str, dict] = {}
         self._capability_active: bool = False
+        # Identity-assertion audit suppression (the audit half of the Step-5
+        # reject-log suppression; Section 13). Keyed by (real.uuid, asserted_name,
+        # denied); value {"last_emit": monotonic_ts, "suppressed": int}. First
+        # emit of an assertion/deny per window fires the bus event; in-window
+        # repeats only bump the counter; the next emit after the window carries
+        # the suppressed count so a hot impersonation (or a denied-assertion
+        # flood) cannot spam the audit stream while the volume is preserved across
+        # the active window. (A burst that fully STOPS leaves its final count
+        # unflushed until the next emit for that key -- the deferred background
+        # sweep would flush it; same tail tradeoff as the reject-log suppression.)
+        # This is the RELATIVE window-counter variant (a `suppressed` counter
+        # reset to 0 at each emit), which reads differently from `_rl_reject_log`'s
+        # `rejected_at_warn` difference-of-counters variant: the reject path has an
+        # external running counter (`Bucket.rejected`) to anchor to and this path
+        # does not. Loop-side only (`_gate_author` runs synchronously on the
+        # dispatch loop). Only touched when capabilities are active (zero-off).
+        self._identity_audit_log: Dict[tuple, dict] = {}
         # yaml_config was loaded above; parse the capabilities: section now so
         # the gate is live from the first dispatch when grants are configured.
         self._load_capability_grants()
@@ -6203,8 +6233,34 @@ class Plexus(EventMixin):
         self, real, asserted_author, asserted_author_id, chain, verdict, denied
     ) -> None:
         """Emit the audit event for an asserted (or denied) identity claim onto
-        the internal bus, best-effort."""
+        the internal bus, best-effort, with per-(real, asserted, denied) window
+        suppression (Section 13, the audit half of the Step-5 reject suppression).
+
+        First emit per key per ``IDENTITY_AUDIT_WINDOW`` fires the event; in-window
+        repeats only bump a counter (NO event); the next emit after the window
+        carries the ``suppressed`` count -- so across an ACTIVE window the volume
+        is preserved and a hot impersonation or a denied-assertion flood cannot
+        spam the stream. (A burst that fully STOPS leaves its final count unflushed
+        until the next emit for that key; the deferred background sweep would flush
+        it -- same tail tradeoff as the reject-log suppression.) Keyed on the
+        asserted NAME (not the caller-supplied id, which may be None and would
+        collapse distinct targets / grow the keyspace). Never raises (best-effort):
+        a suppression-state fault must not break the gate.
+        """
         try:
+            key = (real.uuid, asserted_author, denied)
+            now = time.monotonic()
+            st = self._identity_audit_log.get(key)
+            if st is not None and (now - st["last_emit"]) < IDENTITY_AUDIT_WINDOW:
+                # In-window repeat: collapse it; the count rides the next
+                # post-window emit for this key.
+                st["suppressed"] += 1
+                return
+            suppressed = st["suppressed"] if st is not None else 0
+            # Emit BEFORE resetting the window state: if _internal_emit is skipped
+            # (a re-entrant emit hitting the depth guard) or raises, the
+            # accumulated `suppressed` count then survives to the next emit rather
+            # than being reset away.
             self._internal_emit(
                 "_core/security/identity_asserted",
                 real_caller=real.name,
@@ -6214,8 +6270,18 @@ class Plexus(EventMixin):
                 denied=denied,
                 reason=verdict.reason,
                 chain=[f.name for f in chain],
+                suppressed=suppressed,
                 ts=time.time(),
             )
+            self._identity_audit_log[key] = {"last_emit": now, "suppressed": 0}
+            # Bound the keyspace (caller-supplied deny names): when it grows past
+            # the cap, drop stale (window-elapsed) entries. A stale entry only
+            # exists to carry its count to a NEXT emit that, for an inactive key,
+            # never comes -- same tail tradeoff as the burst-then-stop case.
+            if len(self._identity_audit_log) > _IDENTITY_AUDIT_MAX_KEYS:
+                for k, e in list(self._identity_audit_log.items()):
+                    if (now - e["last_emit"]) >= IDENTITY_AUDIT_WINDOW:
+                        del self._identity_audit_log[k]
         except Exception:
             pass
 

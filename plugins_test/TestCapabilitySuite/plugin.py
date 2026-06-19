@@ -37,7 +37,7 @@ from plexus.decorators import async_log_errors, log_errors  # noqa: E402
 from _test_helpers import CaseRecorder  # noqa: E402
 
 
-SUITE_VERSION = "0.1.3"
+SUITE_VERSION = "0.2.0"
 ACTOR = "TestCapabilityActor"
 ACTOR2 = "TestCapabilityActor2"
 
@@ -102,10 +102,12 @@ class TestCapabilitySuite(Plugin):
             await self._case_stream_async_gated(rec, kw)
             await self._case_stream_sync_gated(rec, kw)
             await self._case_stream_async_lazy(rec, kw)
+            await self._case_audit_dedup(rec, kw)
         finally:
             self._plexus._capability_grants = orig_grants
             self._plexus._capability_active = orig_cap
             self._plexus._identity_active = orig_id
+            self._plexus._identity_audit_log.clear()
 
         return rec.to_dict()
 
@@ -314,3 +316,70 @@ class TestCapabilitySuite(Plugin):
                     f"got {marker!r}"
                 )
         await rec.run_case("capability.stream_async.lazy", body, **kw)
+
+    async def _case_audit_dedup(self, rec, kw):
+        async def body(c):
+            # The capability gate emits a `_core/security/identity_asserted` bus
+            # event per assertion/deny; window-suppression collapses a repeated
+            # identical assertion to ONE event + a count (Section 13, the audit
+            # half of the Step-5 reject suppression). ACTOR may act as system, so
+            # the SAME (ACTOR -> "system", allowed) assertion repeated in-window
+            # must emit once; the next emit after the window carries the count.
+            from plexus.core import IDENTITY_AUDIT_WINDOW
+            px = self._plexus
+            events: List[dict] = []
+
+            def _obs(topic, payload):
+                events.append(dict(payload))
+
+            self.internal_observe("_core/security/identity_asserted", _obs)
+            px._identity_audit_log.clear()
+            try:
+                self._set_grants({ACTOR: {"system_caller": True}})
+                N = 4
+                for _ in range(N):
+                    outcome, res = await self._drive_assert(
+                        ACTOR, ACTOR, "echo", "system", "system"
+                    )
+                    if outcome != "ok":
+                        raise AssertionError(
+                            f"system_caller assertion should allow; got {outcome}/{res!r}"
+                        )
+                # First assertion emits; the other N-1 are suppressed in-window.
+                if len(events) != 1:
+                    raise AssertionError(
+                        f"in-window: exactly 1 audit event expected for {N} identical "
+                        f"assertions; got {len(events)}: {events}"
+                    )
+                e0 = events[0]
+                if e0.get("suppressed") != 0:
+                    raise AssertionError(f"first emit must carry suppressed=0; got {e0!r}")
+                if e0.get("denied") is not False or e0.get("asserted") != "system":
+                    raise AssertionError(f"audit payload wrong on first emit: {e0!r}")
+                # Side-table accumulated the N-1 suppressed; key is name-based.
+                key = (px.plugins[ACTOR].plugin_uuid, "system", False)
+                st = px._identity_audit_log.get(key)
+                if st is None or st["suppressed"] != N - 1:
+                    raise AssertionError(
+                        f"side-table must hold {N - 1} suppressed for {key}; got {st!r}"
+                    )
+                # Force the window elapsed, drive one more -> a 2nd emit that
+                # CARRIES the suppressed count (no security event's volume lost).
+                st["last_emit"] -= (IDENTITY_AUDIT_WINDOW + 1.0)
+                outcome, _ = await self._drive_assert(
+                    ACTOR, ACTOR, "echo", "system", "system"
+                )
+                if outcome != "ok":
+                    raise AssertionError(f"post-window assertion should allow; got {outcome}")
+                if len(events) != 2:
+                    raise AssertionError(
+                        f"post-window: a 2nd audit event expected; got {len(events)}"
+                    )
+                if events[1].get("suppressed") != N - 1:
+                    raise AssertionError(
+                        f"2nd emit must report {N - 1} suppressed; got {events[1]!r}"
+                    )
+            finally:
+                self.internal_unobserve("_core/security/identity_asserted", _obs)
+                px._identity_audit_log.clear()
+        await rec.run_case("capability.audit_dedup", body, **kw)
