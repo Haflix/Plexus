@@ -1,6 +1,6 @@
 # API Reference
 
-*Last updated for Plexus 0.46.0*
+*Last updated for Plexus 0.62.0*
 
 Reference manual for the public surface of `Plugin` (in `plexus.utils`) — the methods and attributes a plugin author calls from inside their own class. Methods on `Plexus` itself are covered at the end for tooling and harness authors.
 
@@ -27,6 +27,7 @@ Argument types use Python conventions; `Any` means no constraint. For tutorials 
   - [`topic_vars` constraints](#topic_vars-constraints)
 - [Subscribe / unsubscribe at runtime](#subscribe--unsubscribe-at-runtime)
 - [Runtime sub/event enable-toggle](#runtime-subevent-enable-toggle)
+- [Internal-observer bus](#internal-observer-bus)
 - [Logger administration](#logger-administration)
 - [Decorators](#decorators)
 - [The `Event` object](#the-event-object)
@@ -300,6 +301,22 @@ Sync variant — bridges via `run_coroutine_threadsafe`.
 
 ---
 
+## Internal-observer bus
+
+The framework emits framework events on an internal bus under `_core/...` topics. Plugins can register a sync observer to watch them, for tooling, diagnostics, or reacting to lifecycle changes. Observed events include `_core/event/published`, `_core/event/requested`, `_core/event/streamed`, the `_core/subscription/state_changed` / `_core/event/state_changed` toggles emitted above, and `_core/security/identity_asserted` (emitted by the capability gate). This is observe-only: it does NOT replace `subscribe` / `subscriptions:` for application events.
+
+### `self.internal_observe(topic, callback) -> None`
+
+Register a sync observer `callback(topic, payload_dict)` for a `_core/...` framework topic. The `plugin_uuid` is auto-filled, so framework auto-cleanup on `disable_plugin` and `pop_plugin` removes the registration. Register observers in `on_enable`; re-registering across enable cycles is idempotent.
+
+The callback MUST be sync (an async-def `callback` raises `TypeError`), runs on the loop thread, and should return quickly. Observer exceptions (`Exception` subclasses) are logged and swallowed.
+
+### `self.internal_unobserve(topic, callback) -> bool`
+
+Remove an observer registration. Returns `True` if one was removed, `False` otherwise.
+
+---
+
 ## Logger administration
 
 Set per-logger thresholds at runtime. Plugin-source overrides survive config reloads but are auto-cleared on `on_disable`, `pop_plugin`, `purge_plugins`, or shutdown.
@@ -370,6 +387,8 @@ From `plexus.exceptions` (also re-exported from the top-level `plexus` package).
 | `RequestException`        | `Exception`        | Any plugin-call failure: endpoint not found, target not ready, method-shape mismatch, target raised, circular sync call, no event subscriber matches, event disabled, framework-not-started guard. |
 | `NetworkRequestException` | `RequestException` | Network-level failure during a remote dispatch (connection error, peer error, timeout).                                                                  |
 | `NoLocalSubException`     | `RequestException` | Peer signals "no local sub matched" on a remote `request_event` / `request_event_stream`. Distinct subclass so request-event fall-through preserves order. |
+| `CapabilityException`     | `RequestException` | Raised by the capability gate on a denied identity assertion. See [capabilities](./capabilities.md).                                                      |
+| `RateLimitException`      | `RequestException` | Raised on a rate-limit reject (OUT and 1:1 IN paths). See [rate limiting](./rate_limiting.md).                                                            |
 | `NodeException`           | `Exception`        | Generic node-level error (e.g. unknown / disabled node).                                                                                                 |
 | `PluginTypeMismatchError`| `Exception`        | A `decorators.py` decorator is applied to a function whose sync/async/gen/async-gen kind does not match.                                                 |
 | `PluginDependencyError`   | `Exception`        | Raised at boot by the dependency resolver when a plugin's `dependencies:` constraint cannot be satisfied — missing required dep, version mismatch, dep in `FAILED_LOAD` state, or a dependency cycle. |
@@ -457,6 +476,8 @@ The methods below are on `Plexus` itself. Plugin authors use the `Plugin` wrappe
 | `await plx.unsubscribe_event(sub_uuid) -> bool` | With remove-delta broadcast. |
 | `await plx.set_subscription_enabled(sub_uuid, enabled) -> bool` | Toggle a subscription's enabled flag. Broadcasts add/remove-delta on transition; emits `_core/subscription/state_changed`. |
 | `await plx.set_event_enabled(plugin_name, event_id, enabled) -> bool` | Toggle an event's enabled flag. Local-only — emits `_core/event/state_changed` on change. |
+| `plx.internal_observe(plugin_uuid, topic, callback)` | Register a sync observer `callback(topic, payload_dict)` for a `_core/...` framework topic. Plugin wrapper auto-fills `plugin_uuid`. |
+| `plx.internal_unobserve(plugin_uuid, topic, callback) -> bool` | Remove an observer registration. `True` if one was removed. |
 
 ### Read-mostly attributes
 

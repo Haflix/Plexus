@@ -1,6 +1,6 @@
 # Configuration
 
-*Last updated for Plexus 0.46.0*
+*Last updated for Plexus 0.62.0*
 
 Reference for the top-level `config.yml` — the file Plexus reads on
 startup to find plugins, configure the runtime, and (when enabled) wire
@@ -11,6 +11,12 @@ For per-plugin manifests (`plugin_config.yml`), see
 [plugin authoring](./plugin_authoring.md). For the operational side of
 the cluster, see [networking](./networking.md). For framework
 internals, see [architecture](./architecture.md).
+
+Two optional top-level config sections have their own deep-dives: the
+token-bucket rate limiter (`rate_limits:`) is documented in
+[rate limiting](./rate_limiting.md), and the caller-identity capability
+grants (`capabilities:`) in [capabilities](./capabilities.md). Both are
+off by default.
 
 ---
 

@@ -1,6 +1,6 @@
 # Networking
 
-*Last updated for Plexus 0.46.0*
+*Last updated for Plexus 0.62.0*
 
 Plexus ships with an optional `NetworkManager` that bridges plugin calls between nodes over an mTLS-pinned TCP protocol. With networking enabled, calling `await self.execute("OtherPlugin", ...)` works whether `OtherPlugin` is on this node or another node. The same applies to `publish_event` and `request_event`.
 
@@ -19,6 +19,7 @@ Every node holds its own self-signed certificate. Peers trust each other by **ce
 - mTLS contexts are built by `_create_server_ssl_context` / `_create_client_ssl_context` / `_create_pinned_ssl_context`. Both sides require client certificates.
 - On every inbound connection, `_handle_client` extracts the peer's SPKI fingerprint as its FIRST act, BEFORE any protocol message is read or sent, and looks the fingerprint up in `peers_by_fingerprint`. A pin failure closes the socket silently — no `_send_message` ever fires on a non-pinned peer.
 - `NetworkManager.start()` hard-errors if `peers:` is empty when networking is enabled, because an empty trust store would reject every inbound connection with an opaque OpenSSL error.
+- Beyond the connection-level pin, every inbound handler (`execute`, `request_event`, `publish_event`, the streaming variants, and the sub-advert frames) runs an anti-spoof gate: the wire-claimed `author_host` on the message must match the hostname this peer was cert-pinned under. A mismatch drops the message (request-shaped frames also get an anti-spoof error response so the caller fails fast) and triggers `_warn_hostname_drift`, which logs a loud ERROR once per offending peer plus an observable `_core/peer/hostname_mismatch` event, then DEBUG for subsequent drops. In practice a mismatch is almost always config drift: the peer's `general.hostname` does not match the hostname in this node's `peers:` entry (and its cert CN).
 
 The legacy `node_ips:` schema is removed. Presence of `node_ips:` in a config raises `RuntimeError` at boot with migration guidance pointing at the `peers:` schema.
 
@@ -136,7 +137,7 @@ Heartbeat parameters live under the `networking:` block in `config.yml`:
 | `lookup_interval`   | `60.0` s  | How often the node-lookup loop runs.                                   |
 | `liveness_timeout`  | `30.0` s  | A peer is considered dead if its last heartbeat is older than this. Should be `>= heartbeat_interval`; 2-3× is typical. |
 
-The heartbeat loop iterates the node list and calls `heartbeat_node(node, timeout=liveness_timeout)`. Failures route through `_mark_node_dead`, which drops advert state for that peer. `Node.is_alive(timeout=30)` returns `True` if the last heartbeat was within `timeout` seconds.
+The heartbeat loop probes every peer in the node list CONCURRENTLY (`asyncio.gather`), so one slow or catatonic peer cannot delay the others. Each per-peer probe is `heartbeat_node(node, timeout=probe_timeout)`, where `probe_timeout` is a dedicated, smaller per-probe budget, NOT the larger `liveness_timeout`. A failed probe does NOT mark the peer dead on the spot: an N-strikes miss counter (`_record_heartbeat_miss`, default 3 strikes) absorbs transient blips first. Only once a peer accumulates the strike threshold does the loop call `_mark_node_dead`, which drops advert state for that peer. A successful probe resets that peer's miss counter. `Node.is_alive(timeout=30)` returns `True` if the last heartbeat was within `timeout` seconds.
 
 Bad values (non-numeric or `<= 0`) fall back to the defaults with a warning logged at config-load time, so a typo can never silently zero an interval and starve the heartbeat / discovery loops. See `docs/configuration.md` for the full `networking:` knob table.
 

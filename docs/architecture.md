@@ -1,6 +1,6 @@
 # Architecture
 
-*Last updated for Plexus 0.46.0*
+*Last updated for Plexus 0.62.0*
 
 This document describes the runtime shape of a Plexus process: how Plexus loads plugins, how the lifecycle hooks fire, what guarantees the framework gives during hot-swap and shutdown, and how the three-tier discipline organises the plugins themselves.
 
@@ -35,6 +35,8 @@ Plexus is the single piece of the framework you talk to. It owns:
 - A `SyncDispatcher` thread pool for synchronous subscriber handlers (default 4 workers; see [configuration](./configuration.md)).
 - A general-purpose plugin executor for synchronous plugin endpoints.
 - Optionally, a `NetworkManager` that bridges calls to peer nodes over mTLS.
+
+The `Plexus` class is not one monolithic block of code: it is composed from several submodules. The event, topic, and subscription methods live in `EventMixin` (`events.py`), which is mixed into `Plexus`. The shared thread-local state, recursion-guard counters, the `GatedExecutor`, the synchronous bridge, and the lifecycle-timeout constants live in `runtime.py`. Rate limiting lives in `ratelimiter.py`, and the stateless config-load and validation helpers live in `helpers/config.py`. `core.py` itself holds the config, lifecycle, and dispatch orchestration that ties these together.
 
 Plugins themselves are subclasses of `utils.Plugin`. They never construct Plexus — they receive a back-reference at load time as `self._plexus` and rely on the wrapper methods on the `Plugin` base class for everything they do.
 
@@ -91,7 +93,7 @@ Constraints:
 
 After `on_load` returns, Plexus overwrites `plugin_name`, `version`, `remote`, `description`, `arguments`, `prefix`, `verbose_notifier`, `endpoints`, `events`, and `subscriptions` from the merged manifest plus `overrides:` block. So `on_load` sees framework defaults; everything outside `on_load` sees the real values.
 
-### `on_enable(self)` — async or sync
+### `on_enable(self, *args, **kwargs)` — async or sync
 
 Called once the plugin is registered. May be `async def` or plain `def`; Plexus branches on `asyncio.iscoroutinefunction`. Sync versions run on the framework's plugin executor.
 
@@ -113,7 +115,7 @@ Use `on_enable` to:
 
 Whatever you do here must be undoable by `on_disable`. Nothing more, nothing less.
 
-### `on_disable(self)` — async or sync
+### `on_disable(self, *args, **kwargs)` — async or sync
 
 Called on shutdown, on `pop_plugin`, or on hot-swap. Must reverse exactly what `on_enable` did. The framework wraps user code in `asyncio.wait_for(timeout=plugin_disable_timeout)` (default 30s; see [configuration](./configuration.md)).
 
@@ -214,6 +216,8 @@ Every state mutation funnels through `plx._transition_plugin(name, new_state)`, 
 
 `Plugin.enabled` is a read-only `@property` that returns `True` for state in `{ENABLING, ENABLED}` (matches pre-v0.26 semantics). To distinguish "fully ready" from "mid-enable" externally, read `plx.plugin_states[name].state` directly.
 
+The dispatch paths carry per-task recursion guards (`runtime.py`) so a runaway chain aborts instead of exhausting a thread pool or looping forever. The internal event bus caps emit nesting at depth 5 (`_EMIT_DEPTH`), and the synchronous execute path caps nesting at depth 16 (`_EXECUTE_DEPTH`, kept below the sync-endpoint worker count so other framework work still gets pool slots). Both are per-task counters, isolated between tasks via context variables.
+
 Public lifecycle API: `await plx.enable_plugin(name)` / `await plx.disable_plugin(name)`. Direct writes to `plugin.enabled` raise `AttributeError`.
 
 ---
@@ -253,13 +257,14 @@ Nothing leaks across the swap. The instance attributes a plugin set in its previ
 `Plexus.close()` walks a deterministic sequence so dependents wind down before their dependencies:
 
 1. Wait up to 30 seconds for in-flight tracked tasks; cancel survivors.
-2. **Disable plugins in REVERSE config order.** Each `on_disable` gets a 30-second cap (hardcoded for shutdown). Different plugins do not block each other — their per-plugin lifecycle locks are independent.
-3. Sweep stranded plugin-source per-logger thresholds.
-4. Shut down BOTH sync dispatchers (the event-handler pool, then the streaming pool) with `wait=True` and a 30-second budget each; on timeout the in-flight shutdown is left running and `close()` continues. They drain AFTER the disable loop so a sync `on_disable` that publishes an event still has a pool to run on.
-5. Stop `NetworkManager` if present.
-6. Shut down the main plugin executor with `wait=True, cancel_futures=True`: pending submissions are cancelled and running sync threads are joined before `close()` returns.
+2. Drain the fire-and-forget task pool (per-peer publish dereg, advert acks, and other short cleanup work spawned by done-callbacks after the step 1 snapshot) for up to 5 seconds, then cancel survivors. This is a separate pool from the tracked tasks in step 1.
+3. **Disable plugins in REVERSE dependency order** (the reverse of `_dep_topo_order`, so dependents wind down before their dependencies). Each `on_disable` gets a 30-second cap (hardcoded for shutdown). Different plugins do not block each other — their per-plugin lifecycle locks are independent.
+4. Sweep stranded plugin-source per-logger thresholds.
+5. Shut down BOTH sync dispatchers (the event-handler pool, then the streaming pool) with `wait=True` and a 30-second budget each; on timeout the in-flight shutdown is left running and `close()` continues. They drain AFTER the disable loop so a sync `on_disable` that publishes an event still has a pool to run on.
+6. Stop `NetworkManager` if present.
+7. Shut down the main plugin executor with `wait=True, cancel_futures=True`: pending submissions are cancelled and running sync threads are joined before `close()` returns.
 
-Reverse-order shutdown is deliberate: an orchestrator that depends on `Postgres` is disabled before `Postgres` is, so it has a chance to flush state cleanly.
+Reverse-dependency shutdown is deliberate: an orchestrator that depends on `Postgres` is disabled before `Postgres` is, so it has a chance to flush state cleanly.
 
 ---
 

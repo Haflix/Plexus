@@ -1,6 +1,6 @@
 # Notifier and Events
 
-*Last updated for Plexus 0.46.0*
+*Last updated for Plexus 0.62.0*
 
 Deep dive on the topic-based event system. The user-facing Plugin
 methods are covered in [api_reference.md](./api_reference.md); this page
@@ -17,7 +17,7 @@ sit in a plugin's lifecycle, see [plugin_authoring.md](./plugin_authoring.md).
 
 | Shape | Method | Returns | Failure mode |
 |---|---|---|---|
-| 1:N fire-and-forget | `publish_event` | count of subs scheduled (int) | Errors inside subscribers are logged, never raised. Returns 0 on no match. |
+| 1:N fire-and-forget | `publish_event` | count of subs scheduled (int) | Errors inside subscribers are logged, never raised. Returns 0 on no match. Can still raise `RateLimitException` at the outbound throttle BEFORE any fan-out (see [rate_limiting.md](./rate_limiting.md)); the never-raised guarantee covers the subscriber-delivery side only. |
 | 1:1 ask | `request_event` | first matching handler's return value | Raises `RequestException` if no subscriber matches. |
 | 1:1 stream | `request_event_stream` | async generator of chunks | Pre-first-chunk: same fall-through as `request_event`. Post-first-chunk: committed to that producer. |
 
@@ -246,7 +246,14 @@ candidate; only candidates that survive every filter actually receive
 the event. Each filter is a separate predicate so the rules compose
 cleanly.
 
-### 1. Publisher hosts gate
+### 1. Sub owner active
+
+`_sub_owner_active` drops any candidate whose owner plugin is not currently
+ENABLED or ENABLING. A subscription stays in the registry across its owner's
+lifecycle, but it only delivers while that owner is live; a sub whose owner is
+disabled or has failed is skipped before the host and author filters run.
+
+### 2. Publisher hosts gate
 
 `_publisher_targets_local` decides whether
 this publish should target local subs at all. The publisher's effective
@@ -255,21 +262,21 @@ gate this. Default `hosts="local"` if the publisher omits it. `"any"`,
 `"local"`, the publisher's own hostname, or a list containing any of
 those accepts. `blocked_hosts` excludes.
 
-### 2. Sub-level local accept
+### 3. Sub-level local accept
 
 `_sub_accepts_local`. Whether the subscriber wants local events. The
 sub's `hosts` must accept `"local"`, own hostname, or `"any"`; the
 sub's `blocked_hosts` must not block them. Default sub `hosts="any"`
 accepts everything.
 
-### 3. Sub-level remote-publisher accept
+### 4. Sub-level remote-publisher accept
 
 `_sub_accepts_remote_publisher`. For inbound peer publishes only. A sub
 with `hosts="local"` rejects remote publishers. Otherwise the sub's
 `hosts` / `blocked_hosts` are checked against the remote publisher's
 `author_host`.
 
-### 4. Author filter
+### 5. Author filter
 
 `_sub_accepts_author`. `authors` is a whitelist; `blocked_authors` is a
 blacklist. The publisher's `plugin_name` is checked against both.
@@ -424,7 +431,12 @@ multiple matching subs, insertion order picks the winner.
 
 Local subs are tried first. On no local match, remote candidates are
 tried in advert insertion order — the order in which peers told us about
-their subs. A remote candidate that fails with `NoLocalSubException` (the
+their subs. The one exception: a request whose publisher resolves to
+`hosts="local"` does NOT fall through to remote. It short-circuits before
+the peer loop and raises `RequestException` on a no-local-match, since a
+local-only request was never meant to reach network peers. The same
+short-circuit applies to `request_event_stream`. A remote candidate that
+fails with `NoLocalSubException` (the
 peer signaled "no sub matched on my side either") or `NetworkRequestException`
 (connection error) is skipped and the next candidate is tried. A
 generic `RequestException` from a remote peer propagates — the candidate
@@ -472,6 +484,14 @@ The `GatedExecutor` gives the pool two independent budgets (see
 - Shutdown happens AFTER the 30 s in-flight drain in
   `Plexus.close()`, with a 30 s budget; falls back to `wait=False`
   on timeout.
+
+There is a SECOND `SyncDispatcher`, `sync_stream_dispatcher`, dedicated to
+sync STREAM handlers (a plain `def` handler that yields chunks). Each `next()`
+of a sync stream generator submits to this pool, kept separate from the RPC
+sync-subscriber pool above so one slow stream cannot saturate it. It has its
+own budgets: `general.sync_stream_workers` (default 4) and
+`general.sync_stream_thread_ceiling` (default 16), with thread-name prefix
+`sync-stream-notifier`.
 
 ---
 

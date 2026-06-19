@@ -1,6 +1,6 @@
 # Plugin Authoring Guide
 
-*Last updated for Plexus 0.46.0*
+*Last updated for Plexus 0.62.0*
 
 Write a plugin from scratch. This page walks through the moving parts in
 the order an author meets them; reference details live in
@@ -55,6 +55,15 @@ plugins:
 If `path` is omitted, Plexus resolves it as
 `{general.plugin_package}/{name}` — so a plugin named `MyPlugin` with
 `general.plugin_package: plugins` auto-resolves to `plugins/MyPlugin/`.
+
+The `name` must be a valid Python identifier. It may not start with an
+underscore (the name becomes the default topic `prefix`, and `_...`
+collides with the framework's reserved `_core/...` namespace), and it
+may not be one of the reserved names `system`, `general`, `any`,
+`remote`, `local`, or `plexus`. The same reserved-name set applies to
+endpoint access_names, event_ids, and subscription declared_ids; those
+surfaces do not feed the topic prefix, so they may keep an underscore
+prefix.
 
 You can load the same class twice under different names by adding two
 entries with different `name` values pointing at the same `path`. The
@@ -199,7 +208,7 @@ events:
 | Field | Type | Required | Default | Notes |
 |---|---|---|---|---|
 | `<key>` (event_id) | identifier | YES | — | How your code refers to the event in `publish_event(event_id, ...)`. |
-| `topic` | str | YES | — | The topic to publish under. `{prefix}`, `{plugin_name}`, `{hostname}`, and `{plugin_uuid}` are resolved at load time; user `{var}` placeholders stay intact and are filled at runtime via `topic_vars`. Wildcards (`*`) are NOT allowed in event topics. |
+| `topic` | str | YES | — | The topic to publish under. `{prefix}`, `{plugin_name}`, `{hostname}`, and `{plugin_uuid}` are resolved at load time; user `{var}` placeholders stay intact and are filled at runtime via `topic_vars`. Wildcards (`*`) are NOT allowed in event topics. A topic may not start with `_`; that prefix (e.g. `_core/...`) is reserved for framework-internal events. |
 | `hosts` | str / list / null | optional | `null` | Default publisher-side hosts filter. Same shape as a sub's `hosts`. |
 | `blocked_hosts` | str / list / null | optional | `null` | Default publisher-side blocked hosts. |
 | `enabled` | bool | optional | `true` | When false, `publish_event` silently drops; `request_event` raises. |
@@ -226,7 +235,7 @@ subscriptions:
 | Field | Type | Required | Default | Notes |
 |---|---|---|---|---|
 | `<key>` (declared_id) | identifier | YES | — | Becomes `Event.subscription_id` when the handler runs. |
-| `topic` | str | YES | — | Topic pattern. `*` matches one segment (e.g. `sensor/*/temperature`). `{prefix}`, `{plugin_name}`, `{hostname}`, `{plugin_uuid}` are substituted at load. User `{var}` placeholders are REJECTED on subscription topics — use a wildcard. |
+| `topic` | str | YES | — | Topic pattern. `*` matches one segment (e.g. `sensor/*/temperature`). `{prefix}`, `{plugin_name}`, `{hostname}`, `{plugin_uuid}` are substituted at load. User `{var}` placeholders are REJECTED on subscription topics — use a wildcard. A topic may not start with `_`; that prefix is reserved for framework-internal events. |
 | `target_access_name` | str | YES | — | Endpoint that receives the dispatched `Event`. |
 | `target_plugin` | str | optional | this plugin's name | For cross-plugin orchestrator subs. |
 | `target_plugin_uuid` | str / null | optional | `null` | Pin to a specific instance. |
@@ -391,6 +400,15 @@ list of hostnames.
 errors and returns `None`. `RequestException` (and its subclasses
 `NetworkRequestException`, `NoLocalSubException`) always propagates so
 callers can react to legitimate plugin/network failures.
+
+`execute()` takes three more optional keywords:
+
+- `timeout` (float, default `None`) bounds the call; the request fails
+  if the target does not return in time.
+- `author` / `author_id` assert a caller identity. They default to your
+  own `plugin_name` / `plugin_uuid`, so leave them unset for normal
+  calls. Overriding them is identity assertion for the capability gate;
+  see [capabilities](./capabilities.md).
 
 ### Step 4 — stream results
 
