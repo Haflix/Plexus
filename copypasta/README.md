@@ -1,13 +1,57 @@
-# Plugin Templates for AIO Assistant Core
+# Plugin Templates & Demo for Plexus (AIO Assistant Core)
 
-This folder contains templates and examples for creating plugins in the AIO Assistant Core system.
+This folder is both a **copy-paste template** for new plugins and a **small
+runnable demo** of the framework. Two plugins talk to each other: `SensorPlugin`
+emits readings and `AveragePlugin` averages them, exercising most of the
+framework surface (events, inter-plugin calls, rate limiting, capabilities, the
+sync bridge, dependencies, tags).
 
 ## Contents
 
-- **AveragePlugin/**: A complete example plugin demonstrating all core features
-  - `plugin.py`: Plugin implementation with examples of different method types
-  - `plugin_config.yml`: Configuration file with full endpoint documentation
-- **config_structures.txt**: Documentation of config.yml and plugin_config.yml structures
+- **SensorPlugin/** — a demo data source (a fake sensor).
+  - `plugin.py`, `plugin_config.yml` — publishes a `reading` event, exposes
+    `read` / `read_stream`, self-declares rate limits, tags an endpoint.
+- **AveragePlugin/** — a demo aggregator/orchestrator (the comprehensive
+  template to copy).
+  - `plugin.py`, `plugin_config.yml` — subscribes to readings, exposes sync +
+    async + generator endpoints, calls SensorPlugin, asserts an identity
+    (capabilities), discovers endpoints by tag, declares a dependency.
+- **demo_config.yml** — a runnable main config wiring both plugins (with
+  `rate_limits:` and `capabilities:` examples; networking off). Named
+  `demo_config.yml` rather than `config.yml` only because the repo's `.gitignore`
+  excludes `config.yml` (the local user copy); it is an ordinary main config.
+- **run_demo.py** — boots `demo_config.yml` and drives a short scripted scenario.
+- **config_structures.txt** — terse cheat-sheet of the full config.yml /
+  plugin_config.yml schema.
+
+## Run the demo
+
+From the repo root:
+
+```bash
+python copypasta/run_demo.py
+```
+
+You will see the two plugins boot, SensorPlugin's readings flow into
+AveragePlugin's running average, an on-demand `execute()` call, a capability
+assertion (allowed for the granted identity, denied otherwise), and the rate
+limiter rejecting once a bucket runs dry. Read `run_demo.py` top-to-bottom as a
+worked example of driving Plexus from outside a plugin.
+
+## What the demo shows (and where to look)
+
+| Feature | Where |
+| --- | --- |
+| Lifecycle + the `self.ready` gate | `AveragePlugin.on_enable` |
+| Publish an event (`events:` block) | `SensorPlugin.emit_reading` |
+| Subscribe to an event (`subscriptions:`) | `AveragePlugin.handle_reading` |
+| Sync method / sync generator | `AveragePlugin.average` / `recorded_values` |
+| Async streaming endpoint | `SensorPlugin.read_stream` |
+| Call another plugin (`execute`) | `AveragePlugin.pull_reading` |
+| Capabilities (assert an identity) | `AveragePlugin.try_act_as` + `demo_config.yml` — see [docs/capabilities.md](../docs/capabilities.md) |
+| Rate limiting (self-declared + operator override) | both manifests' `rate_limits:` + `demo_config.yml` — see [docs/rate_limiting.md](../docs/rate_limiting.md) |
+| Endpoint discovery by tag | `AveragePlugin.discover_sensors` |
+| Dependencies | `AveragePlugin` manifest `dependencies:` |
 
 ## Quick Start: Creating a New Plugin
 

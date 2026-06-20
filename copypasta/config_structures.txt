@@ -116,6 +116,38 @@ networking:                       # Cluster topology. See docs/networking.md
                                   # Default: 30.0.
 
 
+rate_limits:                      # Optional. Token-bucket rate limiter, OFF by
+                                  # default. See docs/rate_limiting.md.
+    framework_in: {max, window}   # Global: every operation entering the node.
+    nodes_in:                     # Per remote peer intake.
+        default: {max, window}    # Every peer unless overridden.
+        peers:
+            hostname: {max, window}
+    plugins:                      # Per-plugin. Main config OVERRIDES a plugin's
+        PluginName:               # own self-declared rate_limits: (main wins).
+            out: {max, window}        # plugin_out(PluginName)
+            in:  {max, window}        # plugin_in(PluginName)
+            endpoints:
+                access_name: {max, window}   # endpoint_in
+            events:
+                event_id: {max, window}      # event_out
+            subs:
+                declared_id: {max, window}   # sub_in
+    # Every bucket is {max: <number>, window: <seconds>} -- both REQUIRED,
+    # unquoted numbers, finite and > 0. Omit a dimension to leave it unlimited.
+
+
+capabilities:                     # Optional. Impersonation / system_caller
+                                  # grants. OFF by default, fail-closed. See
+                                  # docs/capabilities.md.
+    PluginName:                   # Keyed by plugin name (the grantee).
+        system_caller: boolean    # May assert author="system".
+        impersonation_allowed:    # May assert another identity. One of:
+                                  #   "caller"    -> its immediate caller
+                                  #   "ancestor"  -> any genuine chain ancestor
+                                  #   [Name, ...] -> these specific plugin names
+
+
 REMOVED (legacy network config):::
     networking.node_ips           # Replaced by peers: with mTLS pinning.
     networking.secret             # Shared-secret auth removed; mTLS only.
@@ -144,6 +176,33 @@ verbose_notifier: boolean         # Per-plugin verbose logging for the
 arguments:                        # Optional. Passed to on_load:
     [Any]                         # list/tuple unpacks as *args, dict as
                                   # **kwargs, anything else passed as-is.
+
+dependencies:                     # Optional. Plugin-to-plugin requirements,
+                                  # resolved at boot (topological enable order;
+                                  # dependents marked FAILED_LOAD on a missing /
+                                  # cyclic / version-mismatched required dep).
+    OtherPlugin:
+        version: str              # PEP 440 specifier (e.g. ">=1.0,<2.0").
+                                  # Empty string = any version.
+        optional: boolean         # Default false. true = warn + continue if
+                                  # missing/mismatched.
+    plexus:                       # Reserved sentinel: pin the FRAMEWORK version.
+        version: ">=0.60,<1.0"
+
+rate_limits:                      # Optional. This plugin's OWN rate limits (the
+                                  # "plugin-declared" layer). Main config can
+                                  # override any of these; a plugin may only
+                                  # declare limits for ITSELF (framework_in /
+                                  # nodes_in are main-config-only). Same bucket
+                                  # shape as main config: {max, window}.
+    out: {max, window}            # plugin_out(this plugin)
+    in:  {max, window}            # plugin_in(this plugin)
+    endpoints:
+        access_name: {max, window}
+    events:
+        event_id: {max, window}
+    subs:
+        declared_id: {max, window}
 
 endpoints:                        # Dict keyed by access_name (the name
                                   # other plugins use when calling this

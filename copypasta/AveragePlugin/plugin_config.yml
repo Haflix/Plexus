@@ -1,93 +1,142 @@
-description: Example plugin demonstrating the Plexus plugin structure
-version: 1.3.0
-remote: True  # Set to True if this plugin should be accessible remotely
-arguments:  # Optional: Arguments passed during plugin loading
+description: Demo aggregator -- averages the readings SensorPlugin emits (pairs with SensorPlugin)
+version: 1.4.0
+remote: False  # local-only demo
+arguments:  # Optional: forwarded to on_load (list -> *args, dict -> **kwargs)
 
-# Dependencies: plugin-to-plugin runtime relationships. Declares that this
-# plugin needs another plugin (loaded in the same Plexus process) at a
-# specific version range. Plexus resolves these at boot, enables plugins
-# in topological order, and marks dependents FAILED_LOAD when a required
-# dep is missing, in a cycle, or has a version mismatch. The reserved
-# sentinel "plexus" pins against the framework's own version.
-#
-# Uncomment + adapt to declare deps. Quote numeric versions ("1.0" not 1.0).
-#
-# dependencies:
-#   SomeOtherPlugin:
-#     version: ">=1.0,<2.0"            # PEP 440 specifier; empty = any
-#     optional: false                  # default; required dep
-#   AnotherPlugin:
-#     version: "~=2.3"
-#     optional: true                   # warn + continue if missing/mismatch
-#   plexus:                            # framework self-version sentinel
-#     version: ">=0.41,<1.0"
+# Dependencies: plugin-to-plugin runtime relationships. This plugin needs
+# SensorPlugin (it calls SensorPlugin.read and subscribes to its readings).
+# Plexus resolves these at boot, enables plugins in dependency order (so
+# SensorPlugin is enabled before this one), and marks this plugin FAILED_LOAD
+# if a required dep is missing, in a cycle, or version-mismatched. The reserved
+# "plexus" sentinel pins against the framework's own version. Quote numeric
+# versions ("1.0" not 1.0).
+dependencies:
+  SensorPlugin:
+    version: ">=1.0,<2.0"             # PEP 440 specifier; empty string = any
+    optional: false                   # default; required dep
+  plexus:                             # framework self-version sentinel
+    version: ">=0.60,<1.0"
 
-# Subscriptions: declarative event-router entries. Each subscription binds
-# a topic pattern to a target endpoint (target_access_name). When the topic
-# fires (via publish_event / request_event), the framework dispatches the
-# event to the named endpoint. Topics use "/" as separator. Single-segment
-# wildcard "*" is supported, e.g. "sensor/*/temperature".
+# A plugin may declare its OWN rate limits (operator main config can override).
+# Allowed sub-keys: out, in, endpoints, events, subs. Bucket = { max, window }.
+rate_limits:
+  out: { max: 200, window: 1 }        # plugin_out(AveragePlugin)
+  endpoints:
+    pull_reading: { max: 20, window: 1 }   # endpoint_in(AveragePlugin, pull_reading)
+  subs:
+    reading_sub: { max: 60, window: 1 }    # sub_in(reading_sub): cap deliveries
+
+# Subscriptions: bind a topic pattern to one of our endpoints. When the topic
+# fires (here, SensorPlugin publishing its `reading` event onto "sensor/reading")
+# the framework dispatches the Event to target_access_name. We never name the
+# publisher -- topic routing decouples us from it.
 subscriptions:
-  handle_event_sub:
-    topic: "example/event"
-    target_access_name: handle_event
+  reading_sub:
+    topic: "sensor/reading"
+    target_access_name: handle_reading
     hosts: "local"
 
 endpoints:
-  # Endpoints are a dict keyed by access_name (the name other plugins call).
-  # `internal_name` is optional; if absent it defaults to the key.
+  handle_reading:
+    internal_name: handle_reading
+    tags: []
+    remote: False
+    accessible_by_other_plugins: True
+    description: Subscriber endpoint -- folds a reading Event into the running average
+    arguments:
+      - name: event
+        type: any
+        description: Event object (event.payload has the reading; also .topic, .author)
+        required: True
+
+  average:
+    internal_name: average
+    tags: ["demo-average"]
+    remote: False
+    accessible_by_other_plugins: True
+    description: Return the running average (a sync endpoint -- pure computation)
+    arguments: []
+
+  recorded_values:
+    internal_name: recorded_values
+    tags: []
+    remote: False
+    accessible_by_other_plugins: True
+    description: Stream every recorded reading (a SYNC generator endpoint)
+    arguments: []
+
+  pull_reading:
+    internal_name: pull_reading
+    tags: []
+    remote: False
+    accessible_by_other_plugins: True
+    description: Pull one reading on demand by calling SensorPlugin.read via execute
+    arguments: []
+
+  try_act_as:
+    internal_name: try_act_as
+    tags: []
+    remote: False
+    accessible_by_other_plugins: True
+    description: Call SensorPlugin.read while asserting an identity (capabilities demo)
+    arguments:
+      - name: author
+        type: str
+        description: Identity to assert (allowed only if the capabilities grant permits it)
+        required: True
+      - name: author_id
+        type: str
+        description: UUID of the asserted identity; defaults to `author`
+        required: False
+
+  discover_sensors:
+    internal_name: discover_sensors
+    tags: []
+    remote: False
+    accessible_by_other_plugins: True
+    description: Discover endpoints tagged 'demo-sensor' via find_endpoints_by_tag
+    arguments: []
 
   example_method:
     internal_name: example_method
     tags: []
-    remote: True
+    remote: False
     accessible_by_other_plugins: True
-    description: Example method that doubles the input value and returns the result
+    description: Simple async endpoint that doubles the input value
     arguments:
       - name: value
         type: any
         description: Input value to process
+        required: True
 
   call_other_plugin:
     internal_name: call_other_plugin
     tags: []
-    remote: True
+    remote: False
     accessible_by_other_plugins: True
-    description: Call another plugin's method by name and return its result
+    description: Generic helper -- call another plugin's method by name and return its result
     arguments:
       - name: plugin_name
         type: str
         description: Name of the plugin to call
+        required: True
       - name: method_name
         type: str
         description: Method to execute on the target plugin
+        required: True
       - name: args
         type: any
         description: Arguments to pass to the method
+        required: False
 
   example_stream:
     internal_name: example_stream
     tags: []
-    remote: True
+    remote: False
     accessible_by_other_plugins: True
-    description: Streaming method that yields sequential results
+    description: Async streaming endpoint that yields sequential results
     arguments:
       - name: count
         type: int
         description: Number of items to yield
-
-  # Topic-subscribed endpoint example (event system).
-  # The matching `subscriptions.handle_event_sub` block above wires this
-  # endpoint to the topic "example/event". When publish_event /
-  # request_event fires for that topic, the framework dispatches the
-  # Event object to handle_event(self, event).
-  handle_event:
-    internal_name: handle_event
-    tags: []
-    remote: True
-    accessible_by_other_plugins: True
-    description: Example endpoint subscribed to a topic via subscriptions block
-    arguments:
-      - name: event
-        type: any
-        description: Event object received from the topic (event.payload, event.topic, event.author, event.author_host)
+        required: True
