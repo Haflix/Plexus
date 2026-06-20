@@ -74,7 +74,7 @@ from plexus.ratelimiter import (  # noqa: E402
 
 from _test_helpers import CaseRecorder  # noqa: E402
 
-SUITE_VERSION = "0.7.0"
+SUITE_VERSION = "0.8.0"
 SUITE = "TestRateLimitSuite"
 TARGET = "TestRateLimitTarget"
 
@@ -261,10 +261,14 @@ class TestRateLimitSuite(Plugin):
             self._apply({(DIM_EVENT_OUT, event_key(SUITE, "ev_x")): {"max": 30, "window": 1}})
             await px._rebuild_charge_sets()
             b = px._rate_limiter.get(DIM_EVENT_OUT, event_key(SUITE, "ev_x"))
+            # S1: _rl_event_out now holds the precomputed OUT charge-set
+            # [plugin_out, event_out, framework_in] (unconfigured dims skipped).
+            # Only event_out is configured here, so the set is exactly [event_out].
             stored = px._rl_event_out.get((SUITE, "ev_x"))
-            if b is None or stored is not b:
+            if b is None or stored != [b]:
                 raise AssertionError(
-                    f"event_out bucket must be stored by (plugin, event_id); got {stored!r}"
+                    f"event_out set must be the precomputed [event_out] charge-set; "
+                    f"got {stored!r}"
                 )
         await rec.run_case("ratelimit.event_out", body, **kw)
 
@@ -349,6 +353,7 @@ class TestRateLimitSuite(Plugin):
             self._apply({}, {})
             await px._rebuild_charge_sets()
             if (px._rl_endpoint_in or px._rl_sub_in or px._rl_event_out
+                    or px._rl_plugin_out or px._rl_framework_out
                     or px._rl_framework_in is not None):
                 raise AssertionError("empty config must leave all side-tables empty")
             if px._rate_limits_active:
@@ -522,10 +527,6 @@ class TestRateLimitSuite(Plugin):
                     "impersonation must charge plugin_out(asserted), not the "
                     "chain caller"
                 )
-            if px._rl_charged_name(asserted) != "ImpersonatedX":
-                raise AssertionError("_rl_charged_name must prefer the asserted identity")
-            if px._rl_charged_name(None, fallback_name="Pub") != "Pub":
-                raise AssertionError("_rl_charged_name must use fallback_name when no assertion")
         await rec.run_case("ratelimit.out_asserted_attribution", body, **kw)
 
     async def _case_in_endpoint_in(self, rec, kw):

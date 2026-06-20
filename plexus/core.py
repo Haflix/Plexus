@@ -308,8 +308,17 @@ class Plexus(EventMixin):
         # one of these by a key it already knows (no dict walk, no key building).
         self._rl_endpoint_in: Dict[tuple, list] = {}           # (plugin, access) -> [endpoint_in, plugin_in]
         self._rl_sub_in: Dict[str, list] = {}                  # sub_uuid -> [sub_in, endpoint_in, plugin_in]
-        self._rl_event_out: Dict[tuple, object] = {}           # (plugin, event_id) -> event_out bucket
         self._rl_framework_in = None                           # the single global-intake bucket
+        # Precomputed OUT (attempt) charge-sets, mirroring the IN side above so
+        # the OUT admit is one dict lookup + admit with NO per-call list
+        # allocation (S1; Section 11 "no allocation on the hot path"). Built in
+        # _rebuild_charge_sets in pinned order plugin_out, event_out,
+        # framework_in. The impersonation path (asserted identity) still builds
+        # dynamically -- plugin_out keyed by the asserted name but event_out by
+        # the real producer is a mix these per-producer sets cannot hold.
+        self._rl_plugin_out: Dict[str, list] = {}              # caller plugin -> [plugin_out, framework_in]
+        self._rl_event_out: Dict[tuple, list] = {}             # (plugin, event_id) -> [plugin_out, event_out, framework_in]
+        self._rl_framework_out: list = []                      # [framework_in] -- empty/unknown-chain OUT
         # Step 5: reject-log suppression state, keyed by the dry bucket's
         # (dim, key). {"last_warn": monotonic_ts, "rejected_at_warn": int}. The
         # per-bucket Bucket.rejected counter carries the true volume; this only
@@ -5895,7 +5904,9 @@ class Plexus(EventMixin):
         self._rl_endpoint_in.clear()
         self._rl_sub_in.clear()
         self._rl_event_out.clear()
+        self._rl_plugin_out.clear()
         self._rl_framework_in = None
+        self._rl_framework_out = []
 
         # Step 4: recompute the plugin-declared layer FROM SCRATCH from the
         # currently-loaded plugins. This MUST happen BEFORE the early-return
@@ -5939,11 +5950,22 @@ class Plexus(EventMixin):
             return b
 
         self._rl_framework_in = cfg(DIM_FRAMEWORK_IN, FRAMEWORK_IN_KEY)
+        # S1: the framework-only OUT set, charged when the caller chain is empty
+        # (framework / system origin -> framework_in alone; Section 8 amendment).
+        # Also the fallback when a caller's per-plugin set is missing.
+        self._rl_framework_out = charge_set(
+            self._rate_limiter, [(DIM_FRAMEWORK_IN, FRAMEWORK_IN_KEY)]
+        )
 
         for plugin in list(self.plugins.values()):
             p_name = plugin.plugin_name
             cfg(DIM_PLUGIN_IN, p_name)
             cfg(DIM_PLUGIN_OUT, p_name)
+            # S1: per-caller OUT set (execute attempt) -- plugin_out, framework_in.
+            self._rl_plugin_out[p_name] = charge_set(
+                self._rate_limiter,
+                [(DIM_PLUGIN_OUT, p_name), (DIM_FRAMEWORK_IN, FRAMEWORK_IN_KEY)],
+            )
             for access, ep in (getattr(plugin, "endpoints", None) or {}).items():
                 ek = endpoint_key(p_name, access)
                 cfg(DIM_ENDPOINT_IN, ek)
@@ -5966,9 +5988,18 @@ class Plexus(EventMixin):
                     for b in cs:
                         b.register_stream_weight(weight)
             for event_id in (getattr(plugin, "events", None) or {}):
-                b = cfg(DIM_EVENT_OUT, event_key(p_name, event_id))
-                if b is not None:
-                    self._rl_event_out[(p_name, event_id)] = b
+                # cfg() still creates/tracks the event_out bucket for the prune
+                # set; the precomputed full OUT set re-fetches it via charge_set.
+                cfg(DIM_EVENT_OUT, event_key(p_name, event_id))
+                # S1: per-(plugin, event) OUT set -- plugin_out, event_out,
+                # framework_in. Built for EVERY declared event (charge_set skips
+                # any unconfigured dimension), so a publish always finds its set.
+                self._rl_event_out[(p_name, event_id)] = charge_set(
+                    self._rate_limiter,
+                    [(DIM_PLUGIN_OUT, p_name),
+                     (DIM_EVENT_OUT, event_key(p_name, event_id)),
+                     (DIM_FRAMEWORK_IN, FRAMEWORK_IN_KEY)],
+                )
 
         wanted_subs = set()
         for plugin in list(self.plugins.values()):
@@ -6008,45 +6039,61 @@ class Plexus(EventMixin):
         self._rate_limiter.remove(DIM_SUB_IN, sub_uuid)
         self._rl_sub_in.pop(sub_uuid, None)
 
-    def _rl_charged_name(self, asserted, fallback_name=None):
-        """Resolve the identity NAME a Plugin-OUT charge is attributed to.
-
-        Priority: an asserted (impersonation) identity wins; else the in-hand
-        producer name the caller already holds (publisher for events); else the
-        real caller from the chain. Empty chain -> None (framework/system origin,
-        no plugin_out charge -- framework_in still applies at the admit site)."""
-        if asserted is not None:
-            return asserted.name
-        if fallback_name is not None:
-            return fallback_name
-        chain = current_caller_chain()
-        return chain[-1].name if chain else None
-
-    def _rl_admit_out(self, asserted, fallback_name=None, event_out_bucket=None, now=None):
+    def _rl_admit_out(self, asserted, producer_name=None, event_id=None, now=None):
         """OUT-side (attempt) admit for one operation. Returns the first DRY
         bucket (caller raises RateLimitException) or None when admitted.
 
         Pinned bucket order: plugin_out, event_out, framework_in (OUT dims then
         Framework-IN; Section 5). OUT cost is always 1.0 (one operation = one
-        attempt; stream weight is IN-only, Section 7). Charges the asserted name
-        on impersonation, else the in-hand producer name. No-op when rate
-        limiting is off, or when any frame in the live chain is exempt (lifecycle
-        origin)."""
+        attempt; stream weight is IN-only, Section 7). No-op when rate limiting
+        is off, or when any frame in the live chain is exempt (lifecycle origin).
+
+        The caller chain is read ONCE here (S2) and drives both the exempt check
+        and -- on the execute path -- the charged caller name.
+
+        Charge-set source:
+          - asserted is None (the common path): a PRECOMPUTED, pinned-order set
+            (S1, no per-call allocation) -- the per-(producer, event) set for an
+            event, the per-caller set for an execute, or the framework-only set
+            for an empty/unknown chain. Each set already has framework_in folded
+            in at its tail.
+          - asserted is not None (impersonation, rare): built dynamically,
+            because plugin_out is keyed by the ASSERTED name while event_out
+            stays keyed by the REAL producer -- a mix the per-producer precompute
+            cannot hold.
+        The ``or`` fallbacks degrade to a looser set when a key is absent (a
+        plugin / event not yet rebuilt) and finally to the framework-only set; an
+        empty list falls through harmlessly (it can only be empty when the looser
+        sets are empty too)."""
         if not self._rate_limits_active:
             return None
-        if any(f.exempt for f in current_caller_chain()):
+        chain = current_caller_chain()
+        if any(f.exempt for f in chain):
             return None
-        charged = self._rl_charged_name(asserted, fallback_name)
-        buckets = []
-        if charged is not None:
-            pob = self._rate_limiter.get(DIM_PLUGIN_OUT, charged)
+        if asserted is not None:
+            buckets = []
+            pob = self._rate_limiter.get(DIM_PLUGIN_OUT, asserted.name)
             if pob is not None:
                 buckets.append(pob)
-        if event_out_bucket is not None:
-            buckets.append(event_out_bucket)
-        if self._rl_framework_in is not None:
-            buckets.append(self._rl_framework_in)
-        return self._rate_limiter.admit(buckets, 1.0, now)
+            if event_id is not None:
+                eb = self._rate_limiter.get(
+                    DIM_EVENT_OUT, event_key(producer_name, event_id)
+                )
+                if eb is not None:
+                    buckets.append(eb)
+            if self._rl_framework_in is not None:
+                buckets.append(self._rl_framework_in)
+            return self._rate_limiter.admit(buckets, 1.0, now)
+        if event_id is not None:
+            cs = (self._rl_event_out.get((producer_name, event_id))
+                  or self._rl_plugin_out.get(producer_name)
+                  or self._rl_framework_out)
+        else:
+            name = producer_name or (chain[-1].name if chain else None)
+            cs = self._rl_plugin_out.get(name) or self._rl_framework_out
+        if not cs:
+            return None
+        return self._rate_limiter.admit(cs, 1.0, now)
 
     def _rl_admit_in(self, plugin_name, access, sub_uuid, cost=1.0, now=None):
         """IN-side (delivery) admit for one dispatch. Returns the first DRY

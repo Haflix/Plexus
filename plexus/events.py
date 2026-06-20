@@ -936,10 +936,8 @@ class EventMixin:
         # / disabled event); a return-0 would collide with "0 subs matched".
         dry = self._rl_admit_out(
             _asserted_identity.get(),
-            fallback_name=publisher.plugin_name,
-            event_out_bucket=self._rl_event_out.get(
-                (publisher.plugin_name, event_id)
-            ),
+            producer_name=publisher.plugin_name,
+            event_id=event_id,
             now=time.monotonic(),
         )
         if dry is not None:
@@ -1408,10 +1406,8 @@ class EventMixin:
         # to a peer.
         dry = self._rl_admit_out(
             _asserted_identity.get(),
-            fallback_name=publisher.plugin_name,
-            event_out_bucket=self._rl_event_out.get(
-                (publisher.plugin_name, event_id)
-            ),
+            producer_name=publisher.plugin_name,
+            event_id=event_id,
             now=time.monotonic(),
         )
         if dry is not None:
@@ -1730,10 +1726,8 @@ class EventMixin:
         # through the remote fall-through.
         dry = self._rl_admit_out(
             _asserted_identity.get(),
-            fallback_name=publisher.plugin_name,
-            event_out_bucket=self._rl_event_out.get(
-                (publisher.plugin_name, event_id)
-            ),
+            producer_name=publisher.plugin_name,
+            event_id=event_id,
             now=time.monotonic(),
         )
         if dry is not None:
