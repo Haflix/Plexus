@@ -37,7 +37,7 @@ from plexus.decorators import async_log_errors, log_errors  # noqa: E402
 from _test_helpers import CaseRecorder  # noqa: E402
 
 
-SUITE_VERSION = "0.2.0"
+SUITE_VERSION = "0.3.0"
 ACTOR = "TestCapabilityActor"
 ACTOR2 = "TestCapabilityActor2"
 
@@ -103,6 +103,7 @@ class TestCapabilitySuite(Plugin):
             await self._case_stream_sync_gated(rec, kw)
             await self._case_stream_async_lazy(rec, kw)
             await self._case_audit_dedup(rec, kw)
+            await self._case_audit_dedup_deny_flood(rec, kw)
         finally:
             self._plexus._capability_grants = orig_grants
             self._plexus._capability_active = orig_cap
@@ -383,3 +384,59 @@ class TestCapabilitySuite(Plugin):
                 self.internal_unobserve("_core/security/identity_asserted", _obs)
                 px._identity_audit_log.clear()
         await rec.run_case("capability.audit_dedup", body, **kw)
+
+    async def _case_audit_dedup_deny_flood(self, rec, kw):
+        async def body(c):
+            # A DENIED assertion's `asserted` name is CALLER-SUPPLIED. The audit
+            # dedup must NOT key suppression on it -- else a plugin varying the
+            # claimed name every call mints a fresh key per call and floods the
+            # bus (and grows the keyspace). All of ACTOR's denied assertions must
+            # collapse to ONE emit + a suppressed count under a single name-less
+            # deny key.
+            px = self._plexus
+            events: List[dict] = []
+
+            def _obs(topic, payload):
+                events.append(dict(payload))
+
+            self.internal_observe("_core/security/identity_asserted", _obs)
+            px._identity_audit_log.clear()
+            try:
+                # Gate ACTIVE (ACTOR has only ancestor impersonation), so asserting
+                # arbitrary non-ancestor names is DENIED at the gate.
+                self._set_grants({ACTOR: {"impersonation": "ancestor"}})
+                N = 5
+                for i in range(N):
+                    outcome, _ = await self._drive_assert(
+                        ACTOR, ACTOR, "echo", f"fake{i}", "z"
+                    )
+                    if outcome != "denied":
+                        raise AssertionError(
+                            f"asserting non-ancestor fake{i} must deny; got {outcome}"
+                        )
+                # Name dropped from the deny key -> N distinct names collapse to 1.
+                if len(events) != 1:
+                    raise AssertionError(
+                        f"distinct-name deny flood must collapse to 1 audit event; "
+                        f"got {len(events)}: {[e.get('asserted') for e in events]}"
+                    )
+                if not events[0].get("denied"):
+                    raise AssertionError(f"the emit must be a deny: {events[0]!r}")
+                key = (px.plugins[ACTOR].plugin_uuid, None, True)
+                st = px._identity_audit_log.get(key)
+                if st is None or st["suppressed"] != N - 1:
+                    raise AssertionError(
+                        f"name-less deny key must hold {N - 1} suppressed; got {st!r}"
+                    )
+                # No per-name deny key may leak into the table (the flood vector).
+                leaked = [k for k in px._identity_audit_log
+                          if k[2] is True and k[1] is not None]
+                if leaked:
+                    raise AssertionError(
+                        f"deny path must not key on the caller-supplied name; "
+                        f"leaked keys {leaked}"
+                    )
+            finally:
+                self.internal_unobserve("_core/security/identity_asserted", _obs)
+                px._identity_audit_log.clear()
+        await rec.run_case("capability.audit_dedup_deny_flood", body, **kw)

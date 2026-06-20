@@ -6288,13 +6288,23 @@ class Plexus(EventMixin):
         is preserved and a hot impersonation or a denied-assertion flood cannot
         spam the stream. (A burst that fully STOPS leaves its final count unflushed
         until the next emit for that key; the deferred background sweep would flush
-        it -- same tail tradeoff as the reject-log suppression.) Keyed on the
-        asserted NAME (not the caller-supplied id, which may be None and would
-        collapse distinct targets / grow the keyspace). Never raises (best-effort):
-        a suppression-state fault must not break the gate.
+        it -- same tail tradeoff as the reject-log suppression.) Never raises
+        (best-effort): a suppression-state fault must not break the gate.
+
+        Suppression key = ``(real.uuid, asserted-name-or-None, denied)``. The
+        asserted NAME is kept ONLY on the ALLOW path, where it is operator-bounded
+        (a grant + a genuine chain frame / an explicit-list entry), so distinct
+        legitimate impersonations are tracked separately. On the DENY path the
+        name is CALLER-SUPPLIED and unbounded (an in-process plugin can vary it
+        every call), so it is dropped from the key -- otherwise a distinct-name
+        flood would mint a fresh key per call and escape both the window
+        suppression AND the keyspace bound. All of ``real``'s denied assertions
+        therefore collapse to ONE suppressed stream (the useful signal: "real keeps
+        attempting assertions it cannot make"); the first emit still carries the
+        actual name + reason, and ``suppressed`` carries the volume.
         """
         try:
-            key = (real.uuid, asserted_author, denied)
+            key = (real.uuid, None if denied else asserted_author, denied)
             now = time.monotonic()
             st = self._identity_audit_log.get(key)
             if st is not None and (now - st["last_emit"]) < IDENTITY_AUDIT_WINDOW:
@@ -6320,10 +6330,13 @@ class Plexus(EventMixin):
                 ts=time.time(),
             )
             self._identity_audit_log[key] = {"last_emit": now, "suppressed": 0}
-            # Bound the keyspace (caller-supplied deny names): when it grows past
-            # the cap, drop stale (window-elapsed) entries. A stale entry only
-            # exists to carry its count to a NEXT emit that, for an inactive key,
-            # never comes -- same tail tradeoff as the burst-then-stop case.
+            # Keyspace safety net. With the deny-path name stripped from the key
+            # above, the keyspace is config-bounded (one deny key per real plugin;
+            # allow keys bounded by grants / chain depth), so this prune is no
+            # longer load-bearing against a flood -- it just drops stale
+            # (window-elapsed) entries if the dict ever grows past the cap. A stale
+            # entry only exists to carry its count to a NEXT emit that, for an
+            # inactive key, never comes -- same tail tradeoff as burst-then-stop.
             if len(self._identity_audit_log) > _IDENTITY_AUDIT_MAX_KEYS:
                 for k, e in list(self._identity_audit_log.items()):
                     if (now - e["last_emit"]) >= IDENTITY_AUDIT_WINDOW:
