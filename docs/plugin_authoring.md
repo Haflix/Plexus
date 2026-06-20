@@ -7,7 +7,11 @@ the order an author meets them; reference details live in
 [api reference](./api_reference.md), [notifier](./notifier.md), and
 [configuration](./configuration.md).
 
-The shipped `copypasta/AveragePlugin/` is the running example.
+This guide builds a deliberately small example plugin step by step. The shipped
+`copypasta/` folder is a fuller, **runnable** version of the same patterns: a
+two-plugin demo (`SensorPlugin` + `AveragePlugin`) that also exercises rate
+limiting, capabilities, dependencies, and a sync generator. Launch it with
+`python copypasta/run_demo.py` and read `copypasta/README.md`.
 
 ---
 
@@ -313,7 +317,7 @@ Resolution behavior (at boot, after `get_plugins` and before
 ### Step 1 — minimal class
 
 ```python
-# copypasta/AveragePlugin/plugin.py
+# plugin.py
 from plexus.utils import Plugin
 from plexus.decorators import log_errors, async_log_errors
 
@@ -333,7 +337,7 @@ class AveragePlugin(Plugin):
 ```
 
 ```yaml
-# copypasta/AveragePlugin/plugin_config.yml
+# plugin_config.yml
 description: Example plugin
 version: 1.0.0
 remote: false
@@ -765,11 +769,16 @@ more — do NOT use them in new code:
 
 ---
 
-## Full example: AveragePlugin assembled
+## Full example: the tutorial plugin assembled
 
-A single copy-paste reference combining all seven steps.
+A single copy-paste reference combining all seven steps above. This is the small
+teaching plugin built in this guide. The shipped `copypasta/AveragePlugin/` is a
+fuller version of it -- it adds a self-declared `rate_limits:` block, a capability
+assertion, a sync method + a sync generator, a `dependencies:` block, and endpoint
+tags, and pairs with `SensorPlugin` in the runnable demo. Open those files or run
+`python copypasta/run_demo.py` to see them.
 
-`copypasta/AveragePlugin/plugin.py`:
+`plugin.py`:
 
 ```python
 from plexus.utils import Plugin
@@ -817,11 +826,11 @@ class AveragePlugin(Plugin):
             yield f"Item {i + 1} of {count}"
 ```
 
-`copypasta/AveragePlugin/plugin_config.yml`:
+`plugin_config.yml`:
 
 ```yaml
 description: Example plugin demonstrating the Plexus plugin structure
-version: 1.2.0
+version: 1.0.0
 remote: True
 arguments:
 

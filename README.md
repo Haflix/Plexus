@@ -89,11 +89,14 @@ cp config.example.yml config.yml
 A plugin lives in its own folder containing exactly two files: `plugin.py`
 (the class) and `plugin_config.yml` (declarative metadata).
 
-The shipped example (`copypasta/AveragePlugin/`) demonstrates every moving
-part: lifecycle hooks, a regular endpoint, a streaming endpoint, a
-cross-plugin call, and a topic-subscribed endpoint.
+Here is a minimal plugin showing the moving parts: lifecycle hooks, a regular
+endpoint, a streaming endpoint, a cross-plugin call, and a topic-subscribed
+endpoint. The shipped `copypasta/` folder has a fuller, **runnable** version of
+these patterns (a two-plugin demo that also covers rate limiting and
+capabilities); run it with `python copypasta/run_demo.py` and see
+[`copypasta/README.md`](copypasta/README.md).
 
-### `copypasta/AveragePlugin/plugin.py` (excerpt)
+### A minimal `plugin.py`
 
 ```python
 from plexus.utils import Plugin
@@ -138,11 +141,11 @@ class AveragePlugin(Plugin):
             yield f"Item {i + 1} of {count}"
 ```
 
-### `copypasta/AveragePlugin/plugin_config.yml`
+### The matching `plugin_config.yml`
 
 ```yaml
 description: Example plugin demonstrating the Plexus plugin structure
-version: 1.2.0
+version: 1.0.0
 remote: True
 arguments:
 
@@ -200,50 +203,42 @@ endpoints:
         description: Event object received from the topic
 ```
 
-### Register and run
+### Run it
 
-Add the plugin to `config.yml`:
+The `copypasta/` folder ships a runnable version of these patterns. From the repo
+root:
+
+```bash
+python copypasta/run_demo.py
+```
+
+It registers two plugins (`SensorPlugin` + `AveragePlugin`), wires them together,
+and drives a scripted scenario: readings published as events flow into a running
+average, an on-demand cross-plugin `execute()`, a capability assertion, and the
+rate limiter rejecting once a bucket is dry.
+
+To register a plugin in your own app, add it to `config.yml` and launch
+`main_application.py`:
 
 ```yaml
 plugins:
-  - name: AveragePlugin
+  - name: YourPlugin
     enabled: true
-    path: ./copypasta/AveragePlugin
+    path: ./path/to/YourPlugin
 ```
 
-Then launch:
-
-```bash
-python main_application.py
-```
-
-`Plexus` will load and enable AveragePlugin. From any other plugin you
-can now call:
+From any other plugin you can then call an endpoint, or fire an event the plugin
+declares:
 
 ```python
-result = await self.execute("AveragePlugin", "example_method", args=21)
-# -> 42
+result = await self.execute("YourPlugin", "some_method", args=...)
 
-async for chunk in self.execute_stream("AveragePlugin", "example_stream", args=3):
-    print(chunk)
-```
-
-To fire the topic that AveragePlugin is subscribed to, the publishing
-plugin declares the event in its own `plugin_config.yml`:
-
-```yaml
-events:
-  greet:
-    topic: "example/event"
-```
-
-```python
-count = await self.publish_event("greet", payload={"hello": "world"})
+count = await self.publish_event("some_event", payload={"hello": "world"})
 # count == number of subscribers the dispatch was scheduled for
 ```
 
-That is the entire surface to write something useful. The rest is just
-more endpoints, more events, more subscriptions.
+That is the entire surface to write something useful. The rest is just more
+endpoints, more events, more subscriptions.
 
 ---
 
