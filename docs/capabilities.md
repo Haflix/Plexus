@@ -1,6 +1,6 @@
 # Capabilities and Caller Identity
 
-*Last updated for Plexus 0.62.0*
+*Last updated for Plexus 0.66.0*
 
 Every call in Plexus carries a **caller identity**: the framework knows which
 plugin initiated each operation and the chain of plugins it passed through.
@@ -64,8 +64,9 @@ gate can read the true caller.
 
 ## How a plugin asserts an identity
 
-`Plugin.execute()` (and the event methods) take optional `author` and `author_id`
-arguments. Passing them is how a plugin claims an identity for the operation:
+`Plugin.execute()` (and its `execute_sync` / `execute_stream` /
+`execute_stream_sync` variants) take optional `author` and `author_id` arguments.
+Passing them is how a plugin claims an identity for the operation:
 
 ```python
 # Act as the user this orchestrator is serving:
@@ -90,6 +91,13 @@ grant:
 When the gate is inert (no grants configured), `author` / `author_id` are just
 routing labels with no privilege attached, the historical behavior.
 
+The event methods (`publish_event` / `request_event` / `request_event_stream`) do
+NOT take `author` / `author_id` — an event cannot itself assert an identity. They
+always fire under the publisher's own identity, but they INHERIT any assertion
+already active up the call chain: an event fired while an `execute` impersonation
+is in scope is charged and attributed to the asserted identity (including across
+the sync bridge).
+
 ---
 
 ## Rules the gate enforces
@@ -99,6 +107,10 @@ routing labels with no privilege attached, the historical behavior.
 - **No chaining.** An identity that was itself asserted cannot be used as the
   basis for a further assertion. You cannot launder a claim through a second hop:
   the gate reasons about the *real* caller chain, not a previously-asserted label.
+  This holds uniformly on the async and sync paths: an assertion that lands on a
+  synchronous endpoint which re-enters the bus (`execute_sync`, ...) carries the
+  asserted identity across the sync bridge, so the second hop is gated exactly as
+  it would be async.
 - **Ancestry is genuine.** The `ancestor` scope checks the real call chain that
   led to this operation, which the framework stamps at every plugin-to-plugin
   dispatch. A plugin cannot fabricate an ancestor it was not actually called
@@ -121,10 +133,18 @@ security log or alerting.
 
 To keep a hot impersonation or a probing flood of denied attempts from spamming
 the trail, these events are **window-suppressed** the same way rate-limit reject
-logs are: the first event per `(real caller, asserted identity, denied)` per ~10s
-window fires immediately, in-window repeats only increment a counter, and the next
-event after the window carries a `suppressed` count. An alerting consumer always
-sees the onset of a burst; the true volume is preserved across the active window.
+logs are: the first event per suppression key per ~10s window fires immediately,
+in-window repeats only increment a counter, and the next event after the window
+carries a `suppressed` count. The suppression key is
+`(real caller, asserted identity, denied)` on the ALLOW path, but on the DENY path
+the asserted name is dropped from the key (it becomes `(real caller, denied)`): a
+denied claim's asserted name is caller-supplied and unbounded, so an attacker
+varying it every call would otherwise mint a fresh key per attempt and escape
+suppression. Collapsing all of one caller's denied attempts into a single stream
+preserves the useful signal (this caller keeps attempting assertions it cannot
+make); the emitted payload still carries the actual asserted name and reason in
+every case, so only the dedup key changed. An alerting consumer always sees the
+onset of a burst; the true volume is preserved across the active window.
 
 ---
 

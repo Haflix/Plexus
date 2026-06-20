@@ -1,6 +1,6 @@
 # Plexus
 
-*Last updated for Plexus 0.46.0*
+*Last updated for Plexus 0.66.0*
 
 An async Python plugin framework with multi-node mTLS networking and pub/sub
 event routing. PyPI package: [`plexus-core`](https://pypi.org/project/plexus-core/).

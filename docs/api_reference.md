@@ -1,6 +1,6 @@
 # API Reference
 
-*Last updated for Plexus 0.62.0*
+*Last updated for Plexus 0.66.0*
 
 Reference manual for the public surface of `Plugin` (in `plexus.utils`) — the methods and attributes a plugin author calls from inside their own class. Methods on `Plexus` itself are covered at the end for tooling and harness authors.
 
@@ -352,7 +352,7 @@ All eight error-handling decorators live in `plexus.decorators`. They come in ma
 
 All decorators run a kind-check up front, so applying e.g. `@log_errors` to an `async def` raises `PluginTypeMismatchError` with a hint to use `@async_log_errors` instead.
 
-`log_errors`, `handle_errors`, `async_handle_errors`, `gen_log_errors`, and `async_gen_log_errors` accept the no-parens form (`@log_errors` works) — they detect the callable-instead-of-logger argument and rewrap. `async_log_errors` accepts both bare (`@async_log_errors`) and parens (`@async_log_errors()`) forms via the same dual-dispatch shim (added in C-162).
+All eight decorators accept the no-parens form (`@log_errors` works) — they detect the callable-instead-of-logger argument and rewrap. `async_log_errors` additionally accepts the parens form (`@async_log_errors()`) via the same dual-dispatch shim (added in C-162).
 
 **When to use which**
 

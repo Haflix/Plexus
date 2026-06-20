@@ -1,6 +1,6 @@
 # Rate Limiting
 
-*Last updated for Plexus 0.62.0*
+*Last updated for Plexus 0.66.0*
 
 Plexus has a built-in, multi-dimensional token-bucket rate limiter. It is
 **opt-in and off by default**: a node with no `rate_limits:` configured pays
@@ -96,10 +96,20 @@ the global cap.
 OUT charges attribute to the operation's *asserted identity* when impersonation
 is in play, otherwise to the calling plugin. If plugin `A` is granted the
 capability to act as `X` and asserts it, the `plugin_out` charge lands on `X`, not
-`A`. See [capabilities.md](./capabilities.md). Operations that originate from the
-framework itself (lifecycle hooks, system tasks) carry no plugin frame; they are
-**exempt** and skip the per-plugin OUT charge (the global `framework_in` still
-applies).
+`A`. See [capabilities.md](./capabilities.md).
+
+Two framework-origin cases differ:
+
+- **Lifecycle scope** (`on_load` / `on_enable` / `on_disable` and the calls they
+  make) is stamped *exempt* and skips the limiter entirely, `framework_in`
+  included, so a plugin's startup burst cannot rate-limit the boot sequence.
+  Framework-internal `_core/` events are likewise structurally exempt.
+- **System-origin / empty-chain** operations (a direct framework `execute`, a
+  remote re-entry) are NOT exempt. They carry no plugin frame, so there is no name
+  to key `plugin_out` on and the per-plugin OUT charge is simply skipped, but the
+  global `framework_in` DOES charge them. That is deliberate: `framework_in` is the
+  global backstop, and system-origin traffic should count against it so a runaway
+  system task cannot escape the global cap.
 
 ---
 
@@ -189,7 +199,7 @@ on where the bucket ran dry:
 - **OUT reject (the caller's attempt).** Raised as `RateLimitException` directly to
   the calling code, before the operation is dispatched. The message names the
   binding dimension and the remaining tokens, for example
-  `rate limit exceeded on plugin_out:SomeOrchestrator (0.000/50 tokens available, need 1)`.
+  `rate limit exceeded on plugin_out:SomeOrchestrator (0.000/50 tokens available, need 1.0)`.
 - **IN reject on a 1:1 call (`execute` / `request_event`).** Raised at the
   delivery site and surfaced to the caller through the normal request-error path,
   so the caller sees a `RequestException` whose message carries the rate-limit
