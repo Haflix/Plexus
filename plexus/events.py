@@ -58,6 +58,7 @@ from .runtime import (
     _held_permit,
     _sync_call_chain,
     current_caller_chain,
+    current_asserted_identity,
 )
 from .utils import (
     Event,
@@ -1319,6 +1320,7 @@ class EventMixin:
                 blocked_hosts,
                 _caller_chain=chain,
             ),
+            current_asserted_identity(),
         )
         future = asyncio.run_coroutine_threadsafe(
             _pub_coro,
@@ -1651,6 +1653,7 @@ class EventMixin:
                 timeout,
                 _caller_chain=chain,
             ),
+            current_asserted_identity(),
         )
         future = asyncio.run_coroutine_threadsafe(
             _req_coro,
@@ -2134,11 +2137,13 @@ class EventMixin:
             timeout,
             _caller_chain=chain,
         )
-        # Caller identity: capture the originating sync handler's IDENTITY
-        # once (constant across the stream); re-seated loop-side on each pull
-        # below so the open-charge (first __anext__) attributes to the right
-        # caller. Distinct from the flat cycle-detection `chain` above.
+        # Caller identity: capture the originating sync handler's IDENTITY +
+        # asserted identity ONCE (constant across the stream); re-seated loop-side
+        # on each pull below so the open-charge (first __anext__) attributes to the
+        # right caller and the no-chaining / impersonation attribution survive the
+        # bridge. Distinct from the flat cycle-detection `chain` above.
         _es_cap = current_caller_chain()
+        _es_asserted_cap = current_asserted_identity()
 
         try:
             while True:
@@ -2148,7 +2153,9 @@ class EventMixin:
                 # caller passed a per-stream budget, else a 60s default
                 # so a runaway handler can't deadlock the worker.
                 next_fut = asyncio.run_coroutine_threadsafe(
-                    self._with_caller_chain(_es_cap, async_gen.__anext__()),
+                    self._with_caller_chain(
+                        _es_cap, async_gen.__anext__(), _es_asserted_cap
+                    ),
                     self.main_event_loop,
                 )
                 next_timeout = (

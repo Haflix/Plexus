@@ -77,7 +77,7 @@ from plexus.ratelimiter import (  # noqa: E402
 
 from _test_helpers import CaseRecorder  # noqa: E402
 
-SUITE_VERSION = "0.9.0"
+SUITE_VERSION = "0.10.0"
 SUITE = "TestRateLimitSuite"
 TARGET = "TestRateLimitTarget"
 
@@ -116,6 +116,19 @@ class TestRateLimitSuite(Plugin):
         otherwise re-wrap a handler error as a plain RequestException."""
         try:
             await self.execute(target, method)
+            return {"rate_limited": False}
+        except RateLimitException as e:
+            return {"rate_limited": True, "msg": str(e)}
+
+    @async_log_errors
+    async def _rl_drive_as(self, target: str = None, method: str = None,
+                           author: str = None, author_id: str = None) -> Dict[str, Any]:
+        """Like ``_rl_drive`` but ASSERTS ``author``/``author_id`` on the nested
+        execute, so a granted impersonation charges plugin_out(ASSERTED) at the
+        inner OUT admit. Runs one dispatch deep so this suite is the real caller
+        frame the gate sees."""
+        try:
+            await self.execute(target, method, author=author, author_id=author_id)
             return {"rate_limited": False}
         except RateLimitException as e:
             return {"rate_limited": True, "msg": str(e)}
@@ -185,6 +198,8 @@ class TestRateLimitSuite(Plugin):
             await self._case_out_event_out(rec, kw)
             await self._case_out_lifecycle_exempt(rec, kw)
             await self._case_out_asserted_attribution(rec, kw)
+            await self._case_out_asserted_attribution_e2e(rec, kw)
+            await self._case_out_multi_dim_order(rec, kw)
             # Step 3d -- IN admit.
             await self._case_in_endpoint_in(rec, kw)
             await self._case_in_plugin_in(rec, kw)
@@ -556,6 +571,79 @@ class TestRateLimitSuite(Plugin):
                     "chain caller"
                 )
         await rec.run_case("ratelimit.out_asserted_attribution", body, **kw)
+
+    async def _case_out_asserted_attribution_e2e(self, rec, kw):
+        async def body(c):
+            px = self._plexus
+            # END-TO-END complement to out_asserted_attribution (which pokes
+            # _rl_admit_out directly): a REAL granted impersonating execute must
+            # charge plugin_out(ASSERTED), not plugin_out(the caller). The suite
+            # impersonates the real TARGET plugin (the asserted identity must be a
+            # loaded plugin -- the dispatch resolves the effective author); only
+            # plugin_out(TARGET) is configured, so a live execute(author=TARGET)
+            # routed through the gate must reject on plugin_out:TARGET after the
+            # budget -- proving the asserted identity flows gate -> OUT admit
+            # through real dispatch, and is NOT charged to the SUITE caller.
+            self._apply({(DIM_PLUGIN_OUT, TARGET): {"max": 3, "window": 1000}})
+            await px._rebuild_charge_sets()
+            target_uuid = px.plugins[TARGET].plugin_uuid
+            orig_grants = px._capability_grants
+            orig_cap = px._capability_active
+            px._capability_grants = {SUITE: {"impersonation": [TARGET]}}
+            px._recompute_capability_active()
+            try:
+                results, msgs = [], []
+                for _ in range(4):
+                    m = await self.execute(
+                        SUITE, "_rl_drive_as",
+                        args={"target": SUITE, "method": "ep_a",
+                              "author": TARGET, "author_id": target_uuid},
+                    )
+                    results.append(m["rate_limited"])
+                    if m["rate_limited"]:
+                        msgs.append(m.get("msg", ""))
+                if results != [False, False, False, True]:
+                    raise AssertionError(
+                        f"impersonating execute must charge plugin_out({TARGET}) "
+                        f"and reject the 4th; got {results}"
+                    )
+                if not msgs or f"plugin_out:{TARGET}" not in msgs[0]:
+                    raise AssertionError(
+                        f"reject must name plugin_out:{TARGET} (the asserted "
+                        f"identity), not the caller; got {msgs!r}"
+                    )
+            finally:
+                px._capability_grants = orig_grants
+                px._capability_active = orig_cap
+        await rec.run_case("ratelimit.out_asserted_attribution_e2e", body, **kw)
+
+    async def _case_out_multi_dim_order(self, rec, kw):
+        async def body(c):
+            px = self._plexus
+            # Pinned admit order (Section 5): plugin_out, event_out, framework_in.
+            # Configure all THREE for a publish, each max 1. The first publish
+            # drains all three; the second finds all dry -- admit must report the
+            # PINNED-FIRST dry dimension (plugin_out), not event_out/framework_in.
+            self._apply({
+                (DIM_PLUGIN_OUT, SUITE): {"max": 1, "window": 1000},
+                (DIM_EVENT_OUT, event_key(SUITE, "ev_x")): {"max": 1, "window": 1000},
+                (DIM_FRAMEWORK_IN, FRAMEWORK_IN_KEY): {"max": 1, "window": 1000},
+            })
+            await px._rebuild_charge_sets()
+            await self.publish_event("ev_x", {"n": 1})  # drains all three
+            msg = None
+            try:
+                await self.publish_event("ev_x", {"n": 1})
+            except RateLimitException as e:
+                msg = str(e)
+            if msg is None:
+                raise AssertionError("second publish (all dims dry) must reject")
+            if "plugin_out:" not in msg:
+                raise AssertionError(
+                    f"multi-dim reject must name the pinned-FIRST dry dim "
+                    f"(plugin_out), got {msg!r}"
+                )
+        await rec.run_case("ratelimit.out_multi_dim_order", body, **kw)
 
     async def _case_in_endpoint_in(self, rec, kw):
         async def body(c):

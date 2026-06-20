@@ -37,7 +37,7 @@ from plexus.decorators import async_log_errors, log_errors  # noqa: E402
 from _test_helpers import CaseRecorder  # noqa: E402
 
 
-SUITE_VERSION = "0.3.0"
+SUITE_VERSION = "0.4.0"
 ACTOR = "TestCapabilityActor"
 ACTOR2 = "TestCapabilityActor2"
 
@@ -97,6 +97,8 @@ class TestCapabilitySuite(Plugin):
             await self._case_impersonation_no_grant(rec, kw)
             await self._case_ancestor_allow(rec, kw)
             await self._case_no_chaining_deny(rec, kw)
+            await self._case_no_chaining_sync_deny(rec, kw)
+            await self._case_no_chaining_stream_sync_deny(rec, kw)
             await self._case_self_call_passthrough(rec, kw)
             await self._case_sync_gated(rec, kw)
             await self._case_stream_async_gated(rec, kw)
@@ -210,6 +212,67 @@ class TestCapabilitySuite(Plugin):
                     f"deny reason should be no-chaining, got {inner!r}"
                 )
         await rec.run_case("capability.no_chaining.deny", body, **kw)
+
+    async def _case_no_chaining_sync_deny(self, rec, kw):
+        async def body(c):
+            # Regression for the sync-bridge _asserted_identity mirror. Same shape
+            # as no_chaining.deny, but the impersonated target is a SYNC endpoint
+            # (try_reassert_sync) that re-enters the bus via execute_sync. The
+            # worker cannot see the _asserted_identity ContextVar; WITHOUT the
+            # mirror the assertion is lost loop-side and the inner system claim is
+            # wrongly ALLOWED; WITH it, the active ACTOR2 impersonation propagates
+            # across the bridge and no-chaining DENIES the system claim.
+            self._set_grants(
+                {ACTOR: {"system_caller": True, "impersonation": "ancestor"}}
+            )
+            actor2_uuid = self._plexus.plugins[ACTOR2].plugin_uuid
+            spec = {
+                "plugin": ACTOR, "method": "do_assert",
+                "args": {"target": ACTOR, "method": "try_reassert_sync",
+                         "author": ACTOR2, "author_id": actor2_uuid},
+            }
+            outer = await self.execute(ACTOR2, "relay", args={"spec": spec})
+            inner = outer.get("result") if isinstance(outer, dict) else None
+            if not isinstance(inner, dict) or inner.get("outcome") != "denied":
+                raise AssertionError(
+                    f"sync no-chaining must deny the inner reassert (the asserted "
+                    f"identity must survive the sync bridge), got {outer!r}"
+                )
+            if "no-chaining" not in (inner.get("reason") or ""):
+                raise AssertionError(
+                    f"sync deny reason should be no-chaining, got {inner!r}"
+                )
+        await rec.run_case("capability.no_chaining.sync_deny", body, **kw)
+
+    async def _case_no_chaining_stream_sync_deny(self, rec, kw):
+        async def body(c):
+            # Same regression for the STREAM producer's asserted-identity seed: the
+            # impersonated target is a SYNC GENERATOR (try_reassert_stream_sync)
+            # reached via execute_stream; its body re-enters via execute_sync. The
+            # stream producer must seed _asserted_identity onto the worker, else the
+            # inner system claim is wrongly allowed. do_assert_stream_first returns
+            # the generator's first yielded chunk (the inner gate result).
+            self._set_grants(
+                {ACTOR: {"system_caller": True, "impersonation": "ancestor"}}
+            )
+            actor2_uuid = self._plexus.plugins[ACTOR2].plugin_uuid
+            spec = {
+                "plugin": ACTOR, "method": "do_assert_stream_first",
+                "args": {"target": ACTOR, "method": "try_reassert_stream_sync",
+                         "author": ACTOR2, "author_id": actor2_uuid},
+            }
+            outer = await self.execute(ACTOR2, "relay", args={"spec": spec})
+            chunk = outer.get("chunk") if isinstance(outer, dict) else None
+            if not isinstance(chunk, dict) or chunk.get("outcome") != "denied":
+                raise AssertionError(
+                    f"sync-stream no-chaining must deny the inner reassert (the "
+                    f"stream producer must seed the asserted identity), got {outer!r}"
+                )
+            if "no-chaining" not in (chunk.get("reason") or ""):
+                raise AssertionError(
+                    f"sync-stream deny reason should be no-chaining, got {chunk!r}"
+                )
+        await rec.run_case("capability.no_chaining.stream_sync_deny", body, **kw)
 
     async def _case_self_call_passthrough(self, rec, kw):
         async def body(c):

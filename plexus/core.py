@@ -109,6 +109,11 @@ from .runtime import (  # noqa: F401  (re-export shim)
     _asserted_identity,
     evaluate_capability,
     asserted_identity_scope,
+    # Sync-bridge mirror of the asserted identity (parallel to the chain mirror).
+    _sync_asserted_identity,
+    current_asserted_identity,
+    seeded_sync_asserted,
+    establish_asserted_identity,
 )
 from .ratelimiter import (
     RateLimiter,
@@ -5725,9 +5730,10 @@ class Plexus(EventMixin):
             # under cancel mid-finally.
             self.requests.pop(request.id, None)
 
-    async def _with_caller_chain(self, chain, coro):
-        """Caller identity: re-seat a worker-captured caller chain onto the
-        loop for ``coro``'s lifetime (the sync-bridge handoff).
+    async def _with_caller_chain(self, chain, coro, asserted=None):
+        """Caller identity: re-seat a worker-captured caller chain (and the active
+        asserted identity) onto the loop for ``coro``'s lifetime (the sync-bridge
+        handoff).
 
         A plugin's sync handler carries its identity in the _sync_identity_chain
         threadlocal; that threadlocal is invisible once a sync mirror bridges
@@ -5735,11 +5741,20 @@ class Plexus(EventMixin):
         mirror captures ``current_caller_chain()`` worker-side and passes it
         here so the loop-side dispatch attributes to the originating handler,
         not an empty caller. No-op when the captured chain is empty (identity
-        off, or a non-plugin top-level sync caller -- nothing to attribute)."""
-        if not chain:
+        off, or a non-plugin top-level sync caller -- nothing to attribute).
+
+        ``asserted`` is the worker-captured active impersonation identity
+        (``current_asserted_identity()``); it is re-seated OUTSIDE the chain
+        establish so the no-chaining gate + impersonation OUT attribution survive
+        a sync-endpoint re-entry even when the chain is empty. None (the default,
+        and what the ungated constructors pass) is a no-op."""
+        if not chain and asserted is None:
             return await coro
-        with establish_caller_chain(chain):
-            return await coro
+        with establish_asserted_identity(asserted):
+            if not chain:
+                return await coro
+            with establish_caller_chain(chain):
+                return await coro
 
     def _seed_sync_hook(self, fn, seed):
         """Caller identity: wrap a bare sync callable (a lifecycle hook
@@ -6379,6 +6394,10 @@ class Plexus(EventMixin):
             if _id_active else None
         )
         _sync_seed = seeded_sync_chain(_id_active, ident)
+        # Mirror the active asserted identity across the bridge too (the chain
+        # alone does not carry the no-chaining gate state / impersonation OUT
+        # attribution). Gated on the same _id_active as the chain seed.
+        _sync_asserted = seeded_sync_asserted(_id_active)
 
         # Step 3d: IN (delivery) admit, the single choke point for non-stream
         # dispatch (execute + event handlers; streams have their own producers).
@@ -6423,12 +6442,16 @@ class Plexus(EventMixin):
                 _sync_call_chain.chain = call_chain
                 if _sync_seed is not None:
                     _sync_identity_chain.chain = _sync_seed
+                if _sync_asserted is not None:
+                    _sync_asserted_identity.value = _sync_asserted
                 try:
                     return func(ev)
                 finally:
                     _sync_call_chain.chain = ()
                     if _sync_seed is not None:
                         _sync_identity_chain.chain = ()
+                    if _sync_asserted is not None:
+                        _sync_asserted_identity.value = None
 
             return await self.main_event_loop.run_in_executor(
                 self.sync_dispatcher.executor, _tracked_event, event
@@ -6450,12 +6473,16 @@ class Plexus(EventMixin):
             _sync_call_chain.chain = call_chain
             if _sync_seed is not None:
                 _sync_identity_chain.chain = _sync_seed
+            if _sync_asserted is not None:
+                _sync_asserted_identity.value = _sync_asserted
             try:
                 return func(*a, **kw)
             finally:
                 _sync_call_chain.chain = ()
                 if _sync_seed is not None:
                     _sync_identity_chain.chain = ()
+                if _sync_asserted is not None:
+                    _sync_asserted_identity.value = None
 
         if isinstance(args, tuple):
             return await self.main_event_loop.run_in_executor(
@@ -6618,6 +6645,9 @@ class Plexus(EventMixin):
                     if _stream_active else None
                 )
                 _stream_seed = seeded_sync_chain(_stream_active, _stream_ident)
+                # Mirror the asserted identity for a sync-gen endpoint under
+                # impersonation (same reason as _call_endpoint).
+                _stream_asserted = seeded_sync_asserted(_stream_active)
 
                 if asyncio.iscoroutinefunction(func):
                     await self._set_gen_request_result(
@@ -6715,12 +6745,16 @@ class Plexus(EventMixin):
                         _sync_call_chain.chain = ch
                         if _stream_seed is not None:
                             _sync_identity_chain.chain = _stream_seed
+                        if _stream_asserted is not None:
+                            _sync_asserted_identity.value = _stream_asserted
                         try:
                             return next(g, sent)
                         finally:
                             _sync_call_chain.chain = ()
                             if _stream_seed is not None:
                                 _sync_identity_chain.chain = ()
+                            if _stream_asserted is not None:
+                                _sync_asserted_identity.value = None
 
                     sentinel = object()
                     while True:
@@ -6924,6 +6958,9 @@ class Plexus(EventMixin):
                 if _es_active else None
             )
             _es_seed = seeded_sync_chain(_es_active, _es_ident)
+            # Mirror the asserted identity for a sync-gen event-stream handler
+            # under impersonation (same reason as _call_endpoint).
+            _es_asserted = seeded_sync_asserted(_es_active)
 
             if inspect.isasyncgenfunction(func):
                 ait = func(event_meta).__aiter__()
@@ -7006,12 +7043,16 @@ class Plexus(EventMixin):
                     _sync_call_chain.chain = ch
                     if _es_seed is not None:
                         _sync_identity_chain.chain = _es_seed
+                    if _es_asserted is not None:
+                        _sync_asserted_identity.value = _es_asserted
                     try:
                         return next(g, sent)
                     finally:
                         _sync_call_chain.chain = ()
                         if _es_seed is not None:
                             _sync_identity_chain.chain = ()
+                        if _es_asserted is not None:
+                            _sync_asserted_identity.value = None
 
                 try:
                     while True:
@@ -7524,7 +7565,9 @@ class Plexus(EventMixin):
                 call_chain=chain + (target,),
             )
             future = asyncio.run_coroutine_threadsafe(
-                self._with_caller_chain(current_caller_chain(), _exec_coro),
+                self._with_caller_chain(
+                    current_caller_chain(), _exec_coro, current_asserted_identity()
+                ),
                 self.main_event_loop,
             )
             # R2-FF-1: bound the worker-thread wait — see create_request_sync.
@@ -7917,9 +7960,12 @@ class Plexus(EventMixin):
             request_id,
             _post_construct_hook=_stamp_chain,
         )
-        # Caller identity: re-seat the worker-captured caller chain loop-side so
-        # the gate reads the originating handler as the real caller.
-        coro = self._with_caller_chain(current_caller_chain(), coro)
+        # Caller identity: re-seat the worker-captured caller chain + asserted
+        # identity loop-side so the gate reads the originating handler as the real
+        # caller and the no-chaining / impersonation attribution survive the bridge.
+        coro = self._with_caller_chain(
+            current_caller_chain(), coro, current_asserted_identity()
+        )
         # R2-FF-1: bound the construction wait — see create_request_sync.
         request_timeout = timeout[0] if isinstance(timeout, tuple) else timeout
         wait_timeout = (request_timeout + 5.0) if isinstance(request_timeout, (int, float)) else 60.0

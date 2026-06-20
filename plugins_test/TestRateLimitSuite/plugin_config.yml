@@ -1,5 +1,5 @@
 description: Rate-limit charge-set precompute + OUT/IN/inbound-admit + config-load + observability integration suite (Steps 3b/3c/3d/3e/4/5)
-version: "0.9.0"
+version: "0.10.0"
 remote: false
 arguments:
 events:
@@ -45,6 +45,16 @@ endpoints:
     arguments:
       - name: target
       - name: method
+  _rl_drive_as:
+    internal_name: _rl_drive_as
+    remote: false
+    accessible_by_other_plugins: true
+    description: Like _rl_drive but asserts author/author_id (impersonation attribution e2e case)
+    arguments:
+      - name: target
+      - name: method
+      - name: author
+      - name: author_id
   ep_stream:
     internal_name: ep_stream
     remote: false

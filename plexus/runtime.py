@@ -180,6 +180,16 @@ def seeded_sync_chain(active: bool, ident: "CallerIdentity"):
 
 _asserted_identity: ContextVar = ContextVar("_aio_asserted_identity", default=None)
 
+# Sync-bridge mirror of ``_asserted_identity`` (parallel to ``_sync_identity_chain``
+# for the caller chain). A pool worker cannot see the ContextVar, so the active
+# assertion is seeded into this threadlocal at the sync-endpoint dispatch and read
+# back (``current_asserted_identity``) by the sync mirror when the endpoint body
+# re-enters the bus, then re-seated loop-side onto the ContextVar across the bridge.
+# Without it, a sync-endpoint re-entry under an active impersonation loses the
+# assertion: the no-chaining gate is bypassed and the OUT charge mis-attributes.
+# None = not seeded / no active assertion (the chain's None-skip convention).
+_sync_asserted_identity = threading.local()
+
 
 class CapabilityVerdict(NamedTuple):
     """Outcome of ``evaluate_capability``.
@@ -330,6 +340,51 @@ def establish_caller_chain(chain: tuple):
         yield
     finally:
         _caller_chain.reset(token)
+
+
+def current_asserted_identity():
+    """The active asserted (impersonation) identity, or None.
+
+    Reads the sync threadlocal when this thread is a pool worker running a seeded
+    sync handler (the ContextVar is invisible there); otherwise the async
+    ContextVar. Mirrors ``current_caller_chain``. Used worker-side by the sync
+    mirrors to capture the assertion active at the originating dispatch, so it can
+    be re-seated loop-side across the bridge.
+    """
+    v = getattr(_sync_asserted_identity, "value", None)
+    if v is not None:
+        return v
+    return _asserted_identity.get()
+
+
+def seeded_sync_asserted(active: bool):
+    """The asserted identity to seed a sync worker's threadlocal with: the value
+    active at dispatch. Returns None when identity is off (the dispatch wrapper
+    then skips the write -- zero overhead off) AND, harmlessly, when active with no
+    impersonation (the worker read falls through to the ContextVar's None either
+    way). Call on the loop thread at dispatch. Mirrors ``seeded_sync_chain``.
+    """
+    if not active:
+        return None
+    return _asserted_identity.get()
+
+
+@contextmanager
+def establish_asserted_identity(ident: "Optional[CallerIdentity]"):
+    """Re-seat a worker-captured asserted identity onto the loop ContextVar for a
+    bridged coroutine's lifetime (the sync-bridge handoff). Mirrors
+    ``establish_caller_chain``. A no-op when ``ident`` is None: the freshly-bridged
+    coroutine runs in a loop context whose ``_asserted_identity`` is already None,
+    so "no active assertion" needs no install (and skipping avoids a needless
+    set/reset)."""
+    if ident is None:
+        yield
+        return
+    token = _asserted_identity.set(ident)
+    try:
+        yield
+    finally:
+        _asserted_identity.reset(token)
 
 
 # ── Phase 2b: deadlock-free sync bridge (native, stdlib-only) ──────────

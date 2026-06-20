@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from typing import Any, Dict, Optional  # noqa: E402
 
 from plexus.utils import Plugin  # noqa: E402
-from plexus.decorators import async_log_errors, log_errors  # noqa: E402
+from plexus.decorators import async_log_errors, gen_log_errors, log_errors  # noqa: E402
 from plexus.exceptions import CapabilityException  # noqa: E402
 
 
@@ -124,6 +124,55 @@ class TestCapabilityActor(Plugin):
             ):
                 pass
             return {"outcome": "ok"}
+        except CapabilityException as e:
+            return {"outcome": "denied", "reason": str(e)}
+
+    @log_errors
+    def try_reassert_sync(self, value: Any = None) -> dict:
+        # SYNC twin of try_reassert. Reached as the target of an ALLOWED
+        # impersonation, this SYNC endpoint runs on a worker thread. It re-enters
+        # via execute_sync attempting a DIFFERENT assertion (system) -> no-chaining
+        # must DENY. This denies ONLY if _asserted_identity was MIRRORED across the
+        # sync bridge (the worker cannot see the ContextVar); without the mirror
+        # the assertion is lost loop-side and the system claim is wrongly allowed.
+        try:
+            r = self.execute_sync(
+                self.plugin_name, "echo", author="system", author_id="system"
+            )
+            return {"outcome": "ok", "result": r}
+        except CapabilityException as e:
+            return {"outcome": "denied", "reason": str(e)}
+
+    @gen_log_errors
+    def try_reassert_stream_sync(self, value: Any = None):
+        # SYNC-GENERATOR twin. Reached as the target of an ALLOWED impersonation
+        # via execute_stream, this sync generator runs on a worker thread (the
+        # stream producer's _next_with_chain). It re-enters via execute_sync
+        # attempting a DIFFERENT assertion -> no-chaining must DENY, proving the
+        # STREAM producer mirrors _asserted_identity onto the worker. Yields its
+        # own gate result for the suite to read.
+        try:
+            self.execute_sync(
+                self.plugin_name, "echo", author="system", author_id="system"
+            )
+            yield {"outcome": "ok"}
+        except CapabilityException as e:
+            yield {"outcome": "denied", "reason": str(e)}
+
+    @async_log_errors
+    async def do_assert_stream_first(
+        self, target: str, method: str, author: str, author_id: str
+    ) -> dict:
+        # Like do_assert_stream but RETURNS the first yielded chunk, so a sync-gen
+        # target can report its OWN nested gate result back to the suite. The
+        # `author` assertion is what establishes the impersonation the inner
+        # reassert must be blocked from chaining off.
+        try:
+            async for chunk in self.execute_stream(
+                target, method, author=author, author_id=author_id
+            ):
+                return {"outcome": "ok", "chunk": chunk}
+            return {"outcome": "ok", "chunk": None}
         except CapabilityException as e:
             return {"outcome": "denied", "reason": str(e)}
 

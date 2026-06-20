@@ -1,5 +1,5 @@
 description: Capability-gate fixture — makes asserting execute calls to drive the gate
-version: "0.1.3"
+version: "0.1.4"
 remote: false
 arguments:
 endpoints:
@@ -69,6 +69,30 @@ endpoints:
     remote: false
     accessible_by_other_plugins: true
     description: Prove execute_stream is lazy (gate fires only on iteration)
+    arguments:
+      - name: target
+      - name: method
+      - name: author
+      - name: author_id
+  try_reassert_sync:
+    internal_name: try_reassert_sync
+    remote: false
+    accessible_by_other_plugins: true
+    description: Sync endpoint that re-enters via execute_sync under an active assertion (sync no-chaining proof)
+    arguments:
+      - name: value
+  try_reassert_stream_sync:
+    internal_name: try_reassert_stream_sync
+    remote: false
+    accessible_by_other_plugins: true
+    description: Sync generator that re-enters via execute_sync under an active assertion (sync-stream no-chaining proof)
+    arguments:
+      - name: value
+  do_assert_stream_first:
+    internal_name: do_assert_stream_first
+    remote: false
+    accessible_by_other_plugins: true
+    description: Like do_assert_stream but returns the first yielded chunk (so a sync-gen target reports its nested gate result)
     arguments:
       - name: target
       - name: method
