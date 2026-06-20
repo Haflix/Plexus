@@ -77,7 +77,7 @@ from plexus.ratelimiter import (  # noqa: E402
 
 from _test_helpers import CaseRecorder  # noqa: E402
 
-SUITE_VERSION = "0.10.0"
+SUITE_VERSION = "0.11.0"
 SUITE = "TestRateLimitSuite"
 TARGET = "TestRateLimitTarget"
 
@@ -589,6 +589,7 @@ class TestRateLimitSuite(Plugin):
             target_uuid = px.plugins[TARGET].plugin_uuid
             orig_grants = px._capability_grants
             orig_cap = px._capability_active
+            orig_id = px._identity_active  # _recompute_capability_active flips this on
             px._capability_grants = {SUITE: {"impersonation": [TARGET]}}
             px._recompute_capability_active()
             try:
@@ -615,6 +616,7 @@ class TestRateLimitSuite(Plugin):
             finally:
                 px._capability_grants = orig_grants
                 px._capability_active = orig_cap
+                px._identity_active = orig_id
         await rec.run_case("ratelimit.out_asserted_attribution_e2e", body, **kw)
 
     async def _case_out_multi_dim_order(self, rec, kw):
@@ -631,6 +633,21 @@ class TestRateLimitSuite(Plugin):
             })
             await px._rebuild_charge_sets()
             await self.publish_event("ev_x", {"n": 1})  # drains all three
+            # All three MUST be dry now, else the pin-order check below is vacuous
+            # (plugin_out would bind first merely by being the only dry/configured
+            # dim). Assert the multi-dry precondition the case is meant to test.
+            for dim, key in (
+                (DIM_PLUGIN_OUT, SUITE),
+                (DIM_EVENT_OUT, event_key(SUITE, "ev_x")),
+                (DIM_FRAMEWORK_IN, FRAMEWORK_IN_KEY),
+            ):
+                b = px._rate_limiter.get(dim, key)
+                if b is None or b.tokens >= 1:
+                    raise AssertionError(
+                        f"setup: {dim}:{key} must be dry after the first publish "
+                        f"(got {None if b is None else b.tokens}); the pin-order "
+                        f"assertion is only meaningful with ALL three dry"
+                    )
             msg = None
             try:
                 await self.publish_event("ev_x", {"n": 1})

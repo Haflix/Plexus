@@ -1,5 +1,5 @@
 description: Rate-limit charge-set precompute + OUT/IN/inbound-admit + config-load + observability integration suite (Steps 3b/3c/3d/3e/4/5)
-version: "0.10.0"
+version: "0.11.0"
 remote: false
 arguments:
 events:
