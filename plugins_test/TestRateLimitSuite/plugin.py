@@ -23,6 +23,9 @@ Cases (3b):
   charge-set is built on subscribe; unsubscribe tears it down.
 - teardown_sub_bucket: _rl_teardown_sub removes the Sub-IN bucket + the entry.
 - empty_config: a default node has empty side-tables and _rate_limits_active False.
+- empty_config_prunes_orphans: empty config + a NON-empty limiter (last declared-only
+  limit removed) prunes the orphan bucket and turns _rate_limits_active off (the
+  early-return must not skip the prune).
 - idempotent: rebuilding twice does not double the attachments.
 - orphan_prune: a static bucket for a non-loaded plugin is pruned on rebuild.
 
@@ -74,7 +77,7 @@ from plexus.ratelimiter import (  # noqa: E402
 
 from _test_helpers import CaseRecorder  # noqa: E402
 
-SUITE_VERSION = "0.8.0"
+SUITE_VERSION = "0.9.0"
 SUITE = "TestRateLimitSuite"
 TARGET = "TestRateLimitTarget"
 
@@ -173,6 +176,7 @@ class TestRateLimitSuite(Plugin):
             await self._case_runtime_sub_fallback(rec, kw, runtime_subs)
             await self._case_teardown_sub_bucket(rec, kw)
             await self._case_empty_config(rec, kw)
+            await self._case_empty_config_prunes_orphans(rec, kw)
             await self._case_idempotent(rec, kw)
             await self._case_orphan_prune(rec, kw)
             # Step 3c -- OUT admit (end-to-end through real dispatch).
@@ -359,6 +363,30 @@ class TestRateLimitSuite(Plugin):
             if px._rate_limits_active:
                 raise AssertionError("empty config must leave _rate_limits_active False")
         await rec.run_case("ratelimit.empty_config", body, **kw)
+
+    async def _case_empty_config_prunes_orphans(self, rec, kw):
+        async def body(c):
+            # Regression: a rebuild with EMPTY config but a NON-empty limiter
+            # (the last plugin-declared-only limit was just removed on unload)
+            # must fall through to the prune, not early-return -- else the orphan
+            # static bucket leaks and _rate_limits_active stays pinned True.
+            px = self._plexus
+            self._apply({}, {})  # fresh empty limiter + empty config
+            # Simulate a bucket left behind by a now-removed declared-only plugin.
+            px._rate_limiter.configure(DIM_PLUGIN_OUT, "GhostPlugin", 5, 1)
+            if len(px._rate_limiter) != 1:
+                raise AssertionError("setup: ghost bucket must exist before rebuild")
+            await px._rebuild_charge_sets()
+            if px._rate_limiter.get(DIM_PLUGIN_OUT, "GhostPlugin") is not None:
+                raise AssertionError(
+                    "empty config + non-empty limiter must PRUNE the orphan static "
+                    "bucket (the early-return must not skip the prune)"
+                )
+            if px._rate_limits_active:
+                raise AssertionError(
+                    "_rate_limits_active must be False once the last bucket is pruned"
+                )
+        await rec.run_case("ratelimit.empty_config_prunes_orphans", body, **kw)
 
     async def _case_idempotent(self, rec, kw):
         async def body(c):

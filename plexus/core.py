@@ -5833,8 +5833,11 @@ class Plexus(EventMixin):
             params = self._rate_limit_config_declared.get((dim, key))
         if params is None:
             return None
+        # reset_stream_weight: the rebuild re-registers stream weights from
+        # scratch right after, so a reload that lowers a stream_weight + its
+        # bucket max must not be rejected by the stale grow-only floor.
         return self._rate_limiter.configure(
-            dim, key, params["max"], params["window"]
+            dim, key, params["max"], params["window"], reset_stream_weight=True
         )
 
     def _rl_build_sub(self, sub) -> None:
@@ -5859,7 +5862,8 @@ class Plexus(EventMixin):
                 )
             if scfg is not None:
                 sub_b = self._rate_limiter.configure(
-                    DIM_SUB_IN, sub.sub_uuid, scfg["max"], scfg["window"]
+                    DIM_SUB_IN, sub.sub_uuid, scfg["max"], scfg["window"],
+                    reset_stream_weight=True,
                 )
                 # 3d fold-in: if the sub's TARGET endpoint is a stream, register
                 # its weight against the Sub-IN bucket too. A streaming
@@ -5934,8 +5938,17 @@ class Plexus(EventMixin):
             or self._rate_limit_sub_config
             or self._rate_limit_config_declared
             or self._rate_limit_sub_config_declared
-        ):
-            # Zero-overhead-off: nothing configured, nothing to build.
+        ) and len(self._rate_limiter) == 0:
+            # Zero-overhead-off: nothing configured AND no buckets to tear down.
+            # The `len == 0` guard is load-bearing: when nothing is configured but
+            # the limiter STILL holds buckets from a prior config (e.g. the last
+            # plugin-declared-only limit was just removed on unload/reload), we
+            # must NOT short-circuit -- the prune loop below is the ONLY remover of
+            # static buckets, so skipping it would leak them AND pin
+            # _rate_limits_active True (len > 0). Falling through with empty config
+            # leaves `wanted`/`wanted_subs` empty, so the prune drops every static
+            # + Sub-IN bucket (Nodes-IN is intentionally never pruned), and the
+            # master switch then recomputes honestly.
             self._recompute_rate_limits_active()
             return
 
@@ -6121,32 +6134,6 @@ class Plexus(EventMixin):
             return None
         return self._rate_limiter.admit(cs, cost, now)
 
-    def _rl_build_reject_str(self, dry, cost=1.0, loc=None):
-        """Build the RateLimitException message for a dry bucket returned by an
-        admit. Reverse-maps the bucket to its dimension/key (Bucket carries no
-        identity) and folds dimension/key + remaining tokens + the binding cost
-        into the message, so the throttle reason round-trips through the
-        request/future boundary as a string. ``cost`` is 1.0 for the OUT/non-stream
-        IN path and the stream_weight for a stream open, so a weight-rejected
-        stream is legible. ``loc`` may be passed pre-resolved by the caller to
-        avoid a second ``locate`` scan (``_rl_reject_message`` does this); when
-        None it is resolved here so the builder stays callable standalone.
-
-        PURE: no side effect. ``_rl_reject_message`` is the logging wrapper around
-        this; any future caller that needs the string for a NON-reject reason
-        (introspection, a dry-run) uses this builder directly and emits no WARNING.
-        """
-        # locate() can only miss if the bucket was unregistered between the admit
-        # and here; that cannot happen loop-side (no await between), but fall back
-        # to a clear label rather than a bare object repr.
-        if loc is None:
-            loc = self._rate_limiter.locate(dry)
-        where = f"{loc[0]}:{loc[1]}" if loc is not None else "(unregistered bucket)"
-        return (
-            f"rate limit exceeded on {where} "
-            f"({dry.tokens:.3f}/{dry.max:.0f} tokens available, need {cost})"
-        )
-
     def _rl_log_reject(self, dry, loc=None) -> None:
         """Step 5: emit a SUPPRESSED WARNING for a rejected bucket. First reject
         per (dim, key) per ``RL_REJECT_LOG_WINDOW`` logs; further rejects in the
@@ -6189,16 +6176,28 @@ class Plexus(EventMixin):
         # else: in-window -> suppressed; Bucket.rejected already carries it.
 
     def _rl_reject_message(self, dry, cost=1.0):
-        """Logging wrapper: emit the suppressed reject WARNING (Step 5) and return
-        the round-trip reject string (Step 3). Every message-building reject site
-        (the raising ``_rl_reject`` + the stream producers + the networking
-        handlers) already calls this exactly once per reject, so the WARNING fires
-        once per reject without each site needing its own log call. The bucket
-        identity is resolved ONCE here and shared with both helpers so the reject
-        path does a single ``locate`` scan, not two."""
+        """Emit the suppressed reject WARNING (Step 5) and return the round-trip
+        reject string (Step 3): reverse-map the dry bucket to its dimension/key
+        (Bucket carries no identity) and fold dimension/key + remaining tokens +
+        the binding cost into a message that survives the request/future boundary
+        as a string. ``cost`` is 1.0 for the OUT/non-stream IN path and the
+        stream_weight for a stream open, so a weight-rejected stream is legible.
+
+        Every message-building reject site (the raising ``_rl_reject`` + the stream
+        producers + the networking handlers) calls this exactly once per reject, so
+        the WARNING fires once without each site needing its own log call. The
+        bucket identity is resolved ONCE here and shared with ``_rl_log_reject`` so
+        the reject path does a single ``locate`` scan, not two."""
         loc = self._rate_limiter.locate(dry)
         self._rl_log_reject(dry, loc)
-        return self._rl_build_reject_str(dry, cost, loc)
+        # locate() can only miss if the bucket was unregistered between the admit
+        # and here; that cannot happen loop-side (no await between), but fall back
+        # to a clear label rather than a bare object repr.
+        where = f"{loc[0]}:{loc[1]}" if loc is not None else "(unregistered bucket)"
+        return (
+            f"rate limit exceeded on {where} "
+            f"({dry.tokens:.3f}/{dry.max:.0f} tokens available, need {cost})"
+        )
 
     def _rl_reject(self, dry, cost=1.0):
         """Raise ``RateLimitException`` for a dry bucket. OUT callers keep calling

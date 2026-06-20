@@ -143,8 +143,20 @@ class Bucket:
             self.tokens = min(self.max, self.tokens + elapsed * self.rate)
             self.last = now
 
-    def reconfigure(self, max_tokens, window) -> None:
+    def reconfigure(self, max_tokens, window,
+                    reset_stream_weight: bool = False) -> None:
         _validate(max_tokens, window, "reconfigure")
+        # The charge-set rebuild reconfigures a bucket and then RE-REGISTERS every
+        # stream endpoint's weight against it in the SAME pass, so by the time it
+        # reconfigures, the old grow-only max_stream_weight is stale (about to be
+        # replaced). A rebuild that legitimately LOWERS both a stream_weight and
+        # the bucket max must therefore clear the floor FIRST (reset_stream_weight
+        # =True), else the guard below would reject the new (lower) max against the
+        # stale (higher) weight even though the new weight fits. Direct live-tuning
+        # callers keep the default (False): lowering max below an ACTIVE registered
+        # weight is a real config error (the stream could then never open).
+        if reset_stream_weight:
+            self.max_stream_weight = 0.0
         if float(max_tokens) < self.max_stream_weight:
             raise ConfigException(
                 f"rate limit reconfigure: max {max_tokens} < registered "
@@ -189,8 +201,15 @@ class RateLimiter:
         self._buckets: Dict[Tuple[str, str], Bucket] = {}
 
     def configure(self, dimension: str, key: str, max_tokens, window,
-                  now: Optional[float] = None) -> Bucket:
-        """Create the bucket for ``(dimension, key)``, or reconfigure it live."""
+                  now: Optional[float] = None,
+                  reset_stream_weight: bool = False) -> Bucket:
+        """Create the bucket for ``(dimension, key)``, or reconfigure it live.
+
+        ``reset_stream_weight`` is forwarded to ``Bucket.reconfigure``: the
+        charge-set rebuild passes True (it re-registers stream weights from
+        scratch right after), live single-bucket tuning leaves it False to keep
+        the lower-max-below-active-weight guard. Ignored when the bucket is new
+        (a fresh Bucket starts with no stream-weight floor)."""
         _validate(max_tokens, window, f"{dimension}:{key}")
         if now is None:
             now = time.monotonic()
@@ -199,7 +218,7 @@ class RateLimiter:
             b = Bucket(max_tokens, window, now)
             self._buckets[(dimension, key)] = b
             return b
-        existing.reconfigure(max_tokens, window)
+        existing.reconfigure(max_tokens, window, reset_stream_weight)
         return existing
 
     def get(self, dimension: str, key: str) -> Optional[Bucket]:

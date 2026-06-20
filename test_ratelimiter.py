@@ -151,6 +151,30 @@ def test_stream_weight():
           be.max_stream_weight == 3.0)
 
 
+def test_reconfigure_reset_stream_weight():
+    # Regression: the charge-set REBUILD reconfigures a bucket and then
+    # RE-REGISTERS stream weights from scratch in the same pass. A reload that
+    # legitimately LOWERS both a stream_weight and the bucket max must not be
+    # rejected by the stale grow-only floor. reset_stream_weight=True (what the
+    # rebuild passes) clears the floor first; the default keeps the live-tuning
+    # guard (covered by test_stream_weight above).
+    br = Bucket(12, 1, 0.0)
+    br.register_stream_weight(10)                    # floor now 10, max 12
+    # default reconfigure still rejects lowering max below the active weight
+    check("reset_stream_weight: default still guards (max<weight rejected)",
+          raises_config(lambda: br.reconfigure(5, 1)))
+    # rebuild flow: reset clears the stale floor so the lower max is accepted
+    br.reconfigure(5, 1, reset_stream_weight=True)
+    check("reset_stream_weight: clears the stale floor", br.max_stream_weight == 0.0)
+    check("reset_stream_weight: applies the lowered max", br.max == 5.0)
+    br.register_stream_weight(2)                     # rebuild re-registers new weight
+    check("reset_stream_weight: new lower weight re-registers fine",
+          br.max_stream_weight == 2.0)
+    # the per-registration guard still catches a genuinely over-weight stream
+    check("reset_stream_weight: over-max weight still rejected at registration",
+          raises_config(lambda: br.register_stream_weight(9)))
+
+
 # ── RateLimiter registry: configure / get / remove / live reconfigure ──
 def test_key_helpers():
     check("key: endpoint_key joins plugin:access",
@@ -346,6 +370,7 @@ if __name__ == "__main__":
         test_admit_refill_mid_charge, test_fractional_cost, test_reconfigure,
         test_reconfigure_rate_effect, test_backward_now_is_noop,
         test_admit_cost_guard, test_stream_weight,
+        test_reconfigure_reset_stream_weight,
         test_registry, test_locate, test_config_validation, test_counters,
         test_stats, test_key_helpers, test_charge_set,
     ]
