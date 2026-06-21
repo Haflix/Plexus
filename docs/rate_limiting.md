@@ -239,8 +239,13 @@ stream open always costs 1.
   exception message, so "why was this blocked?" is always one line.
 - **Per-bucket counters.** Each bucket tracks lifetime `charged` and `rejected`
   counts. `RateLimiter.stats()` returns a snapshot list of
-  `{dim, key, charged, rejected, tokens, max}` records, the read surface for a
-  metrics exporter or a dashboard.
+  `{dim, key, charged, rejected, tokens, max, last, rate}` records, the read
+  surface for a metrics exporter or a dashboard. `stats()` does NOT refill, so
+  `tokens` is the raw last-committed value; `last` (the bucket's last-refill
+  timestamp) and `rate` (tokens/sec) let a display layer refill-for-show without
+  mutating the bucket: `min(max, tokens + (now - last) * rate)`. `last` is
+  process-monotonic, so a reader compares it against `time.monotonic()`, not
+  wall-clock.
 - **Reject-log suppression.** A runaway caller hitting a cap thousands of times a
   second would otherwise emit thousands of WARNING lines. Instead, the first
   reject per `(dimension, key)` per ~10s window logs a WARNING; further rejects in
@@ -248,6 +253,18 @@ stream open always costs 1.
   one-line summary of how many were suppressed. The counters carry the true
   volume; the logs carry the signal. The capability gate's security audit events
   are de-duplicated the same way (see [capabilities.md](./capabilities.md)).
+- **Reject event (`_core/ratelimit/rejected`).** To consume rejects
+  programmatically (a live dashboard, a metrics sink), observe the internal-bus
+  topic `_core/ratelimit/rejected` via `internal_observe`. It fires on the SAME
+  first-per-window gate as the WARNING above (one emit per `(dimension, key)` per
+  window, so a reject flood cannot spam the bus), and the emit fast-paths out when
+  no observer is registered. Payload:
+  `{dim, key, tokens, max, cost, suppressed, ts}` — `cost` is the binding charge
+  (1.0, or the `stream_weight` for a stream open), `suppressed` is the count of
+  in-window rejects collapsed into this emit, and `ts` is wall-clock
+  (`time.time()`). This mirrors the capability gate's
+  `_core/security/identity_asserted` audit event (see
+  [capabilities.md](./capabilities.md)).
 
 ---
 
