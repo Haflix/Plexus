@@ -219,6 +219,7 @@ class TestRateLimitSuite(Plugin):
             # Step 5 -- observability (reject-log suppression + stats()).
             await self._case_reject_log_suppression(rec, kw)
             await self._case_stats_snapshot(rec, kw)
+            await self._case_reject_event_emit(rec, kw)
             # Step 6 -- coverage sweep (local gap: Framework-IN charged once per
             # 1:N publish, NOT once per delivered sub).
             await self._case_framework_in_fanout_once(rec, kw)
@@ -1144,9 +1145,75 @@ class TestRateLimitSuite(Plugin):
                     f"stats() must report max=2 and drained tokens=0; "
                     f"got max={fw['max']} tokens={fw['tokens']}"
                 )
+            # Section 13: stats() also exposes last + rate for refill-for-show.
+            if "last" not in fw or "rate" not in fw:
+                raise AssertionError(
+                    f"stats() must expose last+rate; got keys {sorted(fw)}"
+                )
+            if fw["rate"] != 2.0 / 1000.0:
+                raise AssertionError(
+                    f"stats() rate must be max/window (=0.002); got {fw['rate']}"
+                )
             if oks != 2 or rejects != 2:
                 raise AssertionError(f"expected 2 admit + 2 reject; got {oks}/{rejects}")
         await rec.run_case("ratelimit.stats_snapshot", body, **kw)
+
+    async def _case_reject_event_emit(self, rec, kw):
+        async def body(c):
+            px = self._plexus
+            # Section 13: the _core/ratelimit/rejected bus emit rides the SAME
+            # first-per-window gate as the reject WARNING -- one emit on the
+            # first reject, in-window repeats suppressed (NO emit), and the
+            # post-window emit carries the suppressed count. Same driver as
+            # reject_log_suppression, asserting the event instead of the log.
+            self._apply({(DIM_FRAMEWORK_IN, FRAMEWORK_IN_KEY): {"max": 1, "window": 1000}})
+            await px._rebuild_charge_sets()
+            px._rl_reject_log.clear()
+            loc = (DIM_FRAMEWORK_IN, FRAMEWORK_IN_KEY)
+
+            events = []
+
+            def _obs(topic, payload):
+                events.append(dict(payload))
+
+            self.internal_observe("_core/ratelimit/rejected", _obs)
+            try:
+                await self.execute(TARGET, "sink")        # admit (1 -> 0)
+                for _ in range(3):                        # 3 in-window rejects
+                    try:
+                        await self.execute(TARGET, "sink")
+                    except RateLimitException:
+                        pass
+                if len(events) != 1:
+                    raise AssertionError(
+                        f"first reject must emit exactly ONE event (next 2 "
+                        f"suppressed); got {len(events)}: {events}"
+                    )
+                ev = events[0]
+                if ev.get("dim") != loc[0] or ev.get("key") != loc[1]:
+                    raise AssertionError(f"event must name the binding bucket; got {ev}")
+                for field in ("tokens", "max", "cost", "suppressed", "ts"):
+                    if field not in ev:
+                        raise AssertionError(f"event payload missing {field!r}; got {ev}")
+                if ev["suppressed"] != 0 or ev["max"] != 1.0 or ev["cost"] != 1.0:
+                    raise AssertionError(
+                        f"first emit must carry suppressed=0/max=1/cost=1; got {ev}"
+                    )
+                # Force the window to elapse, then one more reject -> a 2nd emit
+                # carrying the 2 in-window rejects it collapsed.
+                events.clear()
+                px._rl_reject_log[loc]["last_warn"] -= (RL_REJECT_LOG_WINDOW + 1.0)
+                try:
+                    await self.execute(TARGET, "sink")
+                except RateLimitException:
+                    pass
+                if len(events) != 1 or events[0].get("suppressed") != 2:
+                    raise AssertionError(
+                        f"post-window emit must carry suppressed=2; got {events}"
+                    )
+            finally:
+                self.internal_unobserve("_core/ratelimit/rejected", _obs)
+        await rec.run_case("ratelimit.reject_event_emit", body, **kw)
 
     async def _case_framework_in_fanout_once(self, rec, kw):
         async def body(c):

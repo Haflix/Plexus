@@ -6149,16 +6149,25 @@ class Plexus(EventMixin):
             return None
         return self._rate_limiter.admit(cs, cost, now)
 
-    def _rl_log_reject(self, dry, loc=None) -> None:
+    def _rl_log_reject(self, dry, loc=None, cost=1.0) -> None:
         """Step 5: emit a SUPPRESSED WARNING for a rejected bucket. First reject
         per (dim, key) per ``RL_REJECT_LOG_WINDOW`` logs; further rejects in the
         window are silent (the ``Bucket.rejected`` counter carries the volume);
         the next reject after the window emits a one-line summary of what was
         suppressed, then a fresh WARNING. Self-contained so it is callable from
         every reject path -- the message sites (via ``_rl_reject_message``, which
-        passes ``loc`` pre-resolved) AND the silent fire-and-forget peer-publish
-        drop in the networking layer (which passes no ``loc``). Never raises on
-        the reject path (a logging fault must not mask a throttle).
+        passes ``loc`` pre-resolved and the binding ``cost``) AND the silent
+        fire-and-forget peer-publish drop in the networking layer (which passes
+        no ``loc``). Never raises on the reject path (a logging fault must not
+        mask a throttle).
+
+        The SAME first-per-window gate drives the ``_core/ratelimit/rejected``
+        internal-bus emit (Section 13, the observability seam mirroring the
+        identity-audit feed): one emit per (dim, key) per window, carrying the
+        ``suppressed`` count of the rejects collapsed since the last emit, so a
+        reject flood cannot spam the bus (and costs ~nothing when no observer is
+        registered -- the emit fast-paths out). Emit is best-effort: a bus fault
+        must not mask the throttle.
         """
         if loc is None:
             loc = self._rate_limiter.locate(dry)
@@ -6170,6 +6179,7 @@ class Plexus(EventMixin):
         now = time.monotonic()
         st = self._rl_reject_log.get(loc)
         if st is None or (now - st["last_warn"]) >= RL_REJECT_LOG_WINDOW:
+            suppressed = 0
             if st is not None:
                 # rejected_at_warn was dry.rejected AT the previous WARNING (which
                 # already included that warned reject); dry.rejected now includes
@@ -6188,6 +6198,23 @@ class Plexus(EventMixin):
                 where, dry.tokens, dry.max, RL_REJECT_LOG_WINDOW,
             )
             self._rl_reject_log[loc] = {"last_warn": now, "rejected_at_warn": dry.rejected}
+            # Best-effort observability emit on the SAME gate as the WARNING.
+            try:
+                self._internal_emit(
+                    "_core/ratelimit/rejected",
+                    dim=loc[0],
+                    key=loc[1],
+                    tokens=dry.tokens,
+                    max=dry.max,
+                    cost=cost,
+                    suppressed=max(0, suppressed),
+                    ts=time.time(),
+                )
+            except Exception:
+                self._logger.debug(
+                    "[RATELIMIT] reject-event emit failed for %s (swallowed)", where,
+                    exc_info=True,
+                )
         # else: in-window -> suppressed; Bucket.rejected already carries it.
 
     def _rl_reject_message(self, dry, cost=1.0):
@@ -6204,7 +6231,7 @@ class Plexus(EventMixin):
         bucket identity is resolved ONCE here and shared with ``_rl_log_reject`` so
         the reject path does a single ``locate`` scan, not two."""
         loc = self._rate_limiter.locate(dry)
-        self._rl_log_reject(dry, loc)
+        self._rl_log_reject(dry, loc, cost)
         # locate() can only miss if the bucket was unregistered between the admit
         # and here; that cannot happen loop-side (no await between), but fall back
         # to a clear label rather than a bare object repr.

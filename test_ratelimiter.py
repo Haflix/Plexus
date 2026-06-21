@@ -313,6 +313,29 @@ def test_stats():
     check("stats: untouched bucket full", er["tokens"] == 5.0 and er["charged"] == 0)
 
 
+def test_stats_last_rate_refill_for_show():
+    # stats() exposes `last` + `rate` so a display layer can refill-for-show
+    # WITHOUT mutating the bucket. Verify the fields are present, correct, and
+    # that the documented formula reconstructs the live level of an idle bucket.
+    rl = RateLimiter()
+    rl.configure(DIM_PLUGIN_IN, "P", 10, 2, now=100.0)   # rate = 10/2 = 5/s
+    pin = rl.get(DIM_PLUGIN_IN, "P")
+    rl.admit([pin], 4.0, 100.0)                          # tokens 10 -> 6 at t=100
+    rec = rl.stats()[0]
+    check("stats: last present", rec.get("last") == 100.0, f"last={rec.get('last')}")
+    check("stats: rate present", rec.get("rate") == 5.0, f"rate={rec.get('rate')}")
+    check("stats: raw tokens unrefilled", rec["tokens"] == 6.0, f"tokens={rec['tokens']}")
+    # refill-for-show at t=100.5 (idle 0.5s): 6 + 0.5*5 = 8.5, no mutation.
+    now = 100.5
+    live = min(rec["max"], rec["tokens"] + (now - rec["last"]) * rec["rate"])
+    check("stats: refill-for-show math", abs(live - 8.5) < 1e-9, f"live={live}")
+    check("stats: refill-for-show did NOT mutate bucket", pin.tokens == 6.0,
+          f"tokens={pin.tokens}")
+    # clamps at max: far-future read cannot exceed capacity.
+    live_far = min(rec["max"], rec["tokens"] + (1000.0 - rec["last"]) * rec["rate"])
+    check("stats: refill-for-show clamps at max", live_far == 10.0, f"live={live_far}")
+
+
 def test_admit_refill_mid_charge():
     # admit() must refill before peeking: a bucket too dry at t0 admits at t1
     # because time advanced. This is the runtime path; the bare refill() tests
@@ -372,7 +395,8 @@ if __name__ == "__main__":
         test_admit_cost_guard, test_stream_weight,
         test_reconfigure_reset_stream_weight,
         test_registry, test_locate, test_config_validation, test_counters,
-        test_stats, test_key_helpers, test_charge_set,
+        test_stats, test_stats_last_rate_refill_for_show,
+        test_key_helpers, test_charge_set,
     ]
     for t in tests:
         print(t.__name__)

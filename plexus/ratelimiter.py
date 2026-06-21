@@ -257,7 +257,14 @@ class RateLimiter:
         last-committed value, so ``stats`` has ZERO side effects and never mutates
         a bucket (an idle bucket may read lower than its true refilled level; a
         display layer can refill-for-show itself). ``charged`` / ``rejected`` are
-        the lifetime counters maintained by ``admit``."""
+        the lifetime counters maintained by ``admit``.
+
+        ``last`` (the monotonic timestamp of the bucket's last refill) and
+        ``rate`` (tokens/sec) are exposed so a display layer CAN do that
+        refill-for-show without mutating the bucket: the live level at read time
+        is ``min(max, tokens + (time.monotonic() - last) * rate)``. ``last`` is
+        process-monotonic (NOT wall-clock), so a reader must compare it against
+        ``time.monotonic()``, not ``time.time()``."""
         return [
             {
                 "dim": dim,
@@ -266,6 +273,8 @@ class RateLimiter:
                 "rejected": b.rejected,
                 "tokens": b.tokens,
                 "max": b.max,
+                "last": b.last,
+                "rate": b.rate,
             }
             for (dim, key), b in self._buckets.items()
         ]
