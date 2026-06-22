@@ -1,5 +1,5 @@
 description: Pure-function unit suite for plexus.dependencies (resolve, parse_dependencies)
-version: 0.1.0
+version: 0.1.1
 remote: false
 arguments:
 dependencies:

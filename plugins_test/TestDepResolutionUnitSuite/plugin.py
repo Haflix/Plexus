@@ -90,6 +90,7 @@ class TestDepResolutionUnitSuite(Plugin):
         await self._u17_cycle_wins_precedence(rec, kw)
         await self._u18_invalid_fallback_version(rec, kw)
         await self._u19_first_failure_wins(rec, kw)
+        await self._bug040_collect_all_failures(rec, kw)
         await self._u20_plexus_prerelease(rec, kw)
         await self._u21_plexus_only_deps(rec, kw)
 
@@ -100,6 +101,7 @@ class TestDepResolutionUnitSuite(Plugin):
         await self._p4_invalid_specifier(rec, kw)
         await self._p5_optional_not_bool(rec, kw)
         await self._p6_strip_whitespace(rec, kw)
+        await self._bug039_post_strip_collision(rec, kw)
         await self._p7_int_key_rejected(rec, kw)
         await self._p8_float_version_rejected(rec, kw)
         await self._p9_empty_inputs(rec, kw)
@@ -354,6 +356,33 @@ class TestDepResolutionUnitSuite(Plugin):
             tags=("resolve",), category="resolve", **kw
         )
 
+    async def _bug040_collect_all_failures(self, rec, kw):
+        # BUG-040 (R4-WW-14): resolve() collects ALL failing required deps for a
+        # plugin in ONE pass, not just the first ("first-failure-wins"). A plugin
+        # with two failing required deps must surface BOTH reasons joined under a
+        # "<N> failing deps:" count prefix, so an operator fixes every failing
+        # dep at once instead of restarting N times for N failures. (Distinct
+        # from resolve.plugin.first_failure_wins, which only checks one reason is
+        # present and so does not pin the collect-all behavior.)
+        async def body(c):
+            deps = {
+                "A": [],
+                "C": [_spec("Missing1"), _spec("A", ">=99.0")],
+            }
+            r = resolve(deps, {"A": "1", "C": "1"}, "0.41.1")
+            assert "C" in r.failed, r.failed
+            reason = r.failed["C"]
+            # Both failing required deps reported in the single joined reason.
+            assert "Missing1" in reason, reason
+            assert "A" in reason and ">=99.0" in reason, reason
+            # The multi-failure count prefix proves collect-all (not first-wins).
+            assert reason.startswith("2 failing deps:"), reason
+
+        await rec.run_case(
+            "resolve.plugin.collect_all_failures", body,
+            tags=("resolve",), bug_ids=("BUG-040",), category="resolve", **kw
+        )
+
     async def _u20_plexus_prerelease(self, rec, kw):
         async def body(c):
             r = resolve(
@@ -450,6 +479,25 @@ class TestDepResolutionUnitSuite(Plugin):
         await rec.run_case(
             "parse.target.whitespace_stripped", body,
             tags=("parse", "shape"), category="parse", **kw
+        )
+
+    async def _bug039_post_strip_collision(self, rec, kw):
+        # BUG-039: parse_dependencies strips each target name, so two distinct
+        # raw keys that collide AFTER stripping ('Foo' and ' Foo ') would emit
+        # two specs under the same name with contradictory constraints and
+        # reason=None (silent accept). The post-strip collision must be rejected
+        # with a parse error naming the offending target.
+        async def body(c):
+            specs, field, reason = parse_dependencies(
+                {"Foo": {"version": ">=1.0"}, " Foo ": {"version": ">=2.0"}}
+            )
+            c.expect(specs, [])
+            c.expect(field, "Foo")
+            assert reason is not None and "duplicate" in reason, reason
+
+        await rec.run_case(
+            "parse.target.post_strip_collision_rejected", body,
+            tags=("parse", "shape"), bug_ids=("BUG-039",), category="parse", **kw
         )
 
     async def _p7_int_key_rejected(self, rec, kw):

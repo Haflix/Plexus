@@ -84,6 +84,7 @@ class TestRateLimiterUnitSuite(Plugin):
         await self._stream_weight(rec, kw)
         await self._reconfigure_reset_stream_weight(rec, kw)
         await self._reconfigure_rate_effect(rec, kw)
+        await self._bug036_idle_credit_old_rate(rec, kw)
         await self._backward_now_is_noop(rec, kw)
         # admit cases
         await self._admit_commit_all(rec, kw)
@@ -232,6 +233,30 @@ class TestRateLimiterUnitSuite(Plugin):
         await rec.run_case(
             "ratelimiter.reconfigure_rate_effect", body,
             tags=("ratelimiter", "bucket", "reconfigure", "refill"), category="bucket", **kw
+        )
+
+    async def _bug036_idle_credit_old_rate(self, rec, kw):
+        # BUG-036: a bucket that sat idle, then is reconfigured to a HIGHER rate,
+        # must credit the pre-reconfigure idle interval at the OLD rate and
+        # re-anchor `last` to `now` BEFORE swapping the rate -- so the new rate is
+        # NOT retro-applied to that idle interval. Drain at t=0, idle to t=50,
+        # reconfigure 0.1/s -> 10/s at t=50, then refill at the SAME instant t=50:
+        # the only credit is 50s of idle at the OLD 0.1/s rate (= 5 tokens). The
+        # bug retro-credited 50s at the NEW 10/s rate (= 500, clamped to max 10).
+        async def body(c):
+            b = Bucket(10, 100, now=0.0)    # rate 0.1/s
+            b.tokens = 0.0                  # drained at t=0; last still 0.0 (idle)
+            b.reconfigure(10, 1, now=50.0)  # -> 10/s; refill-at-old-rate + re-anchor
+            b.refill(now=50.0)              # same instant: 0s elapsed at the new rate
+            # 50s idle credited at OLD 0.1/s = 5 tokens; NOT 500 (clamped to 10).
+            assert abs(b.tokens - 5.0) < 1e-9, (
+                f"idle interval must credit at the OLD rate (5 tokens), got {b.tokens}"
+            )
+
+        await rec.run_case(
+            "ratelimiter.reconfigure_idle_credit_old_rate", body,
+            tags=("ratelimiter", "bucket", "reconfigure", "refill"),
+            bug_ids=("BUG-036",), category="bucket", **kw
         )
 
     async def _backward_now_is_noop(self, rec, kw):
