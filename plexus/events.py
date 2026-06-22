@@ -293,7 +293,7 @@ class EventMixin:
                     pass
             return count
 
-    def _internal_emit(self, topic: str, /, **payload: Any) -> None:
+    def _internal_emit(self, topic: str, /, **payload: Any) -> bool:
         """Fire ``topic`` to all registered observers synchronously.
 
         Module-level ``_EMIT_DEPTH`` ContextVar guards against pathological
@@ -350,7 +350,9 @@ class EventMixin:
         with lock:
             listeners = self._internal_observers.get(topic)
             if not listeners:
-                return
+                # BUG-017: no observers == completed no-op flush (nothing to
+                # suppress); True so the audit window advances normally.
+                return True
             snapshot = list(listeners)
         depth = _EMIT_DEPTH.get()
         if depth >= _MAX_EMIT_DEPTH:
@@ -362,7 +364,7 @@ class EventMixin:
                 topic,
                 _MAX_EMIT_DEPTH,
             )
-            return
+            return False  # BUG-017: dropped by depth guard — caller must NOT reset
         token = _EMIT_DEPTH.set(depth + 1)
         try:
             for cb in snapshot:
@@ -376,6 +378,7 @@ class EventMixin:
                     )
         finally:
             _EMIT_DEPTH.reset(token)
+        return True  # BUG-017: emitted to observers
 
     async def _register_yaml_subscriptions(self, plugin: Plugin) -> List[str]:
         """Register every YAML-declared subscription for ``plugin`` per
@@ -1033,7 +1036,7 @@ class EventMixin:
                     eff_hosts=eff_hosts,
                     eff_blocked_hosts=eff_blocked,
                 )
-                remote_count = sum(len(advs) for advs in per_peer.values())
+                remote_count = 0  # BUG-019: count only peers actually dispatched
 
                 tasks = []
                 for peer_hostname, advs in per_peer.items():
@@ -1048,6 +1051,7 @@ class EventMixin:
                     async with nm._adverts_struct_lock:
                         if not node.enabled:
                             continue
+                        remote_count += len(advs)  # BUG-019
                         t = asyncio.create_task(
                             nm.publish_event_remote(
                                 node.IP,
@@ -1498,7 +1502,7 @@ class EventMixin:
                     if node is None:
                         continue
                     try:
-                        if not (node.enabled and await node.is_alive()):
+                        if not (node.enabled and await node.is_alive(timeout=nm.liveness_timeout)):
                             continue
                     except Exception:
                         continue
@@ -1831,7 +1835,7 @@ class EventMixin:
                         if node is None:
                             continue
                         try:
-                            if not (node.enabled and await node.is_alive()):
+                            if not (node.enabled and await node.is_alive(timeout=nm.liveness_timeout)):
                                 continue
                         except Exception:
                             continue

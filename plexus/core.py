@@ -6441,7 +6441,7 @@ class Plexus(EventMixin):
             # (a re-entrant emit hitting the depth guard) or raises, the
             # accumulated `suppressed` count then survives to the next emit rather
             # than being reset away.
-            self._internal_emit(
+            emitted = self._internal_emit(
                 "_core/security/identity_asserted",
                 real_caller=real.name,
                 real_caller_id=real.uuid,
@@ -6453,7 +6453,11 @@ class Plexus(EventMixin):
                 suppressed=suppressed,
                 ts=time.time(),
             )
-            self._identity_audit_log[key] = {"last_emit": now, "suppressed": 0}
+            # BUG-017: only reset the window if the emit actually went out. On a
+            # depth-guard drop (emitted is False) the suppressed count survives
+            # to the next emit and the window is not advanced.
+            if emitted:
+                self._identity_audit_log[key] = {"last_emit": now, "suppressed": 0}
             # Keyspace safety net. With the deny-path name stripped from the key
             # above, the keyspace is config-bounded (one deny key per real plugin;
             # allow keys bounded by grants / chain depth), so this prune is no

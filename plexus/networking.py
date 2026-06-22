@@ -863,7 +863,22 @@ class NetworkManager:
             )
         else:
             ip, _, port_str = address.partition(":")
-            port = int(port_str) if port_str else port_default
+            if port_str:
+                try:
+                    port = int(port_str)  # BUG-021
+                except ValueError:
+                    raise RuntimeError(
+                        f"Peer {hostname} address {address!r}: port suffix "
+                        f"{port_str!r} is not a valid integer."
+                    )
+            else:
+                port = port_default
+        # BUG-022: range-validate the port at the branch convergence point.
+        if not (0 < port <= 65535):
+            raise RuntimeError(
+                f"Peer {hostname} address {address!r}: port {port} out of "
+                "range (must be 1-65535)."
+            )
         endpoint = (ip, port)
         if endpoint in seen_endpoints:
             raise RuntimeError(
@@ -1093,9 +1108,12 @@ class NetworkManager:
             # R2-CC-4: sender/receiver parity. Receiver paths use `>=` so the
             # sender must also reject at exactly MAX (the boundary value is
             # not a usable wire size if the peer will reject it).
-            if len(payload) >= MAX_MESSAGE_SIZE:
+            # BUG-020: gate on the wire length (len(payload)+1, the +1 type
+            # byte) — the SAME quantity every receiver checks — so a MAX-1
+            # payload isn't accepted here then dropped by the peer.
+            if len(payload) + 1 >= MAX_MESSAGE_SIZE:
                 raise ValueError(
-                    f"Message size {len(payload)} exceeds maximum {MAX_MESSAGE_SIZE}"
+                    f"Message size {len(payload) + 1} exceeds maximum {MAX_MESSAGE_SIZE}"
                 )
 
             # Format: [4-byte length][1-byte message_type][payload]
@@ -1564,7 +1582,9 @@ class NetworkManager:
                 )
 
         # Close all pooled connections (key is (ip, port))
-        for key, pool in self.connection_pools.items():
+        # BUG-023: snapshot items() so a concurrent _get_connection insert
+        # during the loop's awaits can't trip dict-changed-size-during-iteration.
+        for key, pool in list(self.connection_pools.items()):
             closed = 0
             while not pool.empty():
                 # R4-VV-9: separate pool.get() failures (-> break out of
@@ -4096,6 +4116,16 @@ class NetworkManager:
                     msg_type, chunk = await self._receive_message(reader)
                 except (TimeoutError, ConnectionError) as e:
                     raise NetworkRequestException(str(e))
+                except pickle.UnpicklingError as _e:
+                    # BUG-029: this path routes EVERY frame (incl. the result
+                    # chunk) through _receive_message's safe_loads, so use a
+                    # GENERIC non-allowlisted-class message (a non-Serializable
+                    # result, not only a MSG_ERROR exception, can trip this).
+                    raise NetworkRequestException(
+                        f"Remote node {IP} sent a non-allowlisted class: {_e}. "
+                        f"Allowlist it. Make custom exceptions inherit from "
+                        f"plexus.serialization.SerializableException."
+                    ) from _e
                 if msg_type == MSG_STREAM_CHUNK:
                     result = chunk
                     have_result = True
@@ -4484,7 +4514,13 @@ class NetworkManager:
                     outbound_now = self._outbound_adverts.get(peer_hostname)
                     if outbound_now is not None:
                         if kind == "add":
-                            outbound_now.pop(sub.sub_uuid, None)
+                            # BUG-026: restore the prior ack_timeout entry on a
+                            # failed re-arm (mirror the C-011 remove-path
+                            # restore); pop only a genuinely-new add.
+                            if existing is not None:
+                                outbound_now[sub.sub_uuid] = existing
+                            else:
+                                outbound_now.pop(sub.sub_uuid, None)
                         else:
                             # C-011: restore the prior AdvertSub captured
                             # before the delete above. Without this, the
@@ -6854,7 +6890,9 @@ class NetworkManager:
     @async_log_errors
     async def _enable_node(self, IP: str):
         self._logger.info(f"[NODE] Enabling node {IP}")
-        (await self._get_node(IP)).enabled = True
+        node = await self._get_node(IP)
+        if node is not None:  # BUG-008: _get_node returns None for unknown IP
+            node.enabled = True
 
     @async_log_errors
     async def _disable_node(self, IP: str):
