@@ -1,0 +1,24 @@
+description: Pure-function unit suite for the Bucket + RateLimiter core (refill math, admit, registry, stats)
+version: 0.1.0
+remote: false
+arguments:
+dependencies:
+endpoints:
+  run:
+    internal_name: run
+    remote: false
+    accessible_by_other_plugins: true
+    description: Run rate-limiter unit cases and return a suite result dict
+    arguments:
+      - name: category
+        description: 'bucket | admit | keys | registry | stats | null (all)'
+      - name: host
+        description: 'local | remote | null (all hosts)'
+      - name: case_ids
+        description: Filter cases within the suite
+      - name: bug_ids
+        description: Filter cases by bug tag
+      - name: skip_slow
+        description: Skip cases tagged slow
+      - name: allow_destructive
+        description: If False, destructive cases are skipped

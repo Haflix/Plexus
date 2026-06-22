@@ -16,6 +16,7 @@ _keys/
 bugtracker.md
 notes.txt
 .githooks/
+logs/
 
 # Distribution / packaging
 .Python
@@ -233,3 +234,4 @@ _keys_tui_smoke/
 # to verify findings against running code. Keep local; plugin authors don't
 # need them.
 plugins_test/audit_pilot/
+plugins_test/audit_2026_06/

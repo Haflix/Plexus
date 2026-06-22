@@ -165,6 +165,25 @@ plugins:
     enabled: true
     path: ./plugins_test/TestDepResolutionUnitSuite
 
+  # Pure-function unit suites ported from the former root-level test_*.py
+  # scripts (one suite, no scattered root tests). Each pairs with an
+  # integration suite (TestCapabilitySuite / TestIdentitySuite / TestRateLimitSuite).
+  - name: TestCapabilityUnitSuite
+    enabled: true
+    path: ./plugins_test/TestCapabilityUnitSuite
+
+  - name: TestIdentityUnitSuite
+    enabled: true
+    path: ./plugins_test/TestIdentityUnitSuite
+
+  - name: TestRateLimitConfigUnitSuite
+    enabled: true
+    path: ./plugins_test/TestRateLimitConfigUnitSuite
+
+  - name: TestRateLimiterUnitSuite
+    enabled: true
+    path: ./plugins_test/TestRateLimiterUnitSuite
+
   # Integration fixtures: A is v1.0.0 (so B's `>=1.0,<2.0` is exercised),
   # B required-deps A + plexus. Both expected to enable in order A then B.
   - name: TestDepResolutionA
