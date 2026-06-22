@@ -432,6 +432,13 @@ class NetworkManager:
         # broadcast hooks to no-op until peers can be reached.
         self.is_ready: bool = False
 
+        # BUG-024: dedicated shutdown flag. is_ready is False in TWO phases --
+        # pre-start AND post-stop -- so it cannot tell "starting up" from
+        # "shutting down". _stopping is set True ONLY at the top of stop(), so
+        # _get_connection's shutdown-abort guard fires during teardown without
+        # rejecting the legitimate connections established during startup.
+        self._stopping: bool = False
+
         # B-071: per-peer wire counters. Keyed by peer hostname; values are
         # flat dicts {bytes_sent, bytes_recv, msgs_sent, msgs_recv}. Entry
         # is pre-created at handshake-time stamp sites in _create_connection
@@ -1507,6 +1514,10 @@ class NetworkManager:
 
         # PR3 Stage C: flip ready flag FIRST so concurrent broadcast
         # hooks become no-ops (locked #18 step 15 guard).
+        # BUG-024: set the dedicated shutdown flag BEFORE is_ready so
+        # _get_connection's guard treats in-flight acquires as shutdown (abort)
+        # from this point on -- and ONLY from this point (not during startup).
+        self._stopping = True
         self.is_ready = False
 
         # Cancel background tasks first
@@ -5687,76 +5698,114 @@ class NetworkManager:
             f"empty={pool.empty()}"
         )
 
-        # Try to get from pool
-        if not pool.empty():
+        # Try to get from pool. BUG-025: bounded retry over pooled connections
+        # so several stale/unhealthy writers drain within ONE call instead of
+        # one-per-call (after a peer flap a pool can hold several stale writers).
+        # Bounded by pool_size so a pathological pool cannot make one acquire
+        # arbitrarily slow (each health-checked attempt costs a ping round-trip).
+        # BUG-024: each attempt tracks the writer in _checked_out_writers
+        # IMMEDIATELY after pool.get() (atomic, no await before the is_ready
+        # guard) so a concurrent stop() either closes it via its drain or this
+        # guard self-closes it -- the fd never leaks past stop(). getattr is
+        # defensive against test scaffolds that bypass __init__.
+        co = getattr(self, "_checked_out_writers", None)
+        attempts = 0
+        while not pool.empty() and attempts < self.pool_size:
+            attempts += 1
             try:
                 self._logger.debug(
                     f"[CONNECTION] Attempting to get connection from pool for {IP}"
                 )
                 reader, writer = await asyncio.wait_for(pool.get(), timeout=0.1)
-                self._logger.debug(
-                    f"[CONNECTION] Retrieved connection from pool for {IP}, performing health check"
-                )
-                # R4-VV-3 (revised): reject a writer pooled before the most
-                # recent _drop_peer_advert_state for this key. Its stamped
-                # generation is stale (socket may be to a now-flapped peer);
-                # close it and fall through to create a fresh connection
-                # rather than handing it out. Validated here (pull side) AND
-                # in _return_connection (return side).
-                if getattr(writer, "_aio_pool_generation", 0) != (
-                    self._pool_generation.get(key, 0)
-                ):
-                    self._logger.debug(
-                        f"[CONNECTION] Pooled connection to {IP} is stale "
-                        f"(peer drop bumped generation); discarding"
-                    )
-                    try:
-                        writer.close()
-                        await writer.wait_closed()
-                    except Exception:
-                        pass
-                    # fall through to "Create new connection" below
-                else:
-                    # Health check - try a ping
-                    try:
-                        await self._send_message(writer, MSG_PING, {})
-                        msg_type, _ = await asyncio.wait_for(
-                            self._receive_message(reader), timeout=2.0
-                        )
-                        if msg_type == MSG_RESULT:
-                            self._logger.debug(
-                                f"[CONNECTION] Pooled connection to {IP} is healthy"
-                            )
-                            # C-043: track checked-out writer for stop()
-                            # drain coverage. getattr defensive against
-                            # test scaffolds that bypass __init__.
-                            co = getattr(self, "_checked_out_writers", None)
-                            if co is not None:
-                                co.add(writer)
-                            return reader, writer
-                        else:
-                            # Connection is bad, close it
-                            self._logger.warning(
-                                f"[CONNECTION] Pooled connection to {IP} failed health check "
-                                f"(msg_type={msg_type}), closing"
-                            )
-                            writer.close()
-                            await writer.wait_closed()
-                    except Exception as e:
-                        # Connection is bad, close it and create new
-                        self._logger.warning(
-                            f"[CONNECTION] Pooled connection to {IP} failed health check: {e}, closing"
-                        )
-                        try:
-                            writer.close()
-                            await writer.wait_closed()
-                        except Exception:
-                            pass
             except asyncio.TimeoutError:
                 self._logger.debug(
                     f"[CONNECTION] Timeout getting connection from pool for {IP}"
                 )
-                pass
+                break
+
+            # BUG-024: track-immediately + is_ready guard. The add and the
+            # is_ready check are an atomic synchronous pair -- no await between
+            # pool.get() returning and the add, and none between the add and the
+            # check -- so they cannot interleave with stop(), which flips
+            # is_ready=False BEFORE it snapshots+clears _checked_out_writers. So
+            # either (i) this pair runs first and the writer is in the set when
+            # stop() drains it, or (ii) stop() already flipped is_ready and this
+            # guard self-closes + aborts. The writer is never handed out open.
+            if co is not None:
+                co.add(writer)
+            if getattr(self, "_stopping", False):
+                if co is not None:
+                    co.discard(writer)
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+                raise NetworkRequestException(
+                    "connection acquired during shutdown"
+                )
+
+            self._logger.debug(
+                f"[CONNECTION] Retrieved connection from pool for {IP}, performing health check"
+            )
+            # R4-VV-3 (revised): reject a writer pooled before the most recent
+            # _drop_peer_advert_state for this key. Its stamped generation is
+            # stale (socket may be to a now-flapped peer). BUG-025: `continue`
+            # to try the NEXT pooled connection rather than falling straight
+            # through to a fresh connect. Validated here (pull side) AND in
+            # _return_connection (return side).
+            if getattr(writer, "_aio_pool_generation", 0) != (
+                self._pool_generation.get(key, 0)
+            ):
+                self._logger.debug(
+                    f"[CONNECTION] Pooled connection to {IP} is stale "
+                    f"(peer drop bumped generation); discarding"
+                )
+                if co is not None:
+                    co.discard(writer)
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+                continue
+
+            # Health check - try a ping
+            try:
+                await self._send_message(writer, MSG_PING, {})
+                msg_type, _ = await asyncio.wait_for(
+                    self._receive_message(reader), timeout=2.0
+                )
+                if msg_type == MSG_RESULT:
+                    self._logger.debug(
+                        f"[CONNECTION] Pooled connection to {IP} is healthy"
+                    )
+                    # BUG-024: already tracked above (atomic add). Hand out.
+                    return reader, writer
+                else:
+                    # Connection is bad, close it and try the next pooled one.
+                    self._logger.warning(
+                        f"[CONNECTION] Pooled connection to {IP} failed health check "
+                        f"(msg_type={msg_type}), closing"
+                    )
+                    if co is not None:
+                        co.discard(writer)
+                    writer.close()
+                    await writer.wait_closed()
+                    continue
+            except Exception as e:
+                # Connection is bad, close it and try the next pooled one.
+                self._logger.warning(
+                    f"[CONNECTION] Pooled connection to {IP} failed health check: {e}, closing"
+                )
+                if co is not None:
+                    co.discard(writer)
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+                continue
 
         # Create new connection
         self._logger.debug(
@@ -5779,10 +5828,25 @@ class NetworkManager:
                     IP,
                 )
             raise
-        # C-043: track checked-out writer for stop() drain coverage.
+        # BUG-024: track-immediately + is_ready guard on the fresh-connect path
+        # too. There is no await between _create_connection returning and this
+        # add (the except above only runs on failure), so the add+check pair is
+        # atomic vs stop() -- same reasoning as the pooled path. Re-resolve co
+        # defensively in case the pooled loop never ran.
         co = getattr(self, "_checked_out_writers", None)
         if co is not None:
             co.add(writer)
+        if getattr(self, "_stopping", False):
+            if co is not None:
+                co.discard(writer)
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+            raise NetworkRequestException(
+                "connection acquired during shutdown"
+            )
         return reader, writer
 
     async def _return_connection(
