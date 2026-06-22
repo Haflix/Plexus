@@ -1140,9 +1140,16 @@ class TestRateLimitSuite(Plugin):
                     f"stats() must report charged=2/rejected=2 after 2 admits + 2 "
                     f"rejects; got charged={fw['charged']} rejected={fw['rejected']}"
                 )
-            if fw["max"] != 2.0 or fw["tokens"] != 0.0:
+            # tokens is "effectively drained" rather than exactly 0.0: stats()
+            # does a refill-for-show against time.monotonic(), so the few ms
+            # between the drain and this snapshot credit a microscopic amount
+            # (rate=0.002 tok/s -> ~3e-5 tokens for ~16ms of elapsed time).
+            # Assert a small tolerance so a correct drain never flakes; a real
+            # leftover (>= 1 token) still fails loudly (1e-3 tolerance = ~0.5s of
+            # slack at this rate, far below one token).
+            if fw["max"] != 2.0 or fw["tokens"] >= 1e-3:
                 raise AssertionError(
-                    f"stats() must report max=2 and drained tokens=0; "
+                    f"stats() must report max=2 and drained tokens~0 (<1e-3); "
                     f"got max={fw['max']} tokens={fw['tokens']}"
                 )
             # Section 13: stats() also exposes last + rate for refill-for-show.
