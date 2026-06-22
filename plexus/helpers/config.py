@@ -204,9 +204,11 @@ def _validate_topic_static(
 
     segments = stripped.split("/")
     for seg in segments:
-        if not seg:
+        if not seg.strip():
+            # BUG-041: reject empty AND whitespace-only segments (C20).
             raise ValueError(
-                f"{context}: empty middle segment in topic {topic!r} (C20)"
+                f"{context}: empty or whitespace-only segment in topic "
+                f"{topic!r} (C20)"
             )
         if "*" in seg:
             if not allow_wildcards:
@@ -374,7 +376,13 @@ def apply_overrides(
             if key in _STRICT_OVERRIDE_SECTIONS:
                 # Strict: every override subkey must exist in the base.
                 # Unknown subkey → fail-load (Q2).
-                unknown = [sk for sk in ov.keys() if sk not in base_dict]
+                # BUG-042: the __replace__ directive marker is not an entry
+                # name; exclude it so it reaches _deep_merge_args (strictness
+                # otherwise preserved — unknown endpoint names still rejected).
+                unknown = [
+                    sk for sk in ov.keys()
+                    if sk not in base_dict and sk != "__replace__"
+                ]
                 if unknown:
                     raise ValueError(
                         f"override section '{key}' references unknown "

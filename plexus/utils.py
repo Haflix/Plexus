@@ -1948,8 +1948,8 @@ class Plugin(ABC):
             timeout=timeout,
         )
 
-    @async_gen_log_errors
-    async def request_event_stream(
+    @log_errors
+    def request_event_stream(
         self,
         event_id: str,
         payload: Any = None,
@@ -1959,12 +1959,32 @@ class Plugin(ABC):
         timeout: Optional[float] = None,
     ):
         """Streaming variant of request_event."""
-        # C-084 + C-085 / R4-XX-6: pre-start guard at call-time, not at
-        # first ``__anext__`` — gives the caller an explicit
-        # RequestException immediately rather than waiting for the
-        # first iteration. ``_check_framework_started`` raises
-        # ``RequestException`` (see utils.py:_check_framework_started).
+        # BUG-043: this is a PLAIN method (not an async generator), so the
+        # pre-start guard fires at CALL time — the caller gets an explicit
+        # RequestException immediately rather than at first ``__anext__``.
+        # The streaming body lives in the @async_gen_log_errors inner method.
+        # Mirrors request_event_stream_sync. ``_check_framework_started``
+        # raises ``RequestException``.
         self._check_framework_started()
+        return self._request_event_stream_inner(
+            event_id,
+            payload=payload,
+            topic_vars=topic_vars,
+            hosts=hosts,
+            blocked_hosts=blocked_hosts,
+            timeout=timeout,
+        )
+
+    @async_gen_log_errors
+    async def _request_event_stream_inner(
+        self,
+        event_id: str,
+        payload: Any = None,
+        topic_vars: Optional[dict] = None,
+        hosts: Union[str, list, None] = None,
+        blocked_hosts: Union[str, list, None] = None,
+        timeout: Optional[float] = None,
+    ):
         async for chunk in self._plexus.request_event_stream(
             self,
             event_id,

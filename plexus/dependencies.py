@@ -73,6 +73,7 @@ def parse_dependencies(
         )
 
     specs: List[DependencySpec] = []
+    seen: set = set()  # BUG-039: detect post-strip duplicate target names
     for target, entry in raw.items():
         if not isinstance(target, str):
             return (
@@ -84,6 +85,18 @@ def parse_dependencies(
         target_stripped = target.strip()
         if not target_stripped:
             return [], "", "dependency target name cannot be empty/whitespace"
+
+        # BUG-039: reject a post-strip name collision (e.g. 'Foo' and ' Foo ')
+        # which would otherwise emit two contradictory specs silently.
+        if target_stripped in seen:
+            return (
+                [],
+                target_stripped,
+                f"duplicate dependency target {target_stripped!r} after "
+                f"whitespace normalization; remove the duplicate / "
+                f"contradictory entry",
+            )
+        seen.add(target_stripped)
 
         if entry is None:
             return (
@@ -395,17 +408,20 @@ def resolve(
                            prior framework load failures (None -> empty)
 
     Reporting:
-      First-failure-wins per plugin: when a plugin has multiple failing
-      required deps, only the FIRST failing spec's reason is recorded in
-      result.failed[name]. Operator fixes that dep, restarts, then sees
-      next failure. Single string per plugin is simpler than comma-joined.
+      All failing required deps per plugin are collected and reported
+      together (R4-WW-14), so an operator sees every failure in one pass
+      instead of one per restart. result.failed[name] is the single reason
+      string when a plugin has exactly one failing required dep, or
+      "N failing deps: <r1>; <r2>; ..." (count prefix + "; "-joined reasons)
+      when it has several. A cycle reason (Step 1) takes precedence and
+      replaces this for cycle members.
 
     Steps:
       1. Detect cycles (required-only edges). Mark every cycle member
          failed with reason "in dependency cycle: A -> B -> ... -> A".
          Cycle reason wins precedence over any later classification.
-      2. For each non-cycle plugin: walk dep list, fail on first
-         non-optional miss, append optional_warnings on optional miss.
+      2. For each non-cycle plugin: walk dep list, collect ALL non-optional
+         failures (R4-WW-14), append optional_warnings on optional miss.
          Missing-target classification order in code: disabled-in-config
          first, then failed-to-load, then default "missing (not loaded)".
          Version-mismatch is checked AFTER target-existence. plexus

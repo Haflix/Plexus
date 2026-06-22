@@ -374,7 +374,12 @@ def generate_keypair(keys_dir: str, hostname: str) -> Tuple[Path, Path, str, str
     # os.open which has no chmod step to swallow.
     key_fd = os.open(key_tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
-        os.write(key_fd, key_pem)
+        # BUG-034: os.write may short-write; loop until the whole buffer is
+        # flushed (keeps the secure 0o600 os.open, unlike write_bytes).
+        mv = memoryview(key_pem)
+        written = 0
+        while written < len(key_pem):
+            written += os.write(key_fd, mv[written:])
     finally:
         os.close(key_fd)
     # C-169: rollback the cert rename on key-rename failure. The pair
@@ -385,7 +390,10 @@ def generate_keypair(keys_dir: str, hostname: str) -> Tuple[Path, Path, str, str
     # handshake with an opaque error. We capture the prior cert (if
     # any) before the rename so we can restore on failure.
     prior_cert: Optional[bytes] = None
-    if cert_path.exists():
+    # BUG-035: track existence separately from readability so the rollback
+    # never deletes a cert that EXISTED but was merely transiently unreadable.
+    cert_existed = cert_path.exists()
+    if cert_existed:
         try:
             prior_cert = cert_path.read_bytes()
         except OSError:
@@ -405,10 +413,24 @@ def generate_keypair(keys_dir: str, hostname: str) -> Tuple[Path, Path, str, str
                 cert_path.write_bytes(prior_cert)
             except OSError:
                 pass
-        else:
+        elif not cert_existed:
+            # Genuinely fresh: remove the new cert so next boot regenerates.
             try:
                 cert_path.unlink(missing_ok=True)
             except OSError:
+                pass
+        else:
+            # BUG-035: cert EXISTED but was unreadable — no bytes to restore,
+            # and deleting would destroy the only cert on disk. Leave the new
+            # cert in place and warn; manual intervention may be needed.
+            try:
+                _logger.warning(
+                    "Cert rollback: prior cert %s existed but was unreadable and "
+                    "the key rename failed; cannot cleanly roll back. Leaving the "
+                    "new cert in place (mismatched with the old key). Key tmp left "
+                    "at %s.", cert_path, key_tmp,
+                )
+            except Exception:
                 pass
         raise
 

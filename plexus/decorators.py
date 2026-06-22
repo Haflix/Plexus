@@ -122,7 +122,7 @@ def log_errors(logger: Optional[logging.Logger] = None):
     return decorator
 
 
-def handle_errors(default_return: Any = None, logger: Optional[logging.Logger] = None):
+def handle_errors(_func=None, *, default_return: Any = None, logger: Optional[logging.Logger] = None):
     """
     Decorator to catch exceptions and return a default value instead.
 
@@ -182,22 +182,13 @@ def handle_errors(default_return: Any = None, logger: Optional[logging.Logger] =
 
         return wrapper
 
-    # R4-XX-1: dual-dispatch shim. When applied as ``@handle_errors``
-    # (no parens) Python passes the decorated function as
-    # ``default_return``. Detect the sync-function case and route
-    # through ``decorator(func)`` so wrapping actually happens. The
-    # check is restricted to sync callables that are NOT coroutine /
-    # generator / async generator functions so a legitimate callable
-    # default_return (e.g. a factory) is not hijacked.
-    if (
-        callable(default_return)
-        and not inspect.iscoroutinefunction(default_return)
-        and not inspect.isgeneratorfunction(default_return)
-        and not inspect.isasyncgenfunction(default_return)
-    ):
-        func = default_return
-        default_return = None
-        return decorator(func)
+    # BUG-037: dual-dispatch via a dedicated first positional param. A sync
+    # function and a callable ``default_return`` are type-indistinguishable,
+    # so disambiguate by SIGNATURE: the no-parens ``@handle_errors`` passes the
+    # function positionally into ``_func``; ``default_return`` is keyword-only
+    # (hence always a value, never mistaken for the function).
+    if _func is not None:
+        return decorator(_func)
 
     return decorator
 
@@ -368,27 +359,35 @@ def gen_log_errors(logger: Optional[logging.Logger] = None):
 
             # Create the generator
             generator = func(*args, **kwargs)
-
-            # Iterate over the generator with error handling
-            while True:
+            try:
+                # Iterate over the generator with error handling
+                while True:
+                    try:
+                        yield next(generator)
+                    except StopIteration:
+                        # Normal generator exhaustion
+                        return
+                    except Exception as e:
+                        # Log the error with the correct source information
+                        if _logger:
+                            _logger.error(
+                                f"Error in generator {func_name}:{line_no} at {file_name}: {type(e).__name__}: {e}",
+                                extra={
+                                    "func_name": func_name,
+                                    "file_name": file_name,
+                                    "line_no": line_no,
+                                },
+                            )
+                            _logger.debug(f"Traceback: {traceback.format_exc()}")
+                        raise  # Re-raise the exception
+            finally:
+                # BUG-038: close the inner generator on early termination
+                # (GeneratorExit / consumer break) so its finally / resource
+                # release runs promptly rather than being deferred to GC.
                 try:
-                    yield next(generator)
-                except StopIteration:
-                    # Normal generator exhaustion
-                    return
-                except Exception as e:
-                    # Log the error with the correct source information
-                    if _logger:
-                        _logger.error(
-                            f"Error in generator {func_name}:{line_no} at {file_name}: {type(e).__name__}: {e}",
-                            extra={
-                                "func_name": func_name,
-                                "file_name": file_name,
-                                "line_no": line_no,
-                            },
-                        )
-                        _logger.debug(f"Traceback: {traceback.format_exc()}")
-                    raise  # Re-raise the exception
+                    generator.close()
+                except Exception:
+                    pass
 
         return wrapper
 
@@ -449,29 +448,35 @@ def gen_handle_errors(
 
             # Create the generator
             generator = func(*args, **kwargs)
+            try:
+                # Iterate over the generator with error handling
+                while True:
+                    try:
+                        yield next(generator)
+                    except StopIteration:
+                        # Normal generator exhaustion
+                        return
+                    except Exception as e:
+                        # Log the error with the correct source information
+                        if _logger:
+                            _logger.error(
+                                f"Error in generator {func_name}:{line_no} at {file_name}: {type(e).__name__}: {e}",
+                                extra={
+                                    "func_name": func_name,
+                                    "file_name": file_name,
+                                    "line_no": line_no,
+                                },
+                            )
+                            _logger.debug(f"Traceback: {traceback.format_exc()}")
 
-            # Iterate over the generator with error handling
-            while True:
+                        # Stop the generator (don't yield default_return, just stop)
+                        return
+            finally:
+                # BUG-038: close the inner generator on early termination.
                 try:
-                    yield next(generator)
-                except StopIteration:
-                    # Normal generator exhaustion
-                    return
-                except Exception as e:
-                    # Log the error with the correct source information
-                    if _logger:
-                        _logger.error(
-                            f"Error in generator {func_name}:{line_no} at {file_name}: {type(e).__name__}: {e}",
-                            extra={
-                                "func_name": func_name,
-                                "file_name": file_name,
-                                "line_no": line_no,
-                            },
-                        )
-                        _logger.debug(f"Traceback: {traceback.format_exc()}")
-
-                    # Stop the generator (don't yield default_return, just stop)
-                    return
+                    generator.close()
+                except Exception:
+                    pass
 
         return wrapper
 
@@ -543,6 +548,14 @@ def async_gen_log_errors(logger: Optional[logging.Logger] = None):
                     )
                     _logger.debug(f"Traceback: {traceback.format_exc()}")
                 raise  # Re-raise the exception
+            finally:
+                # BUG-038: close the inner async generator on early termination
+                # (GeneratorExit / CancelledError / consumer break) so its
+                # finally / async-with cleanup runs promptly, not deferred to GC.
+                try:
+                    await async_gen.aclose()
+                except Exception:
+                    pass
 
         return wrapper
 
@@ -616,6 +629,12 @@ def async_gen_handle_errors(
 
                 # Stop the async generator (don't yield default_return, just stop)
                 return
+            finally:
+                # BUG-038: close the inner async generator on early termination.
+                try:
+                    await async_gen.aclose()
+                except Exception:
+                    pass
 
         return wrapper
 

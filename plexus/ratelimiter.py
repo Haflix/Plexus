@@ -143,9 +143,17 @@ class Bucket:
             self.tokens = min(self.max, self.tokens + elapsed * self.rate)
             self.last = now
 
-    def reconfigure(self, max_tokens, window,
+    def reconfigure(self, max_tokens, window, now: Optional[float] = None,
                     reset_stream_weight: bool = False) -> None:
         _validate(max_tokens, window, "reconfigure")
+        # BUG-036: credit tokens accrued up to `now` at the CURRENT (old) rate
+        # and re-anchor `last` BEFORE swapping the rate, so the new rate is not
+        # retro-applied to the pre-reconfigure idle interval. refill() sets
+        # self.last = now. `now` defaults to the current monotonic clock so
+        # direct callers can omit it (configure() threads its resolved now).
+        if now is None:
+            now = time.monotonic()
+        self.refill(now)
         # The charge-set rebuild reconfigures a bucket and then RE-REGISTERS every
         # stream endpoint's weight against it in the SAME pass, so by the time it
         # reconfigures, the old grow-only max_stream_weight is stale (about to be
@@ -218,7 +226,7 @@ class RateLimiter:
             b = Bucket(max_tokens, window, now)
             self._buckets[(dimension, key)] = b
             return b
-        existing.reconfigure(max_tokens, window, reset_stream_weight)
+        existing.reconfigure(max_tokens, window, now, reset_stream_weight)
         return existing
 
     def get(self, dimension: str, key: str) -> Optional[Bucket]:
