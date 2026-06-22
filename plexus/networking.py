@@ -2182,82 +2182,96 @@ class NetworkManager:
             )
 
             # Stream results - each yielded item as chunks + item boundary marker
+            # BUG-007: wrap the agen consumption in try/finally so every early
+            # exit closes the source async generator deterministically. Breaking
+            # or returning out of `async for` does NOT close the gen (only normal
+            # exhaustion or an explicit aclose() does); without this, the
+            # producer's cleanup finally (execute_stream's set_collected, which
+            # evicts the GeneratorRequest and runs the plugin generator's finally)
+            # is deferred to the event loop's GC-scheduled finalizer. aclose() is
+            # a no-op after normal exhaustion. Mirrors the REQUEST_EVENT_STREAM
+            # sibling path. Nested inside the outer try/except below, so an
+            # exception closes agen before propagating to that handler.
             sent_items = 0
-            async for line in agen:
-                try:
-                    # Send each item - may split if very large
-                    payload = pickle.dumps(line)
-                    if len(payload) > CHUNK_SIZE:
-                        # Split large item into chunks
-                        parts = 0
-                        offset = 0
-                        while offset < len(payload):
-                            chunk_data = payload[offset : offset + CHUNK_SIZE]
-                            chunk_length = len(chunk_data) + 1
+            try:
+                async for line in agen:
+                    try:
+                        # Send each item - may split if very large
+                        payload = pickle.dumps(line)
+                        if len(payload) > CHUNK_SIZE:
+                            # Split large item into chunks
+                            parts = 0
+                            offset = 0
+                            while offset < len(payload):
+                                chunk_data = payload[offset : offset + CHUNK_SIZE]
+                                chunk_length = len(chunk_data) + 1
+                                header = struct.pack(">IB", chunk_length, MSG_STREAM_CHUNK)
+                                writer.write(header + chunk_data)
+                                # R2-CC-2: bounded drain. TODO: surface as config knob.
+                                await asyncio.wait_for(writer.drain(), timeout=30.0)
+                                self._count_sent(writer, len(header) + len(chunk_data))
+                                offset += CHUNK_SIZE
+                                parts += 1
+                            self._logger.debug(
+                                f"[EXECUTE_STREAM] Sent large item in {parts} chunks, bytes={len(payload)}"
+                            )
+                        else:
+                            # Small item, send as single chunk
+                            chunk_length = len(payload) + 1
                             header = struct.pack(">IB", chunk_length, MSG_STREAM_CHUNK)
-                            writer.write(header + chunk_data)
+                            writer.write(header + payload)
                             # R2-CC-2: bounded drain. TODO: surface as config knob.
                             await asyncio.wait_for(writer.drain(), timeout=30.0)
-                            self._count_sent(writer, len(header) + len(chunk_data))
-                            offset += CHUNK_SIZE
-                            parts += 1
-                        self._logger.debug(
-                            f"[EXECUTE_STREAM] Sent large item in {parts} chunks, bytes={len(payload)}"
-                        )
-                    else:
-                        # Small item, send as single chunk
-                        chunk_length = len(payload) + 1
-                        header = struct.pack(">IB", chunk_length, MSG_STREAM_CHUNK)
-                        writer.write(header + payload)
+                            self._count_sent(writer, len(header) + len(payload))
+                        # Mark end of this item so receiver knows where item boundaries are
+                        item_end_header = struct.pack(">IB", 1, MSG_STREAM_ITEM_END)
+                        writer.write(item_end_header)
                         # R2-CC-2: bounded drain. TODO: surface as config knob.
                         await asyncio.wait_for(writer.drain(), timeout=30.0)
-                        self._count_sent(writer, len(header) + len(payload))
-                    # Mark end of this item so receiver knows where item boundaries are
-                    item_end_header = struct.pack(">IB", 1, MSG_STREAM_ITEM_END)
-                    writer.write(item_end_header)
-                    # R2-CC-2: bounded drain. TODO: surface as config knob.
-                    await asyncio.wait_for(writer.drain(), timeout=30.0)
-                    self._count_sent(writer, len(item_end_header))
-                    sent_items += 1
-                except Exception as e:
-                    self._logger.exception("Failed to send stream chunk")
-                    # R3-MM-4 (mirror of _handle_execute fix): if the failure
-                    # itself was a drain timeout on this writer, retrying
-                    # another drain via the error-frame send path would just
-                    # block another 30s on the same stuck peer (and a third
-                    # 30s in the outer except's _send_stream_chunk). Close
-                    # the writer best-effort and bail out — wait_closed()
-                    # would also hang on the stuck FIN/ACK.
-                    if isinstance(e, asyncio.TimeoutError):
-                        try:
-                            writer.close()
-                        except Exception:
-                            pass
-                        return
-                    err_obj = ("__STREAM_ERROR__", str(e))
-                    err_payload = pickle.dumps(err_obj)
-                    chunk_length = len(err_payload) + 1
-                    header = struct.pack(">IB", chunk_length, MSG_STREAM_CHUNK)
-                    writer.write(header + err_payload)
-                    # R2-CC-2: bounded drain. TODO: surface as config knob.
-                    await asyncio.wait_for(writer.drain(), timeout=30.0)
-                    self._count_sent(writer, len(header) + len(err_payload))
-                    # F5 fix: MUST send MSG_STREAM_ITEM_END after the error
-                    # chunk so the client decoder's sentinel check in the
-                    # MSG_STREAM_ITEM_END branch fires (lines 3083-3105 of
-                    # this file). Without ITEM_END, the chunk gets buffered
-                    # and yielded as a normal final item via MSG_END_STREAM
-                    # path, with the client's caller seeing the error tuple
-                    # as data and no exception.
-                    item_end_header = struct.pack(">IB", 1, MSG_STREAM_ITEM_END)
-                    writer.write(item_end_header)
-                    # R2-CC-2: bounded drain. TODO: surface as config knob.
-                    await asyncio.wait_for(writer.drain(), timeout=30.0)
-                    self._count_sent(writer, len(item_end_header))
-                    break
+                        self._count_sent(writer, len(item_end_header))
+                        sent_items += 1
+                    except Exception as e:
+                        self._logger.exception("Failed to send stream chunk")
+                        # R3-MM-4 (mirror of _handle_execute fix): if the failure
+                        # itself was a drain timeout on this writer, retrying
+                        # another drain via the error-frame send path would just
+                        # block another 30s on the same stuck peer (and a third
+                        # 30s in the outer except's _send_stream_chunk). Close
+                        # the writer best-effort and bail out — wait_closed()
+                        # would also hang on the stuck FIN/ACK.
+                        if isinstance(e, asyncio.TimeoutError):
+                            try:
+                                writer.close()
+                            except Exception:
+                                pass
+                            return
+                        err_obj = ("__STREAM_ERROR__", str(e))
+                        err_payload = pickle.dumps(err_obj)
+                        chunk_length = len(err_payload) + 1
+                        header = struct.pack(">IB", chunk_length, MSG_STREAM_CHUNK)
+                        writer.write(header + err_payload)
+                        # R2-CC-2: bounded drain. TODO: surface as config knob.
+                        await asyncio.wait_for(writer.drain(), timeout=30.0)
+                        self._count_sent(writer, len(header) + len(err_payload))
+                        # F5 fix: MUST send MSG_STREAM_ITEM_END after the error
+                        # chunk so the client decoder's sentinel check in the
+                        # MSG_STREAM_ITEM_END branch fires (lines 3083-3105 of
+                        # this file). Without ITEM_END, the chunk gets buffered
+                        # and yielded as a normal final item via MSG_END_STREAM
+                        # path, with the client's caller seeing the error tuple
+                        # as data and no exception.
+                        item_end_header = struct.pack(">IB", 1, MSG_STREAM_ITEM_END)
+                        writer.write(item_end_header)
+                        # R2-CC-2: bounded drain. TODO: surface as config knob.
+                        await asyncio.wait_for(writer.drain(), timeout=30.0)
+                        self._count_sent(writer, len(item_end_header))
+                        break
 
-            await self._send_end_stream(writer)
-            self._logger.info(f"[EXECUTE_STREAM] Completed: items_sent={sent_items}")
+                await self._send_end_stream(writer)
+                self._logger.info(f"[EXECUTE_STREAM] Completed: items_sent={sent_items}")
+            finally:
+                with contextlib.suppress(Exception):
+                    await agen.aclose()
 
         except Exception as e:
             self._logger.exception("Exception while streaming")

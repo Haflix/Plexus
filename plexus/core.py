@@ -2102,7 +2102,15 @@ class Plexus(EventMixin):
 
     def is_main_config(self, path: str) -> bool:
         """Check if path points to the main config.yml."""
-        return os.path.abspath(path) == os.path.abspath(self.config_path)
+        # BUG-046: normcase + realpath so case-insensitive filesystems (Windows)
+        # and symlinks/8.3 paths compare consistently with the read/save/list API
+        # (R2-DD-8). Bare abspath neither resolves symlinks nor normcases, so a
+        # case-variant or symlinked path to config.yml that read/save accept as
+        # the main config was misclassified here as a plugin config (or vice
+        # versa). Now the whole config-file API identifies the main config alike.
+        norm = os.path.normcase(os.path.realpath(path))
+        main = os.path.normcase(os.path.realpath(self.config_path))
+        return norm == main
 
     @async_log_errors
     async def load_plugins(self):
