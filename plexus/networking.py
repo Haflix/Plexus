@@ -6645,10 +6645,11 @@ class NetworkManager:
                     await self._mark_node_dead(node)
                 raise NetworkRequestException(f"Invalid response format from {IP}")
 
-            # Update node info and mark enabled
+            # Update node info; node.update() owns `enabled` (BUG-032: it sets
+            # enabled=True only after a fully-validated reply, so a malformed
+            # reply no longer leaves the node enabled-but-not-alive).
             node = await self._get_node(IP)
             if node:
-                node.enabled = True
                 await node.update(response, self.plexus.hostname)
                 # PR3 Stage C: peer-connect lifecycle hook (Site A —
                 # locked #7). Symmetric initial-exchange — fire-and-

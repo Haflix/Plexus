@@ -107,14 +107,21 @@ class Node:
         self.last_heartbeat = time.monotonic()
 
     async def update(self, response: dict, device_hostname: str):
-        if response["hostname"] == device_hostname:
+        # BUG-032: validate the reply and own `enabled` here so a malformed
+        # reply raises BEFORE `enabled` is touched (no enabled-but-not-alive
+        # state) and a peer is marked enabled only after a full update.
+        hostname = response.get("hostname")
+        if hostname is None:
+            raise ValueError("INFO response missing required 'hostname' field")
+        if hostname == device_hostname:
             self.enabled = False
             return
 
-        self.hostname = response["hostname"]
-        self.auto_discoverable = response["auto_discoverable"]
+        self.hostname = hostname
+        self.auto_discoverable = response.get("auto_discoverable", False)
 
         await self.heartbeat()
+        self.enabled = True
 
     async def is_alive(self, timeout=30):
         """Returns True if last heartbeat was within timeout seconds.
