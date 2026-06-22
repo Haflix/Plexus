@@ -156,6 +156,16 @@ DEFAULT_LIVENESS_TIMEOUT: float = 30.0
 DEFAULT_PROBE_TIMEOUT: Optional[float] = None
 
 
+class _DrainTimeout(asyncio.TimeoutError):
+    """Marker: a bounded ``writer.drain()`` exceeded its timeout (R3-MM-4 /
+    BUG-030). Subclasses ``asyncio.TimeoutError`` so any legacy
+    ``except asyncio.TimeoutError`` still catches it, but lets the two execute
+    handlers distinguish a stuck-peer drain timeout from a plugin-raised plain
+    ``TimeoutError`` (which, on Python 3.11+, IS ``asyncio.TimeoutError`` and
+    would otherwise be misclassified as a drain timeout and have its error
+    frame suppressed)."""
+
+
 class NetworkManager:
     def __init__(
         self,
@@ -1106,6 +1116,19 @@ class NetworkManager:
         stats["bytes_recv"] += total_bytes
         stats["msgs_recv"] += 1
 
+    async def _bounded_drain(self, writer: asyncio.StreamWriter) -> None:
+        """Bounded ``writer.drain()`` (R2-CC-2) that re-raises a drain timeout
+        as the dedicated ``_DrainTimeout`` marker (BUG-030). Every drain reach-
+        able from the two execute handlers routes through here so the handlers'
+        ``isinstance(e, _DrainTimeout)`` guards can tell a stuck-peer drain from
+        a plugin-raised plain ``TimeoutError``, and the 30s budget has one home.
+        TODO: surface the timeout as a networking.send_drain_timeout config knob.
+        """
+        try:
+            await asyncio.wait_for(writer.drain(), timeout=30.0)
+        except asyncio.TimeoutError as e:
+            raise _DrainTimeout(str(e)) from e
+
     async def _send_message(
         self, writer: asyncio.StreamWriter, msg_type: int, data: any
     ) -> None:
@@ -1137,7 +1160,7 @@ class NetworkManager:
             writer.write(header + payload)
             # R2-CC-2: bounded drain — a slow/stuck peer must not wedge the
             # sender forever. TODO: surface as networking.send_drain_timeout config knob.
-            await asyncio.wait_for(writer.drain(), timeout=30.0)
+            await self._bounded_drain(writer)
             self._count_sent(writer, len(header) + len(payload))
         except Exception as e:
             msg_type_name = {
@@ -1235,7 +1258,7 @@ class NetworkManager:
                     header = struct.pack(">IB", chunk_length, MSG_STREAM_CHUNK)
                     writer.write(header + chunk_data)
                     # R2-CC-2: bounded drain. TODO: surface as config knob.
-                    await asyncio.wait_for(writer.drain(), timeout=30.0)
+                    await self._bounded_drain(writer)
                     self._count_sent(writer, len(header) + len(chunk_data))
                     offset += CHUNK_SIZE
             else:
@@ -1244,7 +1267,7 @@ class NetworkManager:
                 header = struct.pack(">IB", chunk_length, MSG_STREAM_CHUNK)
                 writer.write(header + payload)
                 # R2-CC-2: bounded drain. TODO: surface as config knob.
-                await asyncio.wait_for(writer.drain(), timeout=30.0)
+                await self._bounded_drain(writer)
                 self._count_sent(writer, len(header) + len(payload))
         except Exception as e:
             self._logger.exception("Error sending stream chunk")
@@ -1256,7 +1279,7 @@ class NetworkManager:
             header = struct.pack(">IB", 1, MSG_END_STREAM)
             writer.write(header)
             # R2-CC-2: bounded drain. TODO: surface as config knob.
-            await asyncio.wait_for(writer.drain(), timeout=30.0)
+            await self._bounded_drain(writer)
             self._count_sent(writer, len(header))
         except Exception as e:
             self._logger.exception("Error sending end stream marker")
@@ -2023,7 +2046,7 @@ class NetworkManager:
                     header = struct.pack(">IB", chunk_length, MSG_STREAM_CHUNK)
                     writer.write(header + chunk_data)
                     # R2-CC-2: bounded drain. TODO: surface as config knob.
-                    await asyncio.wait_for(writer.drain(), timeout=30.0)
+                    await self._bounded_drain(writer)
                     self._count_sent(writer, len(header) + len(chunk_data))
                     offset += CHUNK_SIZE
                     sent += 1
@@ -2036,7 +2059,7 @@ class NetworkManager:
                 header = struct.pack(">IB", chunk_length, MSG_STREAM_CHUNK)
                 writer.write(header + payload)
                 # R2-CC-2: bounded drain. TODO: surface as config knob.
-                await asyncio.wait_for(writer.drain(), timeout=30.0)
+                await self._bounded_drain(writer)
                 self._count_sent(writer, len(header) + len(payload))
 
             try:
@@ -2065,7 +2088,7 @@ class NetworkManager:
             # swallow on timeout.
             try:
                 await self._send_error_pickled(writer, e)
-            except asyncio.TimeoutError:
+            except _DrainTimeout:
                 try:
                     writer.close()
                 except Exception:
@@ -2079,7 +2102,7 @@ class NetworkManager:
             # wait_for(writer.drain(), timeout=30.0) on the SAME stuck writer,
             # incurring a second 30-second hang (60s total per stuck peer).
             # Close the writer locally instead and bail out.
-            if isinstance(e, asyncio.TimeoutError):
+            if isinstance(e, _DrainTimeout):
                 # R3-MM-4: drain timed out on a stuck peer. Do NOT call
                 # _send_error_pickled (it would invoke _send_message, which
                 # awaits another wait_for(writer.drain(), 30s) on the same
@@ -2219,7 +2242,7 @@ class NetworkManager:
                                 header = struct.pack(">IB", chunk_length, MSG_STREAM_CHUNK)
                                 writer.write(header + chunk_data)
                                 # R2-CC-2: bounded drain. TODO: surface as config knob.
-                                await asyncio.wait_for(writer.drain(), timeout=30.0)
+                                await self._bounded_drain(writer)
                                 self._count_sent(writer, len(header) + len(chunk_data))
                                 offset += CHUNK_SIZE
                                 parts += 1
@@ -2232,13 +2255,13 @@ class NetworkManager:
                             header = struct.pack(">IB", chunk_length, MSG_STREAM_CHUNK)
                             writer.write(header + payload)
                             # R2-CC-2: bounded drain. TODO: surface as config knob.
-                            await asyncio.wait_for(writer.drain(), timeout=30.0)
+                            await self._bounded_drain(writer)
                             self._count_sent(writer, len(header) + len(payload))
                         # Mark end of this item so receiver knows where item boundaries are
                         item_end_header = struct.pack(">IB", 1, MSG_STREAM_ITEM_END)
                         writer.write(item_end_header)
                         # R2-CC-2: bounded drain. TODO: surface as config knob.
-                        await asyncio.wait_for(writer.drain(), timeout=30.0)
+                        await self._bounded_drain(writer)
                         self._count_sent(writer, len(item_end_header))
                         sent_items += 1
                     except Exception as e:
@@ -2250,7 +2273,7 @@ class NetworkManager:
                         # 30s in the outer except's _send_stream_chunk). Close
                         # the writer best-effort and bail out — wait_closed()
                         # would also hang on the stuck FIN/ACK.
-                        if isinstance(e, asyncio.TimeoutError):
+                        if isinstance(e, _DrainTimeout):
                             try:
                                 writer.close()
                             except Exception:
@@ -2262,7 +2285,7 @@ class NetworkManager:
                         header = struct.pack(">IB", chunk_length, MSG_STREAM_CHUNK)
                         writer.write(header + err_payload)
                         # R2-CC-2: bounded drain. TODO: surface as config knob.
-                        await asyncio.wait_for(writer.drain(), timeout=30.0)
+                        await self._bounded_drain(writer)
                         self._count_sent(writer, len(header) + len(err_payload))
                         # F5 fix: MUST send MSG_STREAM_ITEM_END after the error
                         # chunk so the client decoder's sentinel check in the
@@ -2274,7 +2297,7 @@ class NetworkManager:
                         item_end_header = struct.pack(">IB", 1, MSG_STREAM_ITEM_END)
                         writer.write(item_end_header)
                         # R2-CC-2: bounded drain. TODO: surface as config knob.
-                        await asyncio.wait_for(writer.drain(), timeout=30.0)
+                        await self._bounded_drain(writer)
                         self._count_sent(writer, len(item_end_header))
                         break
 
@@ -2292,7 +2315,7 @@ class NetworkManager:
             # would invoke another wait_for(writer.drain(), 30s) chain
             # in _send_stream_chunk / _send_end_stream. Close best-effort
             # and bail.
-            if isinstance(e, asyncio.TimeoutError):
+            if isinstance(e, _DrainTimeout):
                 try:
                     writer.close()
                 except Exception:
@@ -2307,7 +2330,7 @@ class NetworkManager:
                 item_end_header = struct.pack(">IB", 1, MSG_STREAM_ITEM_END)
                 writer.write(item_end_header)
                 # R2-CC-2: bounded drain. TODO: surface as config knob.
-                await asyncio.wait_for(writer.drain(), timeout=30.0)
+                await self._bounded_drain(writer)
                 self._count_sent(writer, len(item_end_header))
                 await self._send_end_stream(writer)
             except Exception:
