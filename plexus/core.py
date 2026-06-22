@@ -6037,6 +6037,16 @@ class Plexus(EventMixin):
             # leaves `wanted`/`wanted_subs` empty, so the prune drops every static
             # + Sub-IN bucket (Nodes-IN is intentionally never pruned), and the
             # master switch then recomputes honestly.
+            #
+            # BUG-014 follow-up: this early-return path must STILL empty
+            # _rl_sub_in. The top of the function no longer clears it (the clear
+            # moved below the get_plugin_subscriptions await to avoid an
+            # admit-without-charge window); without clearing it here, an
+            # empty-config rebuild entered with a stale _rl_sub_in would leak it,
+            # breaking the "twice == once" idempotence the docstring promises.
+            # Safe here: this branch is synchronous (no await before return), so
+            # no concurrent _rl_admit_in can observe an emptied-mid-rebuild table.
+            self._rl_sub_in.clear()
             self._recompute_rate_limits_active()
             return
 

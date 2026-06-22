@@ -143,16 +143,18 @@ class Bucket:
             self.tokens = min(self.max, self.tokens + elapsed * self.rate)
             self.last = now
 
-    def reconfigure(self, max_tokens, window, now: Optional[float] = None,
+    def reconfigure(self, max_tokens, window, now: float,
                     reset_stream_weight: bool = False) -> None:
         _validate(max_tokens, window, "reconfigure")
         # BUG-036: credit tokens accrued up to `now` at the CURRENT (old) rate
         # and re-anchor `last` BEFORE swapping the rate, so the new rate is not
         # retro-applied to the pre-reconfigure idle interval. refill() sets
-        # self.last = now. `now` defaults to the current monotonic clock so
-        # direct callers can omit it (configure() threads its resolved now).
-        if now is None:
-            now = time.monotonic()
+        # self.last = now. `now` is REQUIRED and must share the bucket's timebase
+        # (configure() threads its resolved now; __init__/refill likewise take an
+        # explicit now). There is deliberately no fallback clock: a bucket stores
+        # `last` as a bare float with no record of which timeline it owns, so a
+        # method-chosen time.monotonic() could wedge a real reading into a bucket
+        # driven by a different (e.g. synthetic) clock and corrupt later refills.
         self.refill(now)
         # The charge-set rebuild reconfigures a bucket and then RE-REGISTERS every
         # stream endpoint's weight against it in the SAME pass, so by the time it

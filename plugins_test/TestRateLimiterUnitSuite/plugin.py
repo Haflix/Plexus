@@ -134,19 +134,19 @@ class TestRateLimiterUnitSuite(Plugin):
     async def _reconfigure(self, rec, kw):
         async def body(c):
             b = Bucket(10, 1, 0.0); b.tokens = 8.0
-            b.reconfigure(max_tokens=5, window=1)          # shrink max 10 -> 5
+            b.reconfigure(max_tokens=5, window=1, now=0.0)  # shrink max 10 -> 5
             assert b.tokens == 5.0, \
                 f"reconfigure: clamps tokens down on shrink (tokens={b.tokens})"
             assert b.max == 5.0, "reconfigure: updates max"
-            b.reconfigure(max_tokens=20, window=2)         # rate 20/2 = 10/s
+            b.reconfigure(max_tokens=20, window=2, now=0.0)  # rate 20/2 = 10/s
             assert b.rate == 10.0, f"reconfigure: updates rate (rate={b.rate})"
             # fractional max is allowed (max_stream_weight is 0.0 by default)
-            b.reconfigure(max_tokens=0.5, window=1)
+            b.reconfigure(max_tokens=0.5, window=1, now=0.0)
             assert b.max == 0.5, "reconfigure: fractional max allowed (no stream weight)"
             # invalid reconfig
-            assert _raises_config(lambda: b.reconfigure(0, 1)), \
+            assert _raises_config(lambda: b.reconfigure(0, 1, now=0.0)), \
                 "reconfigure: max<=0 rejected"
-            assert _raises_config(lambda: b.reconfigure(5, 0)), \
+            assert _raises_config(lambda: b.reconfigure(5, 0, now=0.0)), \
                 "reconfigure: window<=0 rejected"
 
         await rec.run_case(
@@ -166,10 +166,10 @@ class TestRateLimiterUnitSuite(Plugin):
             assert b.max_stream_weight == 2.0, \
                 "stream_weight: smaller second registration keeps the max"
             # now reconfigure below the registered weight must fail
-            assert _raises_config(lambda: b.reconfigure(1, 1)), \
+            assert _raises_config(lambda: b.reconfigure(1, 1, now=0.0)), \
                 "stream_weight: reconfigure below registered weight rejected"
             # reconfigure at/above is fine
-            b.reconfigure(2, 1)
+            b.reconfigure(2, 1, now=0.0)
             assert b.max == 2.0, "stream_weight: reconfigure at weight ok"
             assert _raises_config(lambda: b.register_stream_weight(0)), \
                 "stream_weight: weight <= 0 rejected"
@@ -200,10 +200,10 @@ class TestRateLimiterUnitSuite(Plugin):
             br = Bucket(12, 1, 0.0)
             br.register_stream_weight(10)                    # floor now 10, max 12
             # default reconfigure still rejects lowering max below the active weight
-            assert _raises_config(lambda: br.reconfigure(5, 1)), \
+            assert _raises_config(lambda: br.reconfigure(5, 1, now=0.0)), \
                 "reset_stream_weight: default still guards (max<weight rejected)"
             # rebuild flow: reset clears the stale floor so the lower max is accepted
-            br.reconfigure(5, 1, reset_stream_weight=True)
+            br.reconfigure(5, 1, now=0.0, reset_stream_weight=True)
             assert br.max_stream_weight == 0.0, \
                 "reset_stream_weight: clears the stale floor"
             assert br.max == 5.0, "reset_stream_weight: applies the lowered max"
@@ -223,8 +223,8 @@ class TestRateLimiterUnitSuite(Plugin):
     async def _reconfigure_rate_effect(self, rec, kw):
         async def body(c):
             # After a rate change, refill must accrue at the NEW rate, not the old one.
-            b = Bucket(10, 1, 0.0); b.tokens = 0.0          # rate 10/s
-            b.reconfigure(max_tokens=6, window=3)           # new rate = 2/s
+            b = Bucket(10, 1, 0.0); b.tokens = 0.0          # rate 10/s, last=0.0
+            b.reconfigure(max_tokens=6, window=3, now=0.0)  # new rate = 2/s, anchor at 0.0
             b.refill(now=1.0)                               # 1s * 2/s = 2 tokens
             assert abs(b.tokens - 2.0) < 1e-9, \
                 f"reconfigure: subsequent refill uses the new rate (tokens={b.tokens})"
