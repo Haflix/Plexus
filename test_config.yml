@@ -165,6 +165,12 @@ plugins:
     enabled: true
     path: ./plugins_test/TestDepResolutionUnitSuite
 
+  # Structured ports of the 2026-06-21 audit-bug regression guards
+  # (networking / events / decorators) -- previously gitignored pytest only.
+  - name: TestAuditPortUnitSuite
+    enabled: true
+    path: ./plugins_test/TestAuditPortUnitSuite
+
   # Pure-function unit suites ported from the former root-level test_*.py
   # scripts (one suite, no scattered root tests). Each pairs with an
   # integration suite (TestCapabilitySuite / TestIdentitySuite / TestRateLimitSuite).
