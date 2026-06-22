@@ -10,6 +10,7 @@ import inspect
 import pickle
 import struct
 import os
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -3002,6 +3003,76 @@ class NetworkManager:
             except Exception:
                 pass
 
+    async def _drive_sync_gen_stream(self, executor, gen, on_chunk, sentinel):
+        """Pump a BLOCKING sync generator on ``executor``, awaiting
+        ``on_chunk(item)`` for each yielded value, until exhaustion (``next``
+        returns ``sentinel``) or cancellation.
+
+        BUG-028: each ``next(gen)`` runs on a worker thread that CANNOT be
+        cancelled. On timeout/cancel of the surrounding ``asyncio.wait_for``,
+        the ``run_in_executor`` future is marked CANCELLED->done IMMEDIATELY
+        while the worker is still inside ``next()``; a loop-thread
+        ``gen.close()`` would then race the live ``next()`` (``ValueError:
+        generator already executing``) and the generator's cleanup would be
+        lost. We therefore close on the SAME thread as ``next()``, serialized by
+        a lock:
+
+          * ``_pump`` runs ``next()`` on the worker and, in its own ``finally``
+            (after ``next()`` has returned, so the generator is idle on that
+            thread), closes the generator iff ``stop`` is set.
+          * the driver's ``finally`` sets ``stop`` and closes the generator
+            itself only when NO ``next()`` is in flight.
+
+        Both decisions are taken under ``lock`` so exactly one side closes the
+        generator exactly once, never concurrently with ``next()``. A truly hung
+        ``next()`` pins one worker until it returns -- intrinsic to the sync
+        bridge (the same limitation Starlette / anyio / Trio accept); the driver
+        does not block on it.
+
+        Timeout is enforced by the CALLER (the existing
+        ``asyncio.wait_for(_iterate_and_send(), timeout)`` wrapper); this helper
+        just pumps and guarantees the close discipline.
+        """
+        loop = asyncio.get_running_loop()
+        stop = threading.Event()        # loop -> worker: abandon the stream
+        in_flight = threading.Event()   # worker -> loop: a next() is running now
+        closed = threading.Event()      # either side -> the other: gen closed
+        lock = threading.Lock()         # serializes the worker-finally vs driver-finally
+
+        def _pump(g=gen, s=sentinel):
+            in_flight.set()
+            try:
+                return next(g, s)
+            finally:
+                # next() has fully returned/raised -> gen is idle on THIS worker
+                # thread, so closing here is race-free.
+                with lock:
+                    if stop.is_set() and not closed.is_set():
+                        with contextlib.suppress(Exception):
+                            g.close()
+                        closed.set()
+                    in_flight.clear()
+
+        try:
+            while True:
+                chunk = await loop.run_in_executor(executor, _pump)
+                if chunk is sentinel:
+                    break
+                await on_chunk(chunk)
+        finally:
+            # Hand the close off to any in-flight worker (it closes on its own
+            # thread when next() returns); otherwise close here. Under the same
+            # lock so exactly one side closes exactly once.
+            with lock:
+                stop.set()
+                if not closed.is_set():
+                    if in_flight.is_set():
+                        pass  # worker closes on its own thread
+                    else:
+                        with contextlib.suppress(Exception):
+                            gen.close()
+                        closed.set()
+
     async def _handle_request_event_stream(
         self,
         reader: asyncio.StreamReader,
@@ -3287,46 +3358,46 @@ class NetworkManager:
                     )
                     sentinel = object()
                     gen = func(placeholder)
-                    loop = asyncio.get_running_loop()
-                    try:
-                        while True:
-                            fut = loop.run_in_executor(
-                                self.plexus.sync_dispatcher.executor,
-                                lambda g=gen, s=sentinel: next(g, s),
+
+                    async def _on_chunk(chunk):
+                        nonlocal first
+                        if first:
+                            first = False
+                            obj = _Event(
+                                topic=topic,
+                                payload=chunk,
+                                author=author,
+                                author_id=author_id,
+                                author_host=author_host,
+                                subscription_id=sub_id_for_event,
+                                timestamp=ts,
                             )
-                            chunk = await fut
-                            if chunk is sentinel:
-                                break
-                            if first:
-                                first = False
-                                obj = _Event(
-                                    topic=topic,
-                                    payload=chunk,
-                                    author=author,
-                                    author_id=author_id,
-                                    author_host=author_host,
-                                    subscription_id=sub_id_for_event,
-                                    timestamp=ts,
-                                )
-                            else:
-                                obj = chunk
-                            # B-024: send via _send_stream_chunk so a single
-                            # item larger than MAX_MESSAGE_SIZE is split across
-                            # frames (parity with execute_stream) instead of
-                            # aborting the whole stream. Mark chunks_sent BEFORE
-                            # the send (not after): _send_stream_chunk may emit
-                            # several frames, so a drain-timeout mid-item must
-                            # route the outer asyncio.TimeoutError branch to
-                            # close (a partial frame may be on the wire) rather
-                            # than emit a framing-illegal MSG_ERROR.
-                            chunks_sent[0] = True
-                            await self._send_stream_chunk(writer, obj)
-                            await self._send_message(
-                                writer, MSG_STREAM_ITEM_END, None
-                            )
-                    finally:
-                        with contextlib.suppress(Exception):
-                            gen.close()
+                        else:
+                            obj = chunk
+                        # B-024: send via _send_stream_chunk so a single
+                        # item larger than MAX_MESSAGE_SIZE is split across
+                        # frames (parity with execute_stream) instead of
+                        # aborting the whole stream. Mark chunks_sent BEFORE
+                        # the send (not after): _send_stream_chunk may emit
+                        # several frames, so a drain-timeout mid-item must
+                        # route the outer asyncio.TimeoutError branch to
+                        # close (a partial frame may be on the wire) rather
+                        # than emit a framing-illegal MSG_ERROR.
+                        chunks_sent[0] = True
+                        await self._send_stream_chunk(writer, obj)
+                        await self._send_message(
+                            writer, MSG_STREAM_ITEM_END, None
+                        )
+
+                    # BUG-028: the sync generator's next() runs on a worker thread
+                    # that can't be cancelled; _drive_sync_gen_stream closes it on
+                    # that same thread (never racing a live next()).
+                    await self._drive_sync_gen_stream(
+                        self.plexus.sync_dispatcher.executor,
+                        gen,
+                        _on_chunk,
+                        sentinel,
+                    )
 
             try:
                 if timeout is not None:
