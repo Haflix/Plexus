@@ -9,6 +9,7 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
 import contextlib
+import copy
 import functools
 import importlib
 import inspect
@@ -656,33 +657,47 @@ class Plexus(EventMixin):
         # Snapshot via list() so concurrent done_callback eviction can't
         # mutate the set during iteration. (Single-threaded loop already
         # makes this safe but the snapshot keeps the intent explicit.)
-        pending = [t for t in list(self.task_list) if not t.done()]
-        if pending:
-            self._logger.info(
-                "Shutdown: waiting for %d in-flight request(s)...", len(pending)
+        # BUG-013: re-drain in bounded rounds. A task in the snapshot can
+        # spawn NEW tracked tasks (e.g. _fanout_sub per-sub dispatch) while
+        # running; those join task_list AFTER a single-shot snapshot and would
+        # be dropped by clear(). Loop until no new pending tasks appear,
+        # sharing one 30s budget, capped by _MAX_DRAIN_ROUNDS so a
+        # perpetually re-spawning task cannot hang shutdown.
+        _MAX_DRAIN_ROUNDS = 5
+        _drain_deadline = time.monotonic() + 30
+        try:
+            for _round in range(_MAX_DRAIN_ROUNDS):
+                pending = [t for t in list(self.task_list) if not t.done()]
+                if not pending:
+                    break
+                remaining = _drain_deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._logger.info(
+                    "Shutdown: waiting for %d in-flight request(s) (round %d)...",
+                    len(pending), _round + 1,
+                )
+                # children spawned DURING this wait join task_list and are
+                # caught on the next snapshot.
+                await asyncio.wait(pending, timeout=remaining)
+        except BaseException:
+            # R2-AA-4: a second cancellation during the drain — cancel
+            # everything currently tracked (not a stale snapshot) before
+            # re-raising so nothing is orphaned.
+            for t in list(self.task_list):
+                if not t.done():
+                    t.cancel()
+            raise
+        # Budget/max-rounds exhausted (or a task kept respawning): cancel
+        # leftovers so they are never orphaned.
+        leftover = [t for t in list(self.task_list) if not t.done()]
+        if leftover:
+            self._logger.warning(
+                "Shutdown: %d request(s) still running, cancelling...", len(leftover)
             )
-            # R2-AA-4: guard the wait+cancel block against a second
-            # cancellation (e.g. second SIGINT during the 30s drain).
-            # ``asyncio.wait`` is a suspension point; if close() itself
-            # is cancelled between wait() and the t.cancel() loop the
-            # still-pending tasks would be orphaned permanently. The
-            # BaseException branch cancels every task in the snapshot
-            # before re-raising so shutdown still propagates.
-            try:
-                done, still_pending = await asyncio.wait(pending, timeout=30)
-                if still_pending:
-                    self._logger.warning(
-                        "Shutdown: %d request(s) still running after 30s, cancelling...",
-                        len(still_pending),
-                    )
-                    for t in still_pending:
-                        t.cancel()
-                    await asyncio.gather(*still_pending, return_exceptions=True)
-            except BaseException:
-                for t in pending:
-                    if not t.done():
-                        t.cancel()
-                raise
+            for t in leftover:
+                t.cancel()
+            await asyncio.gather(*leftover, return_exceptions=True)
         # In-place clear so any callback firing after this still
         # operates on the same set object — discard() of an already-
         # absent key is a no-op.
@@ -856,6 +871,33 @@ class Plexus(EventMixin):
                     with contextlib.suppress(Exception):
                         await stop()
 
+        # 4b. Second fire-and-forget tail-drain (BUG-009). Networking is now
+        # stopped: NetworkManager.stop() set is_ready=False and cancelled the
+        # heartbeat/discovery/server tasks, so no NEW fire-and-forget task can
+        # be spawned past this point (the heartbeat spawn-sources gate on
+        # is_ready; inbound-handler spawners need the now-closed server). This
+        # catches tasks the heartbeat/inbound handlers spawned DURING the
+        # step-3 plugin-disable / step-3b window, which the step-1b drain
+        # (already .clear()'d) could not have awaited.
+        ff_late = [t for t in list(self._fire_and_forget) if not t.done()]
+        if ff_late:
+            self._logger.info(
+                "Shutdown: draining %d late fire-and-forget task(s)...",
+                len(ff_late),
+            )
+            try:
+                _, ff_still = await asyncio.wait(ff_late, timeout=5)
+                if ff_still:
+                    for t in ff_still:
+                        t.cancel()
+                    await asyncio.gather(*ff_still, return_exceptions=True)
+            except BaseException:
+                for t in ff_late:
+                    if not t.done():
+                        t.cancel()
+                raise
+        self._fire_and_forget.clear()
+
         # 5. Shutdown dedicated plugin executor
         if hasattr(self, "_plugin_executor") and self._plugin_executor:
             # W4-M2: shutdown(wait=True, cancel_futures=True) so any
@@ -922,6 +964,10 @@ class Plexus(EventMixin):
         logger_levels = general_pre.get("logger_levels", {})
 
         self.yaml_config = yaml_dict
+        # BUG-012: snapshot the RAW parsed yaml BEFORE apply_configvalues writes
+        # resolved defaults back into self.yaml_config, so the no-op-reload
+        # short-circuit can compare raw-vs-raw (not raw-vs-applied).
+        self._yaml_config_raw = copy.deepcopy(yaml_dict)
         ConfigUtil.apply_configvalues(self)
         LogUtil.change_level(console_level)
         LogUtil.change_file_level(file_level)
@@ -1036,7 +1082,7 @@ class Plexus(EventMixin):
         # change_file_level / apply_logger_levels_config, producing
         # spurious side-effects (handler reconfiguration, log spam,
         # file-rotator restarts) when the config file is unchanged.
-        if new_yaml == self.yaml_config:
+        if new_yaml == getattr(self, "_yaml_config_raw", None):
             self._logger.debug(
                 "Config reload: no-op (yaml unchanged)"
             )
@@ -3319,6 +3365,11 @@ class Plexus(EventMixin):
                     if ps is not None:
                         if config_has_entry:
                             if ps.state != State.UNLOADED:
+                                # BUG-015: clear the instance BEFORE the UNLOADED
+                                # transition so observers of state_changed reading
+                                # `instance` for state==UNLOADED see None (parity
+                                # with the live-instance pop path).
+                                ps.instance = None
                                 self._transition_plugin(plugin_name, State.UNLOADED)
                         else:
                             self.plugin_states.pop(plugin_name, None)
@@ -3411,9 +3462,16 @@ class Plexus(EventMixin):
         # pop_plugin itself acquires per-plugin lifecycle locks (taking
         # _config_lock around the loop would re-enter or block them).
         async with self._config_lock:
-            plugins_to_purge = list(
-                set(self.plugins.keys()) | set(self.plugin_states.keys())
-            )
+            purge_set = set(self.plugins.keys()) | set(self.plugin_states.keys())
+            # BUG-010 (R3-RR-2): tear down in REVERSE dependency-topo order so
+            # dependents shut down before their dependencies (mirror close()).
+            ordered = [n for n in self._dep_topo_order if n in purge_set]
+            seen = set(ordered)
+            for n in list(self.plugins.keys()) + list(self.plugin_states.keys()):
+                if n in purge_set and n not in seen:
+                    ordered.append(n)
+                    seen.add(n)
+            plugins_to_purge = list(reversed(ordered))
         errors: List[BaseException] = []
         for plugin_name in plugins_to_purge:
             try:
@@ -3444,9 +3502,20 @@ class Plexus(EventMixin):
         (3.11+). Symmetric with purge_plugins above.
         """
         self._logger.info(f"Purging plugins except: {excluded_names}")
-        plugins_to_purge = [
-            name for name in list(self.plugins.keys()) if name not in excluded_names
-        ]
+        # BUG-016: snapshot under _config_lock (R4-UU-7) over the
+        # plugins ∪ plugin_states union (R2-BB-3 ghost entries), mirroring
+        # purge_plugins. BUG-011 (R3-RR-2): reverse dependency-topo order.
+        async with self._config_lock:
+            purge_set = (
+                set(self.plugins.keys()) | set(self.plugin_states.keys())
+            ) - set(excluded_names)
+            ordered = [n for n in self._dep_topo_order if n in purge_set]
+            seen = set(ordered)
+            for n in list(self.plugins.keys()) + list(self.plugin_states.keys()):
+                if n in purge_set and n not in seen:
+                    ordered.append(n)
+                    seen.add(n)
+            plugins_to_purge = list(reversed(ordered))
         errors: List[BaseException] = []
         for plugin_name in plugins_to_purge:
             try:
@@ -4854,7 +4923,7 @@ class Plexus(EventMixin):
                 # request failures. Previously raised bare Exception
                 # which forced callers to use `except Exception` and
                 # accidentally swallowed unrelated errors too.
-                raise RequestException(f"Request {request.id} failed: {request.result}")
+                raise RequestException(f"Request {request.id} failed: {result}")
             yield result
         finally:
             self.requests.pop(request.id, None)
@@ -4875,7 +4944,7 @@ class Plexus(EventMixin):
             if request.error:
                 # C-055: see request_context_async — same RequestException
                 # canonical type so callers can catch by type.
-                raise RequestException(f"Request {request.id} failed: {request.result}")
+                raise RequestException(f"Request {request.id} failed: {result}")
             yield result
         finally:
             self.requests.pop(request.id, None)
@@ -5070,7 +5139,7 @@ class Plexus(EventMixin):
         author_host: str = None,
         request_id: str = None,
         _post_construct_hook: Optional[Callable[["GeneratorRequest"], None]] = None,
-    ) -> Request:
+    ) -> GeneratorRequest:
         """Create a new request synchronously.
 
         R2-FF-7: ``_post_construct_hook`` is forwarded to
@@ -5416,7 +5485,7 @@ class Plexus(EventMixin):
         ):
 
             for node in nm.nodes:
-                if not (node.enabled and await node.is_alive()):
+                if not (node.enabled and await node.is_alive(timeout=nm.liveness_timeout)):
                     continue
 
                 if not _matches_remote_node(node.hostname) or _is_remote_node_blocked(
@@ -5921,7 +5990,11 @@ class Plexus(EventMixin):
         Subscription (those are pickle-shipped to peers).
         """
         self._rl_endpoint_in.clear()
-        self._rl_sub_in.clear()
+        # BUG-014: do NOT clear _rl_sub_in here. It is the only table
+        # repopulated ACROSS an await (get_plugin_subscriptions) below;
+        # clearing it here would expose an empty table to a concurrent
+        # synchronous _rl_admit_in during that await (admit-without-charge).
+        # It is cleared+repopulated in one no-await stretch further down.
         self._rl_event_out.clear()
         self._rl_plugin_out.clear()
         self._rl_framework_in = None
@@ -6029,7 +6102,12 @@ class Plexus(EventMixin):
                      (DIM_FRAMEWORK_IN, FRAMEWORK_IN_KEY)],
                 )
 
-        wanted_subs = set()
+        # BUG-014: gather all subs via the awaiting calls FIRST (no _rl_sub_in
+        # mutation), THEN clear+repopulate _rl_sub_in in one synchronous
+        # (no-await) stretch. The synchronous _rl_admit_in cannot interleave
+        # into a no-await stretch, so a concurrent dispatch sees either the
+        # fully-old or the fully-new table — never the emptied-mid-rebuild one.
+        all_subs = []
         for plugin in list(self.plugins.values()):
             try:
                 subs = await self.topic_registry.get_plugin_subscriptions(
@@ -6037,9 +6115,13 @@ class Plexus(EventMixin):
                 )
             except Exception:
                 subs = []
-            for sub in subs:
-                self._rl_build_sub(sub)
-                wanted_subs.add(sub.sub_uuid)
+            all_subs.extend(subs)
+
+        wanted_subs = set()
+        self._rl_sub_in.clear()
+        for sub in all_subs:
+            self._rl_build_sub(sub)
+            wanted_subs.add(sub.sub_uuid)
 
         # Prune orphan buckets left by removed plugins / subs (configure only
         # adds). Static dims are pruned against the configured set; Sub-IN
@@ -6802,7 +6884,7 @@ class Plexus(EventMixin):
                         if request.timeout_duration is not None:
                             remaining = (
                                 request.timeout_duration
-                                - (time.time() - request.created_at)
+                                - (time.monotonic() - request.created_at_mono)
                             )
                             if remaining <= 0:
                                 await self._set_gen_request_result(
