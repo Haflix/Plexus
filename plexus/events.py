@@ -1934,128 +1934,142 @@ class EventMixin:
         # consistently with the non-streaming request_event path.
         # NOTE: find_endpoint returns (None, None, None) on no-match
         # (NOT bare None), so check the unpacked plugin slot.
-        target_plugin, endpoint, _node = await self.find_endpoint(
-            access_name=local_match.target_access_name,
-            hosts="local",
-            plugin_uuid=local_match.target_plugin_uuid,
-            requester_id=local_match.plugin_uuid,
-            target_plugin=local_match.target_plugin,
-        )
-        if target_plugin is None or endpoint is None:
-            raise RequestException(
-                f"request_event_stream {event_id!r}: target endpoint "
-                f"{local_match.target_access_name!r} not found on "
-                f"{local_match.target_plugin!r} (or access denied per C18)"
-            )
-
-        # R1 HIGH-3 fix: Stage O readiness gate also applies on the
-        # LOCAL request_event_stream path. Without this gate, fan-out
-        # from a publisher to a subscriber that is mid-on_enable would
-        # bypass _process_request_stream's gate entirely (this path
-        # iterates the generator directly) and hit a not-yet-ready
-        # handler. Same skip rules as _process_request_stream — remote
-        # plugins (no readiness events) and self-calls (Q23 — avoid
-        # gating against own _lifecycle_ready from inside on_enable).
-        if (
-            isinstance(target_plugin, Plugin)
-            and target_plugin.plugin_uuid != publisher.plugin_uuid
-        ):
-            try:
-                await self._wait_for_plugin_ready(target_plugin)
-            except asyncio.TimeoutError as e:
-                ready_timeout = getattr(
-                    self,
-                    "plugin_ready_timeout",
-                    DEFAULT_PLUGIN_READY_TIMEOUT,
-                )
-                raise RequestException(
-                    f"request_event_stream {event_id!r}: target plugin "
-                    f"{target_plugin.plugin_name!r} not ready within "
-                    f"{ready_timeout}s"
-                ) from e
-
-        internal = endpoint.get("internal_name") or local_match.target_access_name
-        func = getattr(target_plugin, internal, None)
-        if func is None or not (
-            inspect.isasyncgenfunction(func) or inspect.isgeneratorfunction(func)
-        ):
-            raise RequestException(
-                f"request_event_stream {event_id!r}: handler is not a "
-                f"generator function (use request_event instead)"
-            )
-
-        # Build the Event metadata for first-chunk wrapping.
-        event_meta = Event(
-            topic=resolved_topic,
-            payload=payload,
-            author=publisher.plugin_name,
-            author_id=publisher.plugin_uuid,
-            author_host=self.hostname,
-            subscription_id=(
-                local_match.declared_id
-                if local_match.declared_id is not None
-                else local_match.sub_uuid
-            ),
-            timestamp=now_ts,
-        )
-
-        # B-054 fix: route through GeneratorRequest + _spawn_tracked
-        # so close()'s 30s drain catches the in-flight stream and
-        # pop_plugin's pending-request walk can fail the Request when
-        # the target plugin is unloaded mid-stream.
-        #
-        # CRITICAL — pass timeout=None to GeneratorRequest. The
-        # timeout we received is enforced by the producer's own
-        # _residual() (loop.time() monotonic deadline). If we also
-        # passed it here, get_queue_stream (utils.py:1999/2013)
-        # would enforce it independently with wall-clock time.time(),
-        # producing a double-trigger race. The current inline code
-        # had NO consumer-side get_queue_stream timeout, so timeout=
-        # None here preserves single-source-of-truth semantics.
-        request = GeneratorRequest(
-            author_host=self.hostname,
-            plugin=local_match.target_plugin or local_match.plugin_name,
-            method=local_match.target_access_name,
-            args=payload,
-            plugin_uuid=local_match.target_plugin_uuid,
-            target_hosts="local",
-            blocked_hosts=None,
-            author=publisher.plugin_name,
-            author_id=publisher.plugin_uuid,
-            timeout=None,  # B-054: producer enforces, see above
-            request_id=None,
-            event_loop=self.main_event_loop,
-            kind="request_event_stream",
-            topic=resolved_topic,
-            origin_subscription_id=event_meta.subscription_id,
-            # Rate-limiter Step 3d: the UNAMBIGUOUS sub_uuid (NOT
-            # event_meta.subscription_id, which is declared_id-or-sub_uuid) so
-            # _process_request_event_stream keys the sub IN-set correctly.
-            origin_sub_uuid=local_match.sub_uuid,
-            timestamp=now_ts,
-            requester_id=local_match.plugin_uuid,
-        )
-        async with self.request_lock:
-            self.requests[request.id] = request
-
-        producer_task = self._spawn_tracked(
-            self._process_request_event_stream(
-                request,
-                target_plugin,
-                endpoint,
-                event_meta,
-                timeout=timeout,
-                caller_chain=_caller_chain,
-                verbose_notifier=publisher.verbose_notifier,
-            ),
-            name=f"event_stream:{request.target_plugin}.{request.target_method}<-{resolved_topic}",
-        )
-        request._producer_task = producer_task
-
-        # B-074 Step 10: stream-end tracking for verbose log L5.
+        # BUG-018: hoist the stream try/finally to BEFORE find_endpoint so
+        # the phase="ended" emit (in the finally below) also fires on the
+        # three pre-dispatch raises (missing/forbidden target, not-ready,
+        # non-generator handler) that follow the phase="started" emit.
+        # Without it an observer of _core/event/streamed sees a started
+        # that never closes. Mirrors the remote branch's C-077 try/finally.
+        # chunk_count/exit_reason are the B-074 Step 10 stream-end tracking,
+        # hoisted with the try.
         chunk_count = 0
         exit_reason = "normal"
+        # BUG-018: bind `request` up front so the finally's cleanup can guard on
+        # it — the three pre-dispatch raises fire before the GeneratorRequest is
+        # built, so there is nothing to collect on those paths.
+        request = None
         try:
+            target_plugin, endpoint, _node = await self.find_endpoint(
+                access_name=local_match.target_access_name,
+                hosts="local",
+                plugin_uuid=local_match.target_plugin_uuid,
+                requester_id=local_match.plugin_uuid,
+                target_plugin=local_match.target_plugin,
+            )
+            if target_plugin is None or endpoint is None:
+                exit_reason = "exception"  # BUG-018: accurate verbose-log reason
+                raise RequestException(
+                    f"request_event_stream {event_id!r}: target endpoint "
+                    f"{local_match.target_access_name!r} not found on "
+                    f"{local_match.target_plugin!r} (or access denied per C18)"
+                )
+
+            # R1 HIGH-3 fix: Stage O readiness gate also applies on the
+            # LOCAL request_event_stream path. Without this gate, fan-out
+            # from a publisher to a subscriber that is mid-on_enable would
+            # bypass _process_request_stream's gate entirely (this path
+            # iterates the generator directly) and hit a not-yet-ready
+            # handler. Same skip rules as _process_request_stream — remote
+            # plugins (no readiness events) and self-calls (Q23 — avoid
+            # gating against own _lifecycle_ready from inside on_enable).
+            if (
+                isinstance(target_plugin, Plugin)
+                and target_plugin.plugin_uuid != publisher.plugin_uuid
+            ):
+                try:
+                    await self._wait_for_plugin_ready(target_plugin)
+                except asyncio.TimeoutError as e:
+                    ready_timeout = getattr(
+                        self,
+                        "plugin_ready_timeout",
+                        DEFAULT_PLUGIN_READY_TIMEOUT,
+                    )
+                    exit_reason = "exception"  # BUG-018: accurate verbose-log reason
+                    raise RequestException(
+                        f"request_event_stream {event_id!r}: target plugin "
+                        f"{target_plugin.plugin_name!r} not ready within "
+                        f"{ready_timeout}s"
+                    ) from e
+
+            internal = endpoint.get("internal_name") or local_match.target_access_name
+            func = getattr(target_plugin, internal, None)
+            if func is None or not (
+                inspect.isasyncgenfunction(func) or inspect.isgeneratorfunction(func)
+            ):
+                exit_reason = "exception"  # BUG-018: accurate verbose-log reason
+                raise RequestException(
+                    f"request_event_stream {event_id!r}: handler is not a "
+                    f"generator function (use request_event instead)"
+                )
+
+            # Build the Event metadata for first-chunk wrapping.
+            event_meta = Event(
+                topic=resolved_topic,
+                payload=payload,
+                author=publisher.plugin_name,
+                author_id=publisher.plugin_uuid,
+                author_host=self.hostname,
+                subscription_id=(
+                    local_match.declared_id
+                    if local_match.declared_id is not None
+                    else local_match.sub_uuid
+                ),
+                timestamp=now_ts,
+            )
+
+            # B-054 fix: route through GeneratorRequest + _spawn_tracked
+            # so close()'s 30s drain catches the in-flight stream and
+            # pop_plugin's pending-request walk can fail the Request when
+            # the target plugin is unloaded mid-stream.
+            #
+            # CRITICAL — pass timeout=None to GeneratorRequest. The
+            # timeout we received is enforced by the producer's own
+            # _residual() (loop.time() monotonic deadline). If we also
+            # passed it here, get_queue_stream (utils.py:1999/2013)
+            # would enforce it independently with wall-clock time.time(),
+            # producing a double-trigger race. The current inline code
+            # had NO consumer-side get_queue_stream timeout, so timeout=
+            # None here preserves single-source-of-truth semantics.
+            request = GeneratorRequest(
+                author_host=self.hostname,
+                plugin=local_match.target_plugin or local_match.plugin_name,
+                method=local_match.target_access_name,
+                args=payload,
+                plugin_uuid=local_match.target_plugin_uuid,
+                target_hosts="local",
+                blocked_hosts=None,
+                author=publisher.plugin_name,
+                author_id=publisher.plugin_uuid,
+                timeout=None,  # B-054: producer enforces, see above
+                request_id=None,
+                event_loop=self.main_event_loop,
+                kind="request_event_stream",
+                topic=resolved_topic,
+                origin_subscription_id=event_meta.subscription_id,
+                # Rate-limiter Step 3d: the UNAMBIGUOUS sub_uuid (NOT
+                # event_meta.subscription_id, which is declared_id-or-sub_uuid) so
+                # _process_request_event_stream keys the sub IN-set correctly.
+                origin_sub_uuid=local_match.sub_uuid,
+                timestamp=now_ts,
+                requester_id=local_match.plugin_uuid,
+            )
+            async with self.request_lock:
+                self.requests[request.id] = request
+
+            producer_task = self._spawn_tracked(
+                self._process_request_event_stream(
+                    request,
+                    target_plugin,
+                    endpoint,
+                    event_meta,
+                    timeout=timeout,
+                    caller_chain=_caller_chain,
+                    verbose_notifier=publisher.verbose_notifier,
+                ),
+                name=f"event_stream:{request.target_plugin}.{request.target_method}<-{resolved_topic}",
+            )
+            request._producer_task = producer_task
+
             try:
                 async for result, error, _ in request.get_queue_stream():
                     if error:
@@ -2097,7 +2111,11 @@ class EventMixin:
                 )
             # Mark for cleanup. Cancels the producer task on early
             # break (B-002 pattern). Mirrors execute_stream's pattern.
-            await request.set_collected()
+            # BUG-018: guard — a pre-dispatch raise (no/forbidden target, not
+            # ready, non-generator handler) leaves `request` None, so there is
+            # no GeneratorRequest to collect.
+            if request is not None:
+                await request.set_collected()
 
     @gen_log_errors
     def request_event_stream_sync(
