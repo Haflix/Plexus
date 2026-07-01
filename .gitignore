@@ -235,3 +235,4 @@ _keys_tui_smoke/
 # need them.
 plugins_test/audit_pilot/
 plugins_test/audit_2026_06/
+plugins_test/hunt_2026_06/
