@@ -40,7 +40,7 @@ Submodules:
     networking_classes  — Node + RemotePlugin data classes
 """
 
-__version__ = "0.69.5"
+__version__ = "0.69.6"
 
 from .core import Plexus
 from .utils import (
@@ -93,9 +93,9 @@ from .notifier import (
     Subscription,
 )
 # C-170: pull in the public networking + serialization symbols that
-# operators reach for from sibling-repo plugins and migration docs but
-# that the old __all__ omitted. SyncDispatcher is removed from the
-# public surface — it is framework-internal and was leaked by accident.
+# plugin authors and operators reach for but that the old __all__
+# omitted. SyncDispatcher is removed from the public surface — it is
+# framework-internal and was leaked by accident.
 from .networking import (
     AdvertSub,
     PeerSpec,

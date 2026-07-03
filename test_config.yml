@@ -97,7 +97,7 @@ plugins:
     enabled: true
     path: ./plugins_test/TestHotReloadNetworkingSuite
 
-  # Session 2 internal event bus + done-callback eviction regression suite (B-073)
+  # Internal event bus + done-callback eviction regression suite (B-073)
   - name: TestInternalEventBusSuite
     enabled: true
     path: ./plugins_test/TestInternalEventBusSuite

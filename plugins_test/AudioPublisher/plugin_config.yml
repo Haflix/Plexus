@@ -1,5 +1,5 @@
-description: Perf fixture — bursts N publish_event calls with audio-sized payloads. Simulates DiscordBot's sink callback firing one event per 20ms PCM frame.
-version: 0.1.0
+description: Perf fixture — bursts N publish_event calls with audio-sized payloads. Simulates an audio-capture callback firing one event per 20ms PCM frame.
+version: 0.1.1
 remote: True
 arguments:
 

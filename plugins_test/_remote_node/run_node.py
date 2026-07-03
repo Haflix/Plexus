@@ -40,7 +40,7 @@ async def main() -> None:
     # Override port BEFORE wait_until_ready: NetworkManager is constructed
     # there via ``_build_network_manager``, which reads
     # ``yaml_config["networking"]["port"]`` (NOT the ``pc.networking_port``
-    # instance attribute) per Commit 2b cycle 3 HIGH-γ. The instance
+    # instance attribute). The instance
     # attribute write below is kept for parity with code paths that
     # still read ``self.networking_*`` (e.g. apply_configvalues' own
     # state); the yaml write is the load-bearing one for construction.

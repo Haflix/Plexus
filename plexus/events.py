@@ -6,7 +6,7 @@ touches (topic_registry, network, plugins, requests, the observer registry,
 etc.) is created in ``Plexus.__init__``, and every non-event method it calls
 (``self._spawn_tracked``, ``self._process_request``, ...) lives on Plexus and
 resolves through the MRO at runtime. The split is a pure relocation; call
-sites are unchanged. See _private/plans/core_extraction_plan.md.
+sites are unchanged.
 
 Imports are limited to the names the moved bodies use, sourced from the same
 real modules core.py imports them from, so events.py never imports core and
@@ -1006,9 +1006,9 @@ class EventMixin:
         # forget per-peer publish tasks for every advertised sub on
         # every reachable peer that survived per-peer + sub-level
         # filters. Best-effort; return count is local + remote.
-        # Snapshot ``nm = self.network`` once (Commit 2b cycle 2 MED-B):
-        # mid-block hot-reload would otherwise leak calls onto a
-        # stopped NM. cycle 4 HIGH-1: the ``_deregister`` closure below
+        # Snapshot ``nm = self.network`` once: mid-block hot-reload
+        # would otherwise leak calls onto a stopped NM. The
+        # ``_deregister`` closure below
         # MUST capture ``nm`` via default-arg so done-callbacks fired
         # AFTER a rebuild swap continue mutating the OLD NM's
         # ``_inflight_publishes`` (drain is ongoing on it) instead of
@@ -1073,7 +1073,7 @@ class EventMixin:
                         tasks.append(t)
                         nm._inflight_publishes.setdefault(peer_hostname, set()).add(t)
 
-                    # cycle 4 HIGH-1: capture ``nm`` via default-arg so
+                    # Capture ``nm`` via default-arg so
                     # the done-callback uses the OLD NM's accounting
                     # even if a hot-reload has swapped ``self.network``
                     # mid-flight. Reading ``self.network`` inside
@@ -1262,7 +1262,7 @@ class EventMixin:
             try:
                 await self._process_request(request)
             finally:
-                # B-073 Session 2 Step 3: done-callback eviction. Was
+                # B-073: done-callback eviction. Was
                 # ``await request.set_collected()`` (Q12 fix); migrated
                 # to direct sync pop. Idempotent — _process_request's
                 # own finally already pops via the producer-side path.
@@ -1469,8 +1469,8 @@ class EventMixin:
             # PR3 Stage C step 19 — remote dispatch fall-through (locked
             # #6 + #13). Iterate _inbound_global_order in C11 insertion
             # order, apply ALL filters, try each surviving candidate.
-            # Snapshot ``nm = self.network`` once (Commit 2b cycle 2
-            # MED-B): mid-block hot-reload would otherwise leak calls
+            # Snapshot ``nm = self.network`` once: mid-block
+            # hot-reload would otherwise leak calls
             # onto a stopped NM. None falls through to the bottom
             # ``raise RequestException("no subscriber matches...")``.
             #
@@ -1612,7 +1612,7 @@ class EventMixin:
                 raise RequestException(result)
             return result
         finally:
-            # B-073 Session 2 Step 3: done-callback eviction. Was
+            # B-073: done-callback eviction. Was
             # ``await request.set_collected()``; migrated to direct sync
             # pop. Defensive — _process_request's producer-side finally
             # and _fanout_sub._run_and_collect's finally both also pop
@@ -1785,8 +1785,8 @@ class EventMixin:
             # #6 + #13). Pre-first-chunk fall-through ONLY; mid-stream
             # NetworkRequestException terminates without fall-through to
             # preserve the Event-first invariant.
-            # Snapshot ``nm = self.network`` once (Commit 2b cycle 2
-            # MED-B): mid-block hot-reload would otherwise leak calls
+            # Snapshot ``nm = self.network`` once: mid-block
+            # hot-reload would otherwise leak calls
             # onto a stopped NM. None falls through to the bottom
             # ``raise RequestException("no subscriber matches...")``.
             # C-077: wrap the whole remote-dispatch block in try/finally
@@ -2316,7 +2316,7 @@ class EventMixin:
 
         # PR3 Stage C add-delta hook (locked #18 item 3). No-op when
         # networking is disabled or not yet ready.
-        # Snapshot nm (Commit 2b cycle 2 MED-B): single-call site;
+        # Snapshot nm: single-call site;
         # snapshotting matches the loop-site pattern for consistency
         # and tightens the guard-vs-call window in case of mid-block
         # hot-reload.
@@ -2357,7 +2357,7 @@ class EventMixin:
         # PR3 Stage C remove-delta hook (locked #18 item 4). Send BEFORE
         # the registry drop so the broadcast still has access to the
         # sub object and our peers see the remove cleanly.
-        # Snapshot nm (Commit 2b cycle 2 MED-B): single-call site,
+        # Snapshot nm: single-call site,
         # snapshotting for consistency with the loop-site pattern.
         nm = self.network
         if (

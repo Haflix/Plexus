@@ -44,7 +44,7 @@ def _install_fast_loop():
 
 
 CONFIG_PATH = "test_config.yml"
-DUMP_PATH = "_private/test_outputs/phase_1_baseline.json"
+DUMP_PATH = "test_outputs/test_report.json"
 RUNNER_PLUGIN = "TestRunner"
 
 # Subnode endpoint default (kept in sync with TestRemoteSuite.SUBNODE_PORT_DEFAULT
@@ -212,7 +212,7 @@ def _cleanup_test_mtls_identities(mtls: Dict[str, str]) -> None:
             os.unlink(pem_file)
         except OSError:
             pass
-    # Cycle 2 fresh-eyes MED fix: clear env vars so a second in-process
+    # Clear env vars so a second in-process
     # invocation of run_tests() (test rerun, REPL session, etc.) cannot
     # pick up stale paths pointing at the now-deleted temp dirs.
     for key in (
@@ -233,7 +233,7 @@ async def run_tests() -> int:
         _patch_networking_for_mtls(pc, mtls)
         await pc.wait_until_ready()
     except Exception:
-        # Cycle 2 fresh-eyes / verifier MED fix: ensure the temp dirs +
+        # Ensure the temp dirs +
         # env vars are cleaned up even if Plexus startup raises.
         # The downstream try/finally only fires if pc was constructed
         # successfully.

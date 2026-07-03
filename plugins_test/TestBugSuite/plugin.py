@@ -139,7 +139,7 @@ class _B066LogCapture:
         self._attached = True
 
     def detach(self) -> None:
-        # Cycle 4 fresh-eyes MED fix: only restore logger level if
+        # Only restore logger level if
         # attach() actually ran. A `finally`-block detach() called after
         # an exception during attach setup must not silently reset the
         # logger to NOTSET (which would suppress WARNING messages later
@@ -421,7 +421,7 @@ class TestBugSuite(Plugin):
         hostname: Optional[str] = None,
     ) -> Dict[str, Any]:
         nm = self._plexus.network
-        # Cycle 4 fix: every test peer uses a UNIQUE subject CN. If
+        # Every test peer uses a UNIQUE subject CN. If
         # two self-signed CA certs in the trust store share Subject DN,
         # OpenSSL's chain-builder picks the FIRST match by name and
         # validates the presented cert's signature against the WRONG
@@ -1185,7 +1185,7 @@ class TestBugSuite(Plugin):
                 await self.publish_event_for_repro()
             # Poll until burst-spawned tasks drain. Each fan-out task
             # awaits _process_request → endpoint dispatch → producer's
-            # finally pops from self.requests (B-073 Session 2 Step 3
+            # finally pops from self.requests (B-073
             # — was set_collected pre-migration) → done_callback fires
             # via call_soon. One asyncio.sleep(0) is NOT enough;
             # deadline-bounded poll handles slow CI.
@@ -1580,10 +1580,10 @@ class TestBugSuite(Plugin):
                 "verdict tracks there"
             )
 
-        # B-073 Session 2 Step 5: B-006 skip-stub deleted. The actual
-        # B-006 case in TestLifecycleSuite was deleted (Step 4 killed
-        # running_loop, removing the failure mode the case guarded
-        # against). No upstream case to defer to.
+        # B-073: B-006 skip-stub deleted. The actual
+        # B-006 case in TestLifecycleSuite was deleted (the B-073 fix
+        # killed running_loop, removing the failure mode the case
+        # guarded against). No upstream case to defer to.
 
         async def body_b_007_covered(c):
             c.skip(
@@ -1675,7 +1675,7 @@ class TestBugSuite(Plugin):
             tags=("bug_repro", "covered_elsewhere"), bug_ids=("B-005",),
             **kw,
         )
-        # B-073 Session 2 Step 5: bug.B-006.covered_by_test_lifecycle_suite
+        # B-073: bug.B-006.covered_by_test_lifecycle_suite
         # registration removed alongside the body stub above.
         await rec.run_case(
             "bug.B-007.covered_by_test_lifecycle_suite", body_b_007_covered,

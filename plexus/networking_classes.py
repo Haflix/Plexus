@@ -1,6 +1,6 @@
 """Networking-side data classes — RemotePlugin and Node.
 
-Note (v0.26.0): the Plugin state machine added in Session 3 applies to
+Note: the Plugin state machine added in v0.26.0 applies to
 LOCAL plugins only. ``RemotePlugin.enabled`` is the snapshot of a remote
 plugin's enabled state at advertisement time — a distinct concept from
 the local state machine. ``RemotePlugin.enabled`` and ``Node.enabled``

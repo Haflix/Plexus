@@ -9,9 +9,6 @@ Exercises:
   - Stray top-level arguments: on plugin entry (legacy field warning)
   - Plugin with endpoints: null / absent loads with 0 endpoints
 
-All 15 cases map 1:1 to the test spec in notes.txt section I STEP 6 and
-section H TESTING.
-
 Fixture plugins used (all live in plugins_test/):
   TestPR2Fixture        — dict-form endpoints, no internal_name, no access_name field
   TestPR2ListFixture    — legacy list-form endpoints (should be rejected)

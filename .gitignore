@@ -229,6 +229,9 @@ plugins/
 # fingerprints into peer configs.
 _keys_tui_smoke/
 
+# Test-run report dumps (test_application.py DUMP_PATH).
+test_outputs/
+
 # Audit-triage test scripts (~100 files, internal bug-intake verification).
 # Not part of the main test framework — used during framework audit cycles
 # to verify findings against running code. Keep local; plugin authors don't

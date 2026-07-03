@@ -1,4 +1,4 @@
-"""TestInternalEventBusSuite — Session 2 coverage for B-073 internal
+"""TestInternalEventBusSuite — coverage for the B-073 internal
 event bus + done-callback eviction (shipped 0.24.0).
 
 Categories:

@@ -573,8 +573,7 @@ class TestRemoteSuite(Plugin):
         # B-018 spoof cases retired 2026-06-14: the spoofer harness was removed
         # in PR3 Stage D so these were permanent skips. B-018b is now covered
         # end-to-end by the B-066 suite (system_caller denial/grant) plus
-        # bug.B-018b.uuid_spoof_denied_local_endpoint in TestBugSuite. See
-        # _private/bugs/bugs.jsonl entry B-018.
+        # bug.B-018b.uuid_spoof_denied_local_endpoint in TestBugSuite.
 
         async def body_b019_count_per_node(c):
             # On the parent's side we have one local sub for test/r/multi (set up
@@ -706,7 +705,7 @@ class TestRemoteSuite(Plugin):
             peer_host = self._peer_info["hostname"]
             assert peer_host in entry["hosts"], (peer_host, entry["hosts"])
 
-        # C-128: Session 4 (v0.27.0) ack-protocol coverage variants.
+        # C-128: v0.27.0 ack-protocol coverage variants.
         # Each helper mutates the LOCAL NM's _outbound_adverts state
         # to simulate the failure mode being tested, then asserts the
         # framework's recovery / state-machine response.  These tests
@@ -729,7 +728,7 @@ class TestRemoteSuite(Plugin):
                 await asyncio.sleep(0.05)
             return None
 
-        # Session 4 (v0.27.0): sub-advert ack protocol regression guard.
+        # v0.27.0: sub-advert ack protocol regression guard.
         # Registers a runtime sub on the parent — broadcast_local_sub_added
         # fires an MSG_SUB_DELTA(add) to the subnode, which acks via
         # MSG_SUB_ADVERTISE_ACK on its outbound back to the parent. Verify
@@ -1284,7 +1283,7 @@ class TestRemoteSuite(Plugin):
              ("bug_repro", "regression_guard"), ("B-020",)),
             ("remote.find_endpoints_by_tag", body_find_endpoints_by_tag,
              ("discovery", "basic"), ()),
-            # Session 4 (v0.27.0) — sub-advert ack protocol
+            # v0.27.0 — sub-advert ack protocol
             ("remote.advert_ack.basic", body_advert_ack_basic,
              ("basic", "advert_ack"), ()),
             # C-128 — ack-protocol failure-mode coverage. timeout_resend

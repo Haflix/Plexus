@@ -4,7 +4,7 @@ Exercises plugin lifecycle: load, enable, disable, reload, pop, purge plus
 bug repros B-004 / B-005 / B-007 / B-008 / B-009 / B-010 / B-016 /
 B-037 / B-043 and the disable-reverse-order regression lock.
 
-B-073 Session 2 Step 5: B-006 case removed — its target failure mode
+B-073: B-006 case removed — its target failure mode
 (``running_loop`` crashing on a poisoned ``self.requests`` entry)
 ceased to exist when Step 4 killed ``running_loop`` and
 ``cleanup_requests`` entirely. Done-callback eviction at all 7
@@ -98,7 +98,7 @@ class TestLifecycleSuite(Plugin):
         await self._basic_logger_levels_skip(rec, kw)
         await self._basic_async_reload_skip(rec, kw)
         await self._state_machine_coverage(rec, kw)  # C-152
-        # B-073 Session 2 Step 5: B-006 case deleted (tested
+        # B-073: B-006 case deleted (tested
         # _running_loop_task which was killed in Step 4). Done-callback
         # eviction removes the entire failure mode the case guarded
         # against (cleanup_requests crash → maintenance loop dead).
@@ -736,7 +736,7 @@ class TestLifecycleSuite(Plugin):
                 await task
             except (asyncio.CancelledError, RequestException):
                 pass
-            # B-073 Session 2 Step 3: done-callback eviction. Was
+            # B-073: done-callback eviction. Was
             # ``await req.set_collected()``; migrated to direct sync
             # pop. The producer's finally in ``_process_request`` will
             # also pop on completion (idempotent under ``pop(key, None)``).
@@ -943,7 +943,7 @@ class TestLifecycleSuite(Plugin):
             tags=("config", "contract", "deferred"), **kw,
         )
 
-    # B-073 Session 2 Step 5: ``_basic_b006_running_loop`` deleted.
+    # B-073: ``_basic_b006_running_loop`` deleted.
     # The B-006 case tested ``running_loop`` survival of a poisoned
     # ``self.requests`` entry. After Step 4 killed ``running_loop`` +
     # ``cleanup_requests`` entirely, the failure mode the case guarded

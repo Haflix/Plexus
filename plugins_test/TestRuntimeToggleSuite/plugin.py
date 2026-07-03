@@ -243,7 +243,7 @@ class TestRuntimeToggleSuite(Plugin):
 
         async def body_unknown_uuid(c):
             """Test #39 — wrapper returns False for an unknown uuid.
-            Plus cycle 3 LOW-7 defensive guard: observe
+            Plus a defensive guard: observe
             ``_core/subscription/state_changed`` and assert NO emit
             fires (a future regression that mutated state on a
             fallback path before the None short-circuit would still
@@ -295,8 +295,7 @@ class TestRuntimeToggleSuite(Plugin):
             """Test #41 — two concurrent calls with opposite values.
             Registry-level mutation serializes through the lock; final
             state is whichever task acquired the lock last. Either
-            ordering is valid. Assertions tightened post-cycle-1 code
-            review (F1/M2 from reviewer cycle): the original
+            ordering is valid. Assertions tightened after review: the original
             ``in (True, False)`` was a tautology that passed for any
             value of ``sub.enabled`` including non-bool corruption.
 
@@ -309,7 +308,7 @@ class TestRuntimeToggleSuite(Plugin):
             appears at least once in the captured emits (set-membership,
             not strict "last == final" — broadcast latency can reorder
             emits across the two concurrent tasks when peer adverts
-            exist; cycle 4 M1 fix).
+            exist).
             """
             uuid = await self._make_runtime_sub(RUNTIME_TOGGLE_TOPIC)
             captured: List[bool] = []
@@ -357,7 +356,7 @@ class TestRuntimeToggleSuite(Plugin):
                 # == sub.enabled`` strictly because broadcasts happen
                 # OUTSIDE the registry lock — when real peer adverts
                 # are present, broadcast latency interleaves with the
-                # second task's mutation+emit. Cycle 4 M1 fix:
+                # second task's mutation+emit. So we
                 # downgrade the strict "last emit matches" check to a
                 # set-membership invariant ("final state was emitted at
                 # least once across the captured set").
@@ -371,7 +370,7 @@ class TestRuntimeToggleSuite(Plugin):
                 await self._drop_runtime_sub(uuid)
 
         async def body_emit_after_broadcast(c):
-            """Test #54 (post-cycle-1 review tightened): the emit must
+            """Test #54 (tightened after review): the emit must
             fire AFTER the broadcast call has returned. The original
             assertion only compared timestamps against the call window,
             which trivially passes when the broadcast path is skipped
@@ -405,8 +404,8 @@ class TestRuntimeToggleSuite(Plugin):
                 # ``is_ready`` — so the test can verify the gate IS
                 # enforced (if implementation bypasses the is_ready
                 # check and calls broadcast on a not-ready NM, the spy
-                # records it and the assertion below fires). cycle 3
-                # MEDIUM-1 fix: the cycle 2 version skipped spy install
+                # records it and the assertion below fires). An earlier
+                # version skipped spy install
                 # when not-ready, making the "no broadcast happened"
                 # assertion vacuous. When nm itself is None, there's
                 # nothing to spy on — skip the case to avoid pretending
@@ -425,8 +424,7 @@ class TestRuntimeToggleSuite(Plugin):
                 async def spy(sub, *, _target_uuid=uuid, _orig=original_broadcast):
                     # Filter by sub_uuid so concurrent broadcasts from
                     # unrelated paths (peer-driven flows, other suites'
-                    # teardowns) don't pollute the capture list (cycle 2
-                    # MEDIUM-1).
+                    # teardowns) don't pollute the capture list.
                     if getattr(sub, "sub_uuid", None) == _target_uuid:
                         captured_broadcast_ts.append(time.time())
                     return await _orig(sub)
@@ -579,7 +577,7 @@ class TestRuntimeToggleSuite(Plugin):
 
         async def body_unknown_id(c):
             """Test #44 — unknown plugin OR unknown event_id returns
-            False. Plus cycle 3 LOW-7 defensive guard: observe
+            False. Plus a defensive guard: observe
             ``_core/event/state_changed`` and assert NO emit fires on
             either failure path.
             """
@@ -767,7 +765,7 @@ class TestRuntimeToggleSuite(Plugin):
             must still be present on _core/request/started. Locks the
             contract so a future refactor cannot strip them silently.
 
-            Cycle 4 LOW-1 fix: filter captured emits by method so
+            Filter captured emits by method so
             unrelated concurrent /started emits (other suites' traffic,
             internal framework calls) cannot pollute ``captured[0]``.
             """
@@ -799,14 +797,14 @@ class TestRuntimeToggleSuite(Plugin):
                 self.internal_unobserve("_core/request/started", cb)
 
         async def body_completed_existing_keys_preserved(c):
-            """Test #49b (cycle 2 LOW-1 addition) — parallel regression
+            """Test #49b — parallel regression
             guard for _core/request/completed. Pre-existing keys
             (request_id, latency, error, ts) plus the new kind must be
             present. Symmetric with #49 — without this guard a refactor
             could strip latency or error from /completed without
             tripping any existing test.
 
-            Cycle 4 LOW-2 fix: filter by request_id so unrelated
+            Filter by request_id so unrelated
             /completed emits don't pollute ``captured[0]``. We learn
             the request_id from the matching /started emit.
             """
@@ -1012,7 +1010,7 @@ class TestRuntimeToggleSuite(Plugin):
                 # Filter BEFORE appending depth — concurrent state_changed
                 # emits from unrelated subs (other tests' teardowns, future
                 # observers) must NOT pollute observed_depths and break the
-                # strict [1, 2] assertion. cycle 3 LOW-3 fix.
+                # strict [1, 2] assertion.
                 sub_uuid = payload.get("sub_uuid")
                 if sub_uuid not in (outer_uuid, inner_uuid):
                     return
@@ -1024,7 +1022,6 @@ class TestRuntimeToggleSuite(Plugin):
                 inner_fired["v"] = True
                 # Observer fires on loop thread already; no loop= kwarg
                 # needed (deprecated since Python 3.10, removed in 3.12).
-                # cycle 2 LOW-6 fix.
                 try:
                     asyncio.ensure_future(
                         pc.set_subscription_enabled(inner_uuid, False),

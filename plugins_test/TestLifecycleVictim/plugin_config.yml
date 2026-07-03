@@ -1,5 +1,5 @@
 description: Phase 4 fixture — controllable lifecycle victim with configurable on_enable / on_disable behaviors
-version: 0.2.0
+version: 0.2.1
 remote: True
 arguments:
   level: "info"

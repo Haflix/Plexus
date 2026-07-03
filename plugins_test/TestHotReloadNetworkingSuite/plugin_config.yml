@@ -1,5 +1,5 @@
 description: Hot-reload networking suite — Commit 2b orchestrator + helpers (B-070)
-version: 0.1.0
+version: 0.1.1
 remote: false
 arguments:
 endpoints:

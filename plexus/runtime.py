@@ -421,7 +421,7 @@ _held_permit = threading.local()
 # path ever waits anywhere near this long.
 REACQUIRE_GRACE: float = 30.0
 
-# Per-pool thread ceilings (M). Runaway-prevention backstops a personal
+# Per-pool thread ceilings (M). Runaway-prevention backstops a typical
 # deployment never tunes, so hardcoded here rather than exposed as config
 # keys. The matching execution budgets (E) keep their existing
 # general.*_workers config keys (sync dispatchers) / the bare

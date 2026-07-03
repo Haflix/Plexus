@@ -1,5 +1,5 @@
-description: Session 2 — TestInternalEventBusSuite covering B-073 internal event bus + done-callback eviction
-version: "0.1.0"
+description: TestInternalEventBusSuite covering B-073 internal event bus + done-callback eviction
+version: "0.1.1"
 remote: false
 arguments:
 events:

@@ -1,9 +1,9 @@
 """publish_event throughput perf fixture — publisher side.
 
-Bursts N publish_event calls with audio-sized payloads. Models the
-DiscordBot voice sink's per-frame publish behavior: each captured 20ms
-PCM frame would publish one audio_chunk event for any subscribed
-plugin (STT, VAD, recorder, ...) to consume.
+Bursts N publish_event calls with audio-sized payloads. Models a
+real-time audio-capture plugin's per-frame publish behavior: each
+captured 20ms PCM frame publishes one audio_chunk event for any
+subscribed plugin to consume.
 """
 
 import time

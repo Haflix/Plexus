@@ -706,8 +706,6 @@ class LogUtil(logging.Logger):
         root_logger = logging.getLogger()
         root_logger.setLevel(log_level)
 
-        # logging.root.setLevel(log_level)  # NOTE: FOR TESTING
-
         # If a previous create() ran (e.g. test setUp/tearDown cycle), tear
         # its listener and FD redirector down before installing new ones —
         # otherwise the old QueueListener thread blocks forever on its

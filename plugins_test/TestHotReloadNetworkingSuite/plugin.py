@@ -13,9 +13,8 @@ Exercises the hot-reload code paths added by Commit 2b for B-070:
 
 These tests run as pure-function checks against the helpers + a
 monkeypatch case for the rebuild abort path. No real TLS peers or
-subprocess required — the integration smoke for the full rebuild
-flow is in the manual smoke-test plan in
-`_private/framework_changes_plan.md` Session 1.
+subprocess required — the full rebuild flow is covered by a manual
+smoke test.
 
 Cases (5):
 
@@ -31,8 +30,6 @@ Cases (5):
 5. `hotreload.rebuild.construction_failure_keeps_old_state` —
    monkeypatch `_build_network_manager` to raise; verify
    `_rebuild_networking` early-returns without mutating state
-
-Spec: `_private/next_session_handoff.md` (Commit 2b Step 8).
 """
 
 import sys
@@ -254,7 +251,7 @@ class TestHotReloadNetworkingSuite(Plugin):
     ):
         """B-070 _rebuild_networking: construction failure (monkeypatch
         ``_build_network_manager`` to raise) leaves ``self.network``
-        and ``self.yaml_config`` unchanged. Per cycle 3 HIGH-B + the
+        and ``self.yaml_config`` unchanged. Per the
         Step 7 docstring's "if construct raises → log error, abort,
         NO state mutation" guarantee.
         """

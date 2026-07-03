@@ -679,7 +679,7 @@ class TestExecuteSuite(Plugin):
                 await task
             except (asyncio.CancelledError, RequestException):
                 pass
-            # B-073 Session 2 Step 3: done-callback eviction. Was
+            # B-073: done-callback eviction. Was
             # ``await req.set_collected()`` (cleanup_requests reaped
             # after ``collected=True``). Migrated to direct sync pop;
             # the producer's finally in ``_process_request`` will also

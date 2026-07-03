@@ -1,4 +1,4 @@
-"""Plugin state machine types — Session 3 (v0.26.0).
+"""Plugin state machine types — v0.26.0.
 
 Convention-only read-only data containers for the plugin lifecycle state
 machine. ``State`` is a Python ``Enum`` and ``PluginState`` is a plain

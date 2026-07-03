@@ -362,7 +362,7 @@ class Plexus(EventMixin):
         # via plugins.get(name) returning None for popped entries.
         self._plugin_deps: Dict[str, List[DependencySpec]] = {}
         self._dep_topo_order: List[str] = []
-        # Session 3 (v0.26.0): plugin state machine. Read-only data
+        # v0.26.0: plugin state machine. Read-only data
         # container; all mutations through plx._transition_plugin(name, state).
         # External readers MUST snapshot before iterating: dict(plx.plugin_states).
         self.plugin_states: Dict[str, PluginState] = {}
@@ -433,8 +433,8 @@ class Plexus(EventMixin):
         # ``wait_until_ready()`` during boot AND by
         # ``_rebuild_networking`` (Step 7) during hot reload —
         # non-reentrant, held across NetworkManager construction +
-        # ``network.start()`` so the two flows can't race. Per cycle 3
-        # HIGH-α + Option A (one canonical construction site lives in
+        # ``network.start()`` so the two flows can't race (one
+        # canonical construction site lives in
         # ``wait_until_ready``; ``start()`` is a thin shim).
         self._network_rebuild_lock: asyncio.Lock = asyncio.Lock()
         # R2-DD-4: signalled if a rebuild aborts mid-flight (cancelled or
@@ -567,11 +567,11 @@ class Plexus(EventMixin):
     async def wait_until_ready(self):
         """Ensure initialization tasks are started and await completion.
 
-        Per Commit 2b Option A: this is the canonical NetworkManager
+        This is the canonical NetworkManager
         construction site. ``start()`` delegates here. Construction is
         serialized via ``_network_rebuild_lock`` so a hot-reload
-        triggered during boot waits cleanly until init completes
-        (cycle 3 HIGH-α). The lock is held across both NM construction
+        triggered during boot waits cleanly until init completes.
+        The lock is held across both NM construction
         AND the ``await asyncio.gather(*self._init_tasks)`` so a
         rebuild triggered mid-``network.start()`` cannot race the
         in-progress startup.
@@ -603,7 +603,7 @@ class Plexus(EventMixin):
                         )
                     # Hold the lock until init tasks complete so a
                     # concurrent hot-reload can't fire mid-
-                    # ``network.start()`` (cycle 3 HIGH-α).
+                    # ``network.start()``.
                     await asyncio.gather(*self._init_tasks)
                     return
 
@@ -617,8 +617,8 @@ class Plexus(EventMixin):
     async def start(self):
         """Initialize background tasks, load plugins, and start networking.
 
-        Thin shim that delegates to ``wait_until_ready()``. Per
-        Commit 2b Option A: all NetworkManager construction lives in
+        Thin shim that delegates to ``wait_until_ready()``. Since
+        Commit 2b, all NetworkManager construction lives in
         ``wait_until_ready()`` under ``_network_rebuild_lock`` so the
         boot path is serialized with concurrent hot-reload calls.
 
@@ -634,7 +634,7 @@ class Plexus(EventMixin):
     async def close(self):
         """Gracefully shutdown: drain requests, disable plugins in reverse order, stop networking.
 
-        B-073 Session 2 Step 4: ``running_loop`` + ``cleanup_requests``
+        B-073: ``running_loop`` + ``cleanup_requests``
         + ``cleanup_request_interval`` knob removed entirely. Done-callback
         eviction (Step 2's producer-finally pops + Step 3's outer-finally
         pops at all 7 framework Request migration sites) replaces the
@@ -738,9 +738,8 @@ class Plexus(EventMixin):
         #    down before their dependencies. The previous use of
         #    list(self.plugins.keys()) reflected config insertion order,
         #    which is NOT guaranteed to be dependency order — a dependency
-        #    (e.g. PostgreSQL) could be disabled before a dependent
-        #    (e.g. DataCollection) finished its on_disable.
-        #    e.g. Discord_Bot_Plugin → DataCollection → PostgreSQL
+        #    (e.g. a database plugin) could be disabled before a dependent
+        #    plugin finished its on_disable.
         #    R3-RR-6: the SyncDispatcher shutdown block (step 2) moved to
         #    AFTER this loop so on_disable callbacks can still emit
         #    synchronous events / submit to the executor.
@@ -930,7 +929,7 @@ class Plexus(EventMixin):
         — Step 4's ``_normalize_networking_for_diff`` does exactly this.
 
         Split out so the hot-reload path can pre-validate a candidate
-        config before any mutation hits self. Closes cycle 2 HIGH-3
+        config before any mutation hits self. Closes a
         state-lie (``apply_configvalues`` used to mutate ``self`` before
         ``check_config_integrity`` completed; if integrity raised,
         ``self.networking_*`` already reflected the new yaml but
@@ -1012,9 +1011,9 @@ class Plexus(EventMixin):
     def load_config_yaml(self, config_path: str):
         """Sync entry point — load + integrity check + apply.
 
-        Behavior change vs pre-Step-1: integrity-check raises now leave
+        Behavior change: integrity-check raises now leave
         ``self.yaml_config`` unmodified (was previously overwritten with
-        the bad-but-parsed dict). Closes cycle 2 HIGH-3 state-lie.
+        the bad-but-parsed dict).
         """
         # R3-NN-1: sync boot path. No event loop running, no other thread
         # alive yet -> call the lockless internal helper directly. Cannot
@@ -1029,7 +1028,7 @@ class Plexus(EventMixin):
 
         * Bootstrap (``self.yaml_config is None``): apply new config
           directly. NO networking action — NetworkManager construction
-          happens later in ``wait_until_ready()`` via Option A. NOTE:
+          happens later in ``wait_until_ready()``. NOTE:
           unreachable in practice — ``Plexus.__init__`` calls
           ``load_config_yaml`` synchronously, populating
           ``self.yaml_config`` before any caller reaches this method.
@@ -1043,8 +1042,6 @@ class Plexus(EventMixin):
           abort, no state mutation), then ``_rebuild_networking``
           (which acquires the rebuild lock + does the ordered
           tear-down + rebuild).
-
-        Rebuild orchestrator design per Commit 2b cycle 3 settled spec.
 
         R4-UU-10: Plugin list reconciliation is intentionally NOT
         performed here. To add / remove / reload a specific plugin,
@@ -1129,9 +1126,9 @@ class Plexus(EventMixin):
         enabled / port / hostname / keys_dir changes.
 
         Acquires ``_network_rebuild_lock`` so concurrent boot or other
-        rebuild calls serialize. Per cycle 3 HIGH-α + Option A.
+        rebuild calls serialize.
 
-        Ordering (cycle 3 design — DO NOT REORDER):
+        Ordering (DO NOT REORDER):
 
         1. Build new NM via ``_build_network_manager(new_yaml)``. If
            raises, no state mutation; old keeps running. (Skipped if
@@ -1143,8 +1140,8 @@ class Plexus(EventMixin):
         4. ``self.network = None`` — guards in 4 sites + 7 snapshot
            sites observe None from here. Held until end of rebuild.
         5. Drain in-flight remote requests (10s budget) +
-           ``old_nm._inflight_publishes``. Pessimistic drain (per
-           cycle 7 fix): includes any not-done request not explicitly
+           ``old_nm._inflight_publishes``. Pessimistic
+           drain: includes any not-done request not explicitly
            stamped ``_is_remote=False``, since the stamp is set
            INSIDE ``_process_request*`` AFTER the request is already
            registered in ``self.requests``. Local requests resolve
@@ -1426,8 +1423,8 @@ class Plexus(EventMixin):
         Two snapshot sources:
 
         * ``self.requests`` filtered for not-done + not explicitly
-          ``_is_remote=False``. **Pessimistic filter** (cycle 7 HIGH-1
-          fix): the stamp is set INSIDE ``_process_request*`` AFTER
+          ``_is_remote=False``. **Pessimistic filter**:
+          the stamp is set INSIDE ``_process_request*`` AFTER
           the request is already in ``self.requests``, so a request
           that hasn't yet reached the RemotePlugin branch wouldn't
           be caught by a strict ``_is_remote=True`` filter. Including
@@ -1438,8 +1435,7 @@ class Plexus(EventMixin):
           publish tasks (PR3 Stage C).
 
         Best-effort: surviving tasks log warning at timeout expiry;
-        the rebuild continues regardless. Per cycle 1 HIGH-1 + cycle
-        2 HIGH-C.
+        the rebuild continues regardless.
         """
         pending = []
 
@@ -1596,9 +1592,7 @@ class Plexus(EventMixin):
           2. If construct raises → no state mutation, abort cleanly
           3. _apply_yaml(new_yaml) — only after construction succeeds
 
-        Per cycle 3 HIGH-γ.
-
-        Field source-of-truth (per cycle 3 HIGH-γ — must NOT read
+        Field source-of-truth (must NOT read
         ``self.networking_*``):
 
         * ``port`` / ``auto_discoverable`` / ``direct_discoverable`` —
@@ -1703,8 +1697,6 @@ class Plexus(EventMixin):
         ``apply_configvalues`` mutate it (writing back resolved defaults
         in-place) while the other is freshly parsed.
 
-        Per cycle 3 HIGH-δ (originally cycle 3 LOW-1, upgraded).
-
         Fields normalised:
 
         * ``networking.enabled`` / ``networking.port`` /
@@ -1745,7 +1737,7 @@ class Plexus(EventMixin):
         nw_out.setdefault("auto_discoverable", False)
         nw_out.setdefault("direct_discoverable", False)
         nw_out.setdefault("keys_dir", "_keys")
-        # Step 4 cycle 1: peers absent vs explicit empty list both
+        # Peers absent vs explicit empty list both
         # equal post-normalization. Without this default, an old
         # yaml with peers: [] vs a new yaml dropping the key (or
         # vice versa) would diff-as-different and trigger a spurious
@@ -1828,9 +1820,9 @@ class Plexus(EventMixin):
         before comparison so a fresh-parsed candidate (no defaults
         filled) doesn't false-positive against a post-apply live yaml
         (where ``apply_configvalues`` has written resolved defaults
-        back in place). Per cycle 3 HIGH-δ.
+        back in place).
 
-        Hostname has TWO source paths (cycle 4 finding):
+        Hostname has TWO source paths:
 
         * ``networking.hostname`` — read by ``NetworkManager.__init__``
           at networking.py:175 for ``self.hostname`` (the value the
@@ -2840,7 +2832,7 @@ class Plexus(EventMixin):
             await error_config(f"No Plugin subclass found in {module_path}")
             return
 
-        # Session 3 (v0.26.0): pre-create state entry BEFORE Plugin(...)
+        # v0.26.0: pre-create state entry BEFORE Plugin(...)
         # so the @property read inside Plugin.__init__ works (returns False
         # — only ENABLED state returns True from the property). On reload,
         # transition any existing entry (UNLOADED / FAILED_LOAD) to INACTIVE.
@@ -2946,8 +2938,9 @@ class Plexus(EventMixin):
 
         # Q5: warn (allow) when another already-loaded plugin uses the
         # same prefix. Two instances sharing a prefix isn't an error
-        # (intentional use case for running two Discord bots etc.) but
-        # the warning helps the author spot accidental collisions.
+        # (intentional use case for running two instances of the same
+        # plugin) but the warning helps the author spot accidental
+        # collisions.
         for existing_name, existing_plugin in self.plugins.items():
             if existing_name == name:
                 continue
@@ -3217,8 +3210,8 @@ class Plexus(EventMixin):
             raw_blocked_authors = _resolve_filter_value(raw_blocked_authors)
 
             # Normalize sub-level filter values via _normalize_hosts /
-            # _normalize_authors (parity with the events: section fix from
-            # cycle 6). Without this, YAML forms like `hosts: []` (empty
+            # _normalize_authors (parity with the events: section
+            # handling). Without this, YAML forms like `hosts: []` (empty
             # list — spec says invalid) would silently produce a sub that
             # rejects all delivery, with no warning at load time.
             try:
@@ -3298,7 +3291,7 @@ class Plexus(EventMixin):
             plugin_uuid = plugin.plugin_uuid
             if plugin_uuid:
                 self.plugins_by_uuid[plugin_uuid] = plugin
-            # Session 3 + C-131: bind instance into plugin_states then
+            # C-131: bind instance into plugin_states then
             # transition UNLOADED -> INACTIVE atomically under
             # plugin_lock. The pre-create at 2270 set UNLOADED so
             # observers never saw INACTIVE+None mid-load; the emit
@@ -3339,7 +3332,7 @@ class Plexus(EventMixin):
     async def pop_plugin(self, plugin_name: str) -> None:
         """Remove a plugin from the runtime.
 
-        Session 3 (v0.26.0) state-machine semantics: the resulting
+        v0.26.0 state-machine semantics: the resulting
         plugin_states entry depends on whether config still references
         the plugin.
 
@@ -3392,7 +3385,7 @@ class Plexus(EventMixin):
                 try:
                     await self._pop_plugin_under_lock(plugin_name)
                 finally:
-                    # Post-pop state transition. Cycle 1 review: must run
+                    # Post-pop state transition. Must run
                     # in finally so a partial failure inside
                     # _pop_plugin_under_lock doesn't leave plugin_states
                     # inconsistent. Only fires if the instance is gone
@@ -3407,7 +3400,7 @@ class Plexus(EventMixin):
                         and plugin_name not in self.plugins
                     ):
                         if config_has_entry:
-                            # Cycle 3 fix: clear instance BEFORE the
+                            # Clear instance BEFORE the
                             # state transition so observers of
                             # _core/plugin/state_changed reading
                             # `instance` for state == UNLOADED see None,
@@ -3713,7 +3706,7 @@ class Plexus(EventMixin):
         OTHER plugins (which acquire plugin_lock briefly themselves) are
         not blocked. _lifecycle_ready is set after on_enable returns.
 
-        Session 3 (v0.26.0): the INACTIVE → ENABLING transition happens
+        v0.26.0: the INACTIVE → ENABLING transition happens
         UNDER plugin_lock so concurrent observers see the consistent
         state. ENABLING → ENABLED happens after on_enable succeeds.
         ENABLING → INACTIVE happens in the rollback path. last_errors
@@ -3728,7 +3721,7 @@ class Plexus(EventMixin):
         async with self.plugin_lock:
             plugin = self.plugins.get(plugin_name)
             ps = self.plugin_states.get(plugin_name)
-            # Skip non-INACTIVE plugins. Cycle 1 review:
+            # Skip non-INACTIVE plugins.
             # ENABLING included so a defensive re-entry (any caller that
             # somehow bypasses the lifecycle_lock serialisation) cannot
             # double-register YAML subs. R2-BB-6: broadened from
@@ -3752,7 +3745,7 @@ class Plexus(EventMixin):
             # INACTIVE on raise. POSS-W-D1-002 / W-A1-001: state flip
             # MUST stay under plugin_lock so a concurrent re-entry
             # checking ps.state ∈ {ENABLING, ENABLED} cannot double-
-            # register YAML subs (cycle 1 review invariant) — but the
+            # register YAML subs — but the
             # observer emit is deferred to AFTER lock release so a
             # sync observer scheduling async work cannot deadlock on
             # plugin_lock.
@@ -3849,7 +3842,7 @@ class Plexus(EventMixin):
             plugin._lifecycle_ready.set()
             ok = True
         except BaseException as exc:
-            # Session 3: capture on_enable failure for last_errors.
+            # v0.26.0: capture on_enable failure for last_errors.
             # R2-BB-7: skip CancelledError (cancellation is not a
             # plugin error) AND TimeoutError (per-spec routine for a
             # hung on_enable, callers handle the timeout signal cleanly
@@ -3981,7 +3974,7 @@ class Plexus(EventMixin):
                                 plugin.plugin_name,
                             )
                     finally:
-                        # Session 3: sync state transition (cannot raise),
+                        # v0.26.0: sync state transition (cannot raise),
                         # guaranteed to run via the outer finally chain
                         # even if both async cleanups above are cancelled.
                         self._transition_plugin(plugin_name, State.INACTIVE)
@@ -3999,7 +3992,7 @@ class Plexus(EventMixin):
         for the dict reads + state transition; user on_disable runs
         without it held.
 
-        Session 3 (v0.26.0): the ENABLED → DISABLING transition happens
+        v0.26.0: the ENABLED → DISABLING transition happens
         UNDER plugin_lock so observers see the consistent state. The
         DISABLING → INACTIVE transition happens in the finally block —
         unconditional regardless of whether on_disable raised, was
@@ -4075,7 +4068,7 @@ class Plexus(EventMixin):
                         plugin_name, ps.state.value,
                     )
                 return
-            # Session 3: transition ENABLED → DISABLING under plugin_lock
+            # v0.26.0: transition ENABLED → DISABLING under plugin_lock
             # so any concurrent enable check sees DISABLING (not ENABLED)
             # and bails. Flip happens before plugin_lock release.
             # POSS-W-D1-002 / W-A1-001: state mutation stays under-lock
@@ -4133,7 +4126,7 @@ class Plexus(EventMixin):
                 else:
                     await executor_call
         except BaseException as exc:
-            # Session 3: capture on_disable failure for last_errors. Skip
+            # v0.26.0: capture on_disable failure for last_errors. Skip
             # CancelledError (cancellation is not a plugin error) and
             # TimeoutError (per-spec routine, callers handle it cleanly).
             # R2-BB-7: matches _enable_plugin_under_lock — parity restored.
@@ -4203,7 +4196,7 @@ class Plexus(EventMixin):
                         plugin.plugin_name,
                     )
             finally:
-                # Session 3: sync state transition (cannot raise),
+                # v0.26.0: sync state transition (cannot raise),
                 # guaranteed to run even if the unregister await above
                 # is cancelled. plugin_lock is not needed here: any
                 # find_endpoint reader that briefly sees DISABLING
@@ -4229,7 +4222,7 @@ class Plexus(EventMixin):
         if plugin_name not in self.plugins:
             return False
 
-        # B-073 (Session 2 Step 2 prep): snapshot under the lock,
+        # B-073: snapshot under the lock,
         # iterate outside. Producer-side finally pops in
         # ``_process_request*`` mutate ``self.requests`` lock-free
         # (Python dict ``pop`` is GIL-atomic). Iterating directly
@@ -4413,7 +4406,7 @@ class Plexus(EventMixin):
         _enable_plugin_under_lock. Concurrent enable on the SAME plugin
         serializes here; concurrent ops on OTHER plugins do not block.
 
-        Session 3 (v0.26.0): renamed from `_enable_plugin` to public
+        v0.26.0: renamed from `_enable_plugin` to public
         `enable_plugin`. State machine transitions are emitted via
         _transition_plugin under plugin_lock.
 
@@ -4434,7 +4427,7 @@ class Plexus(EventMixin):
         _disable_plugin_under_lock. Waits for any in-progress
         enable_plugin on the same name to complete first.
 
-        Session 3 (v0.26.0): renamed from `_disable_plugin` to public
+        v0.26.0: renamed from `_disable_plugin` to public
         `disable_plugin`. State machine transitions are emitted via
         _transition_plugin.
 
@@ -4530,7 +4523,7 @@ class Plexus(EventMixin):
     def _transition_plugin(self, name: str, new_state: State) -> None:
         """Atomic state transition + _core/plugin/state_changed emit.
 
-        Session 3 (v0.26.0). All state mutations on PluginState go through
+        v0.26.0. All state mutations on PluginState go through
         this method (D2). Direct field writes on PluginState are forbidden
         — code review enforces.
 
@@ -4616,7 +4609,7 @@ class Plexus(EventMixin):
         use get_plugin_info(plugin_name) which reads from the live
         instance.
 
-        Session 3 (v0.26.0): supports TUI listing of disabled-in-config
+        v0.26.0: supports TUI listing of disabled-in-config
         plugins (per B1 design decision).
         """
         ps = self.plugin_states.get(plugin_name)
@@ -4657,7 +4650,7 @@ class Plexus(EventMixin):
         """Helper used by YAML-registration sites to push add-delta to
         peers. Wraps the get_subscription + ready-flag check in one place
         so the YAML loop stays clean."""
-        # Snapshot nm. Per Commit 2b cycle 2 MED-B: a mid-block
+        # Snapshot nm. A mid-block
         # hot-reload could otherwise leak the broadcast call onto a
         # stopped NM. Single-call site so the practical race window is
         # tiny, but snapshotting matches the pattern used by the loop
@@ -4691,7 +4684,7 @@ class Plexus(EventMixin):
         if plugin_uuid:
             # PR3 Stage C remove-delta loop (locked #18 item 5). Snapshot
             # subs BEFORE the bulk-unsubscribe, then per-sub broadcast.
-            # Snapshot nm (Commit 2b cycle 2 MED-B): the per-sub broadcast
+            # Snapshot nm: the per-sub broadcast
             # loop below would otherwise leak calls onto a stopped NM if
             # a hot-reload swaps self.network mid-loop.
             nm = self.network
@@ -4742,7 +4735,7 @@ class Plexus(EventMixin):
         re-enable. The locked-body helpers (_pop_plugin_under_lock /
         _enable_plugin_under_lock) avoid recursive lock acquisition.
 
-        Session 3 (v0.26.0): the natural state transition sequence is:
+        v0.26.0: the natural state transition sequence is:
             ENABLED → DISABLING → INACTIVE → UNLOADED → INACTIVE → ENABLING → ENABLED
         for an enabled source. For an INACTIVE source:
             INACTIVE → UNLOADED → INACTIVE
@@ -4766,10 +4759,10 @@ class Plexus(EventMixin):
             previously_enabled = ps is not None and ps.state == State.ENABLED
 
             await self._pop_plugin_under_lock(plugin_name)
-            # Session 3: transition INACTIVE → UNLOADED to match the
+            # v0.26.0: transition INACTIVE → UNLOADED to match the
             # public pop_plugin contract. load_plugin_with_conf will
-            # transition back to INACTIVE on re-instantiation. Cycle 3
-            # fix: clear instance BEFORE the transition so observers see
+            # transition back to INACTIVE on re-instantiation. Clear
+            # instance BEFORE the transition so observers see
             # instance=None for state==UNLOADED.
             if plugin_name in self.plugin_states:
                 self.plugin_states[plugin_name].instance = None
@@ -4915,7 +4908,7 @@ class Plexus(EventMixin):
     async def request_context_async(self, request: Request):
         """Async context manager to handle requests.
 
-        B-073 Session 2 Step 3: ``set_collected`` migrated to
+        B-073: ``set_collected`` migrated to
         ``self.requests.pop`` per the done-callback eviction model.
         ``Request.set_collected`` was a no-op flag-setter; the producer's
         finally in ``_process_request`` already pops the request, but
@@ -4940,7 +4933,7 @@ class Plexus(EventMixin):
     def request_context_sync(self, request: Request):
         """Sync context manager to handle requests.
 
-        B-073 Session 2 Step 3: replaced the ``run_coroutine_threadsafe``
+        B-073: replaced the ``run_coroutine_threadsafe``
         bridge to ``set_collected`` with a direct sync ``pop``. The pop
         is GIL-atomic so it's safe to call from a worker thread without
         a loop-bridge — Python dict ``pop`` is implemented as a single
@@ -5231,9 +5224,9 @@ class Plexus(EventMixin):
                             }
                         )
 
-        # Snapshot self.network once. Per Commit 2b cycle 3 HIGH-A:
+        # Snapshot self.network once:
         # during a hot-reload rebuild, self.network is set to None for
-        # the entire rebuild duration; per cycle 2 MED-B: a mid-block
+        # the entire rebuild duration, and a mid-block
         # swap would otherwise leak calls onto a stopped NM. Both
         # conditions resolve cleanly here — None falls through to the
         # local-only path.
@@ -5369,7 +5362,7 @@ class Plexus(EventMixin):
             unpack-then-check the first element rather than
             `if result is None`. Stage M (B-048): annotation reads accurately;
             behavior unchanged (every callsite already uses unpack-then-check
-            after PR3 Stage B cycle 5 fixed the one mismatched caller in
+            after PR3 Stage B fixed the one mismatched caller in
             request_event_stream).
         """
 
@@ -5479,9 +5472,9 @@ class Plexus(EventMixin):
             return True
 
         # Check remote nodes if networking is enabled
-        # Snapshot nm once. Per Commit 2b cycle 3 HIGH-A: during a
+        # Snapshot nm once: during a
         # hot-reload rebuild, self.network = None for the entire
-        # rebuild duration. cycle 2 MED-B: snapshot prevents mid-block
+        # rebuild duration; the snapshot prevents a mid-block
         # swap from leaking calls onto a stopped NM. None falls through
         # to the bottom `return None, None, None` no-match path.
         nm = self.network
@@ -5558,7 +5551,7 @@ class Plexus(EventMixin):
     async def _process_request(self, request: Request) -> None:
         """Process a request by invoking the target plugin method.
 
-        B-073 Session 2 Step 2: ``finally`` block evicts the Request
+        B-073: ``finally`` block evicts the Request
         from ``self.requests`` on every completion path (success, error,
         cancellation). Replaces the 10s polling reap performed by the
         ``cleanup_requests`` maintenance loop (killed in Step 4 — both
@@ -5644,7 +5637,7 @@ class Plexus(EventMixin):
                 # Stamp _is_remote BEFORE the network check so the
                 # rebuild drain (Step 7) catches in-flight remote
                 # requests even when self.network transitions to None
-                # mid-await. Per cycle 1 HIGH-1 — drain filter uses
+                # mid-await — the drain filter uses
                 # this attribute to distinguish remote-bound requests
                 # from local execute path requests.
                 request._is_remote = True
@@ -5656,15 +5649,15 @@ class Plexus(EventMixin):
                 # target_host is the single concrete peer this Request
                 # was actually dispatched to after routing resolved.
                 request.target_host = node.hostname
-                # Snapshot nm. Per Commit 2b cycle 3 HIGH-A: during a
+                # Snapshot nm: during a
                 # hot-reload rebuild, self.network is None for the
-                # entire rebuild duration. cycle 3 HIGH-β requires a
-                # distinct fail-fast semantic here (not silent return)
+                # entire rebuild duration. This path needs a
+                # distinct fail-fast semantic (not silent return)
                 # so the caller's future resolves with a clear error
                 # rather than hanging forever. Also gate on
                 # ``is_ready=False`` to cover the post-rebuild window
                 # where NM has been assigned but its ``start()`` task
-                # hasn't completed yet (cycle 6 fresh-eyes MED).
+                # hasn't completed yet.
                 nm = self.network
                 if nm is None or not getattr(nm, "is_ready", False):
                     await self._set_request_result(
@@ -5799,7 +5792,7 @@ class Plexus(EventMixin):
                     ts=now,
                 )
 
-            # B-073 Session 2 Step 2: done-callback eviction. Pop the
+            # B-073: done-callback eviction. Pop the
             # Request entry from ``self.requests`` on every completion
             # path (success, exception, cancellation). Replaces the
             # ``cleanup_requests`` polling reap (killed in Step 4).
@@ -6635,7 +6628,7 @@ class Plexus(EventMixin):
     async def _process_request_stream(self, request: GeneratorRequest) -> None:
         """Process a request by invoking the target plugin method.
 
-        B-073 Session 2 Step 2: ``finally`` block evicts the
+        B-073: ``finally`` block evicts the
         GeneratorRequest from ``self.requests`` on every completion path
         (success, error, cancellation). Symmetric with ``_process_request``
         for non-stream Requests. Replaces the ``cleanup_requests``
@@ -6703,8 +6696,8 @@ class Plexus(EventMixin):
             )
 
             if isinstance(plugin, RemotePlugin):
-                # Stamp _is_remote BEFORE the network check (cycle 1
-                # HIGH-1) so the rebuild drain catches in-flight
+                # Stamp _is_remote BEFORE the network check
+                # so the rebuild drain catches in-flight
                 # streaming-remote requests via the filter. Symmetry
                 # with the non-stream path's stamp.
                 request._is_remote = True
@@ -6712,14 +6705,14 @@ class Plexus(EventMixin):
                 # _mark_node_dead's fast-fail filter compares this
                 # against the dead-peer hostname.
                 request.target_host = node.hostname
-                # Snapshot nm. Per Commit 2b cycle 3 HIGH-A + HIGH-β:
+                # Snapshot nm:
                 # mid-rebuild self.network is None; resolve the
                 # generator request with an error so the consumer sees
                 # a clean RequestException via B-044 chain rather than
                 # hanging on an empty queue. Also gate on
                 # ``is_ready=False`` to cover the post-rebuild window
                 # where NM has been assigned but ``start()`` hasn't
-                # completed (cycle 6 fresh-eyes MED — symmetry with
+                # completed (symmetry with
                 # _process_request guard).
                 nm = self.network
                 if nm is None or not getattr(nm, "is_ready", False):
@@ -6969,7 +6962,7 @@ class Plexus(EventMixin):
             # via the resolved future, not via an unhandled task
             # exception).
         finally:
-            # B-073 Session 2 Step 2: done-callback eviction. Symmetric
+            # B-073: done-callback eviction. Symmetric
             # with ``_process_request``'s finally — pop on any completion
             # path. Sync, GIL-atomic, idempotent.
             self.requests.pop(request.id, None)
@@ -7002,7 +6995,7 @@ class Plexus(EventMixin):
         get_queue_stream's redundant consumer-side timeout enforcement
         — see consumer-site comment in request_event_stream).
 
-        B-073 Session 2 Step 2: ``finally`` block evicts the
+        B-073: ``finally`` block evicts the
         GeneratorRequest from ``self.requests`` on every completion path
         (success, RequestException, generic Exception). Symmetric with
         ``_process_request`` and ``_process_request_stream``. Sync
@@ -7274,7 +7267,7 @@ class Plexus(EventMixin):
             if isinstance(e, asyncio.CancelledError):
                 raise
         finally:
-            # B-073 Session 2 Step 2: done-callback eviction. Symmetric
+            # B-073: done-callback eviction. Symmetric
             # with ``_process_request`` and ``_process_request_stream``
             # finally blocks — pop the GeneratorRequest from
             # ``self.requests`` on every completion path. Sync, GIL-atomic,
@@ -7490,7 +7483,7 @@ class Plexus(EventMixin):
         task.add_done_callback(self._fire_and_forget.discard)
         return task
 
-    # B-073 Session 2 Step 4: ``running_loop`` + ``cleanup_requests``
+    # B-073: ``running_loop`` + ``cleanup_requests``
     # removed. Pre-Step-2 the maintenance loop ticked every
     # ``cleanup_request_interval`` seconds and reaped Request entries
     # whose ``collected`` flag was set. Steps 2+3 replaced the polling
@@ -7805,7 +7798,7 @@ class Plexus(EventMixin):
                     raise RequestException(result)
                 return result
             finally:
-                # B-073 Session 2 Step 3: done-callback eviction. Runs on
+                # B-073: done-callback eviction. Runs on
                 # normal return, RequestException, AND CancelledError. Sync,
                 # GIL-atomic, idempotent with the producer-side pop in
                 # _process_request.

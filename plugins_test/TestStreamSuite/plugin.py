@@ -462,7 +462,7 @@ class TestStreamSuite(Plugin):
 
             # GeneratorRequest entry: ``set_collected`` cancels the
             # producer task (B-002 logic — distinct from Request which
-            # was migrated in B-073 Session 2 Step 3 to direct dict
+            # was migrated by the B-073 fix to direct dict
             # pop). Producer's finally in ``_process_request_stream``
             # then pops the entry from ``self.requests``. Entry should
             # leave well within 30s via that path.

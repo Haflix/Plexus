@@ -42,7 +42,7 @@ class AdvertSub:
     blocked_hosts: Union[str, list, None]
     authors: Union[str, list, None]
     blocked_authors: Union[str, list, None]
-    # Session 4 (v0.27.0): outbound-side ack tracking. Receiver-side
+    # v0.27.0: outbound-side ack tracking. Receiver-side
     # AdvertSub instances leave these as defaults — only sender-side
     # _outbound_adverts entries populate sent_at / acked_at / state /
     # retry_count. Not wire-serialized (see _serialize_local_sub_for_peer).
@@ -102,7 +102,7 @@ MSG_SUB_DELTA = 19
 # (replaced shared-secret auth). The message-type number is reserved
 # and must not be reused for new message types.
 
-# Session 4 (v0.27.0): receiver-side acknowledgement of MSG_SUB_ADVERTISE
+# v0.27.0: receiver-side acknowledgement of MSG_SUB_ADVERTISE
 # / MSG_SUB_DELTA. Async-delivered via the receiver's outbound connection
 # back to the sender; sender does NOT block on ack arrival. Sender's
 # heartbeat loop scans _outbound_adverts for entries past 2 *
@@ -721,8 +721,8 @@ class NetworkManager:
 
         Static so callers without a live ``NetworkManager`` (e.g. a
         transition from ``networking_enabled=False`` to ``True``
-        during hot reload) can validate before construction. Per
-        Commit 2b cycle 3 — the inline validation pattern would
+        during hot reload) can validate before construction. The
+        inline validation pattern would
         otherwise need a temporary NetworkManager instance, defeating
         the "no side effects" guarantee of pre-validation.
         """
@@ -845,7 +845,7 @@ class NetworkManager:
                 )
             ip = address[1:end_bracket]
             if not ip:
-                # Cycle 2 verifier MED fix: reject empty bracket "[]:port"
+                # Reject empty bracket "[]:port"
                 # at config-load time instead of letting it propagate to
                 # PeerSpec(ip="") and surface later as a cryptic
                 # socket.gaierror at connect time.
@@ -1233,7 +1233,7 @@ class NetworkManager:
             self._logger.debug(f"[MESSAGE] Incomplete read: {e}")
             raise ConnectionError("Connection closed unexpectedly")
         except pickle.UnpicklingError:
-            # Cycle 3 fresh-eyes LOW fix: re-raise without ERROR-level
+            # Re-raise without ERROR-level
             # traceback. _handle_client's inner loop catches this and
             # logs at WARNING with peer context. Letting the bare except
             # below run would double-log every disallowed-class event.
@@ -1474,7 +1474,7 @@ class NetworkManager:
                 except Exception:
                     self._logger.debug("Heartbeat iteration failed")
 
-                # Session 4 (v0.27.0): scan outbound adverts for missing
+                # v0.27.0: scan outbound adverts for missing
                 # acks. The scan itself is fast (single struct_lock pass);
                 # per-peer resends are spawned as detached tasks so the
                 # heartbeat tick stays on schedule.
@@ -3022,7 +3022,7 @@ class NetworkManager:
                     )
                     return
                 result, error, _ = await request.wait_for_result_async()
-                # B-073 Session 2 Step 3: done-callback eviction. Was
+                # B-073: done-callback eviction. Was
                 # ``await request.set_collected()`` (which set a flag for
                 # the now-removed cleanup_requests reap). Migrated to
                 # direct sync pop. Idempotent under ``pop(key, None)``;
@@ -3664,7 +3664,7 @@ class NetworkManager:
                 return
 
             # Atomic purge + reinsert (per locked #5: empty list → {}).
-            # Session 4: accumulate processed_uuids for the ack frame.
+            # v0.27.0: accumulate processed_uuids for the ack frame.
             # C-040: snapshot prior state before the clear so a mid-iter
             # AdvertSub-construction raise can roll back the table to a
             # consistent state instead of leaving it half-empty. Build
@@ -3716,7 +3716,7 @@ class NetworkManager:
                 len(subs_payload), author_host,
             )
 
-            # Session 4 (v0.27.0): schedule ack BEFORE the reciprocal
+            # v0.27.0: schedule ack BEFORE the reciprocal
             # exchange await so the ack-task is registered in the loop
             # immediately on lock release. peer_ip was captured above
             # via _safe_peer_ip(writer) for anti-spoof; reuse for the
@@ -3823,7 +3823,7 @@ class NetworkManager:
                     )
 
             entry = subs_payload[0]
-            # Session 4: only kind="add" success paths produce an ack
+            # v0.27.0: only kind="add" success paths produce an ack
             # (sender's _outbound_adverts only tracks sent_at on add
             # operations; remove paths delete the tracking entry, so an
             # ack would have nothing to update).
@@ -3857,8 +3857,8 @@ class NetworkManager:
                     per_peer = self._inbound_adverts.get(author_host)
                     if per_peer is None or sub_uuid not in per_peer:
                         # Idempotent skip — fall through to reciprocal-exchange
-                        # check (locked #7); the early-return in Cycle 6 review
-                        # was inconsistent with sister handlers.
+                        # check (locked #7); an early-return here would be
+                        # inconsistent with sister handlers.
                         # C-041: log WARNING so peer-state divergence (sender
                         # thinks the sub exists, we never registered it) is
                         # visible. The skip stays by-design idempotent, but
@@ -3873,7 +3873,7 @@ class NetworkManager:
                         per_peer.pop(sub_uuid, None)
                         self._inbound_global_order.pop((author_host, sub_uuid), None)
 
-            # Session 4 (v0.27.0): schedule ack BEFORE the reciprocal
+            # v0.27.0: schedule ack BEFORE the reciprocal
             # exchange await. Only "add" success generates an ack;
             # "remove" paths intentionally leave processed_uuid=None.
             if processed_uuid is not None:
@@ -3895,7 +3895,7 @@ class NetworkManager:
                 "[SUB_DELTA] handler crashed: %s", exc
             )
 
-    # ── Session 4 (v0.27.0) — sub-advert ack protocol ─────────────
+    # ── v0.27.0 — sub-advert ack protocol ─────────────
 
     async def _send_advert_ack_to(
         self,
@@ -4378,7 +4378,7 @@ class NetworkManager:
                     s for s in subs
                     if self._should_advertise_sub_to_peer(s, peer_hostname)
                 ]
-                # Session 4 (v0.27.0): stamp sent_at at build time. If
+                # v0.27.0: stamp sent_at at build time. If
                 # _send_message fails below, the existing rollback at
                 # line ~3088 (_outbound_adverts.pop) wipes the entries —
                 # no orphan sent_at remains. The narrow race where send
@@ -4500,7 +4500,7 @@ class NetworkManager:
                     outbound_for_peer = self._outbound_adverts.setdefault(
                         peer_hostname, {}
                     )
-                    # Session 4 (v0.27.0): stamp sent_at on the new
+                    # v0.27.0: stamp sent_at on the new
                     # entry. Send-failure rollback at line ~3180
                     # (outbound_now.pop) wipes the entry on failure.
                     # C-012: monotonic timebase, paired with the read
@@ -4599,7 +4599,7 @@ class NetworkManager:
                         except Exception:
                             pass
 
-    # ── Session 4 (v0.27.0) — sub-advert ack timeout + retry ──────
+    # ── v0.27.0 — sub-advert ack timeout + retry ──────
 
     async def _spawn_periodic_resync(self) -> None:
         """C-109: kick off a full-snapshot resend to every connected
@@ -6528,137 +6528,6 @@ class NetworkManager:
                     except Exception:
                         pass
                     connection_returned = True
-
-    # async def execute_remote(
-    #    self,
-    #    IP: str,
-    #    plugin: str,
-    #    method: str,
-    #    timeout: tuple,
-    #    request_id: str,
-    #    args=None,
-    #    plugin_uuid="",
-    #    author="remote",
-    #    author_id="remote",
-    # ):
-    #    url = f"http://{IP}:{self.port}/execute"
-    #    args = args or []
-    #
-    #    payload = pickle.dumps(args)
-    #    b64 = base64.b64encode(payload)
-    #
-    #    async with httpx.AsyncClient(
-    #        timeout=timeout[0] if timeout[0] is not 0.0 else 7200.0
-    #    ) as client:  # verify='./cert.pem'
-    #        response = await client.post(
-    #            url,
-    #            json={
-    #                "plugin": plugin,
-    #                "method": method,
-    #                "args": b64,
-    #                "plugin_uuid": plugin_uuid,
-    #                "author": author,
-    #                "author_id": author_id,
-    #                "timeout": timeout,
-    #                "author_host": self.plexus.hostname,
-    #                "request_id": request_id,
-    #            },
-    #        )
-    #        b = base64.b64decode(response.content)
-    #        item = pickle.loads(b)
-    #        return item
-
-    # async def execute_remote_stream(
-    #    self,
-    #    IP: str,
-    #    plugin: str,
-    #    method: str,
-    #    timeout: tuple,
-    #    request_id: str,
-    #    args=None,
-    #    plugin_uuid: str = "",
-    #    author: str = "remote",
-    #    author_id: str = "remote",
-    # ):
-    #    url = f"http://{IP}:{self.port}/execute_stream"
-    #    args = args or []
-    #    timeout_val = timeout[0] if timeout[0] != 0.0 else 7200.0
-    #
-    #    payload = pickle.dumps(args)
-    #    b64 = base64.b64encode(payload)
-    #
-    #    async with httpx.AsyncClient(
-    #        timeout=timeout_val
-    #    ) as client:  # verify='./cert.pem',
-    #        try:
-    #            async with client.stream(
-    #                "POST",
-    #                url,
-    #                json={
-    #                    "plugin": plugin,
-    #                    "method": method,
-    #                    "args": args,
-    #                    "plugin_uuid": plugin_uuid,
-    #                    "author": author,
-    #                    "author_id": author_id,
-    #                    "timeout": timeout,
-    #                    "author_host": self.plexus.hostname,
-    #                    "request_id": request_id,
-    #                },
-    #            ) as response:
-    #                response.raise_for_status()
-    #                async for raw_line in response.aiter_lines():
-    #                    if not raw_line:
-    #                        continue
-    #                    try:
-    #                        b = base64.b64decode(raw_line)
-    #                        item = pickle.loads(b)
-    #                        yield item
-    #                    except Exception as e:
-    #                        # yield an error tuple or raise depending on your design choice
-    #                        self._logger.exception(
-    #                            "Failed to decode/deserialize remote stream line"
-    #                        )
-    #                        yield ("__REMOTE_STREAM_DECODE_ERROR__", str(e))
-    #        except Exception as e:
-    #            self._logger.exception("execute_remote_stream failed")
-    #            yield ("__REMOTE_STREAM_ERROR__", str(e))
-
-    #    def execute_remote_sync(self, host: str, plugin: str, method: str, args=None, plugin_uuid="", author="remote", author_id="remote", timeout=5):
-    #        url = f"http://{host}:{self.port}/execute"
-    #        with httpx.Client(timeout=timeout) as client:
-    #            response = client.post(url, json={
-    #                "plugin": plugin,
-    #                "method": method,
-    #                "args": args,
-    #                "plugin_uuid": plugin_uuid,
-    #                "author": author,
-    #                "author_id": author_id,
-    #                "timeout": timeout
-    #            })
-    #            return response.json()
-
-    #    async def discover_nodes(self, cidr_range=None):
-    #        if not cidr_range:
-    #            hostname = socket.gethostname()
-    #            local_ip = socket.gethostbyname(hostname)
-    #            cidr_range = ipaddress.ip_network(local_ip + '/24', strict=False)
-    #
-    #        sem = asyncio.Semaphore(20)  # Limit to 20 requests at a time for testing
-    #
-    #        async def probe(ip):
-    #            async with sem:
-    #                try:
-    #                    async with httpx.AsyncClient(timeout=1.0) as client:
-    #                        response = await client.get(f"http://{ip}:{self.port}/plugins")
-    #                        if response.status_code == 200:
-    #                            return str(ip)
-    #                except:
-    #                    return None
-    #
-    #        results = await asyncio.gather(*(probe(ip) for ip in cidr_range.hosts()))
-    #        self.nodes = [ip for ip in results if ip]
-    #        return self.nodes
 
     @async_handle_errors(None)
     async def update_all_nodes(
