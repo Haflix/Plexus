@@ -417,7 +417,7 @@ networking:
 | `hostname` | str | `socket.gethostname()` | Node's networking hostname. Separate from `general.hostname` if needed for tests. |
 | `keys_dir` | str | `"_keys"` | Where this node's `cert.pem` / `key.pem` live (auto-generated on first run). Resolved relative to the config file's directory if not absolute. |
 | `peers` | list[dict] | `[]` | Peer trust list. **Required (non-empty)** when networking is enabled. See below. |
-| `pool_size` | int | `5` | Connection-pool depth per `(ip, port)`. |
+| `pool_size` | int | `5` | Idle-return buffer depth per `(ip, port)`. Coerced to a positive int (`< 1`, non-numeric, or `0` fall back to the default; `0` would otherwise make the pool Queue unbounded). |
 | `discover_nodes` | bool | `false` | Run periodic node-lookup loop (`update_all_nodes`). |
 | `direct_discoverable` | bool | `false` | Allow peers that explicitly know this node's IP to connect. Auto-coerced to `true` when `auto_discoverable=true`. |
 | `auto_discoverable` | bool | `false` | Allow peers to find this node via subnet scan. Forces `direct_discoverable=true`. |
@@ -426,6 +426,10 @@ networking:
 | `liveness_timeout` | float | `30.0` | A peer whose last successful heartbeat is older than this is considered dead. Should be `>= heartbeat_interval`; 2-3× is typical. Bad values fall back to default with a warning. |
 | `probe_timeout` | float | `min(heartbeat_interval, liveness_timeout)` | Per-probe budget for a single heartbeat ping (R2-LL-5). Bad values fall back to the default. |
 | `resync_interval` | float | `300.0` | Seconds between periodic full sub-snapshot resyncs that scrub ghost subscriptions (C-109). The next heartbeat tick after this interval re-sends a `MSG_SUB_ADVERTISE` snapshot. |
+| `connect_timeout` | float | `10.0` | Per-attempt budget for a single outbound TCP + TLS connect. A black-holed peer can no longer hang a caller forever. Bad values fall back to the default. Hot-reloadable. |
+| `inbound_idle_timeout` | float | `120.0` | Idle ceiling for an inbound server-side connection between requests; a connection with no request for this long is reaped. Floored at `3 × heartbeat_interval` (a healthy peer that only heartbeats is never false-reaped; the reaped socket is read-only so the peer just reconnects on demand). Bad values fall back to the default. Hot-reloadable. |
+| `request_timeout` | float | `30.0` | Fallback **per-frame** read deadline for an outbound request/stream when the caller passes no explicit `timeout`. Applies to each frame independently (including the first chunk of a stream), so a cross-node stream whose producer is legitimately slow (e.g. a >30s time-to-first-token model) should pass an explicit generous `timeout` at the call site rather than rely on this default. Bad values fall back to the default. Hot-reloadable. |
+| `max_outbound_connections` | int | `20` | Global cap on concurrently checked-out outbound connections (a process-wide semaphore); bounds the fd/socket storm a wide/slow publish fan-out could open. Callers beyond the cap block until a slot frees (backpressure). Bad values fall back to the default. **Restart-only** — the semaphore is minted once and `asyncio.Semaphore` has no live resize, so a hot-reload of this value updates the stored attr but the live cap changes only on a full restart. |
 
 The validators check `enabled`, `port`, `auto_discoverable`,
 `direct_discoverable`, and `discover_nodes` for presence (warn on

@@ -1506,6 +1506,14 @@ class Plexus(EventMixin):
         * ``pool_size`` — best-effort: only affects pools created
           AFTER this call. Existing pools keep their construction-
           time ``maxsize``.
+        * ``connect_timeout`` / ``request_timeout`` /
+          ``inbound_idle_timeout`` — live effect: read fresh at each
+          use site, so the new value applies immediately (coerced via
+          ``_safe_float``, mirroring the timing knobs).
+        * ``max_outbound_connections`` — attr synced (coerced via
+          ``_safe_int``) but RESTART-ONLY in effect: the outbound
+          semaphore is minted once and ``asyncio.Semaphore`` has no
+          live resize, so the live cap changes only on a full rebuild.
 
         (C-029 + C-030: ``secret`` / ``cert_file`` / ``key_file`` were
         listed here as legacy attr-update fields; both the attrs and
@@ -1530,12 +1538,28 @@ class Plexus(EventMixin):
             DEFAULT_LOOKUP_INTERVAL as _DEF_LOOK,
             DEFAULT_LIVENESS_TIMEOUT as _DEF_LIVE,
             DEFAULT_RESYNC_INTERVAL as _DEF_RESYNC,
+            DEFAULT_CONNECT_TIMEOUT as _DEF_CONNECT,
+            DEFAULT_INBOUND_IDLE_TIMEOUT as _DEF_INBOUND,
+            DEFAULT_REQUEST_TIMEOUT as _DEF_REQUEST,
+            DEFAULT_MAX_OUTBOUND_CONNECTIONS as _DEF_MAXOUT,
         )
 
         def _safe_float(val, default):
             try:
                 f = float(val)
                 return f if f > 0 else default
+            except (TypeError, ValueError):
+                return default
+
+        # HUNT-145: pool_size is an int (Queue maxsize / drain-loop bound), so
+        # it needs an int sibling to _safe_float. Same fail-silent contract:
+        # coerce, reject <=0 / bad type -> default. (NetworkManager.pool_size
+        # additionally clamps on assignment; this applies the default-5 config
+        # semantics consistently with the timing knobs above.)
+        def _safe_int(val, default):
+            try:
+                i = int(val)
+                return i if i > 0 else default
             except (TypeError, ValueError):
                 return default
 
@@ -1571,7 +1595,28 @@ class Plexus(EventMixin):
         nm.auto_discoverable = nw_cfg.get("auto_discoverable", False)
         if nm.auto_discoverable and not nm.direct_discoverable:
             nm.direct_discoverable = True
-        nm.pool_size = nw_cfg.get("pool_size", 5)
+        nm.pool_size = _safe_int(nw_cfg.get("pool_size", 5), 5)
+        # HUNT-108/110/111/142 (R2/R6): the bounded-await timeouts are read
+        # fresh on each use, so updating them here makes them live on hot-reload
+        # (coerced fail-silent, same as the timing knobs above).
+        nm.connect_timeout = _safe_float(
+            nw_cfg.get("connect_timeout", _DEF_CONNECT), _DEF_CONNECT
+        )
+        nm.request_timeout = _safe_float(
+            nw_cfg.get("request_timeout", _DEF_REQUEST), _DEF_REQUEST
+        )
+        nm.inbound_idle_timeout = max(
+            _safe_float(nw_cfg.get("inbound_idle_timeout", _DEF_INBOUND), _DEF_INBOUND),
+            3.0 * nm.heartbeat_interval,
+        )
+        # HUNT-109: update the cap value, but the outbound semaphore is minted
+        # once (lazily) and asyncio.Semaphore has no live resize, so this new
+        # value only takes effect on a full NM rebuild/restart — the attr is
+        # kept in sync for correctness/observability but the live cap does not
+        # change here (documented restart-only).
+        nm._max_outbound_connections = _safe_int(
+            nw_cfg.get("max_outbound_connections", _DEF_MAXOUT), _DEF_MAXOUT
+        )
         # C-029 + C-030 + C-143: legacy `secret` / `cert_file` /
         # `key_file` in-place writes removed alongside the attrs
         # themselves (the previous block silently wiped them to None
@@ -1601,14 +1646,21 @@ class Plexus(EventMixin):
           (utils.py:1056-1092), so post-apply or fresh-parse gives
           identical values.
         * ``heartbeat_interval`` / ``lookup_interval`` /
-          ``liveness_timeout`` — read from yaml_config and parsed via
-          ``_safe_float`` (matches ``apply_configvalues``' parsing with
-          identical ``<= 0`` rejection boundary, utils.py:1124-1166).
-        * ``secret`` / ``cert_file`` / ``key_file`` / ``pool_size`` —
-          read raw from yaml_config. ``apply_configvalues`` currently
-          passes these through unchanged (utils.py:1098-1101), so
-          behavior matches the inline construction sites'
-          ``getattr(self, "networking_*")`` path.
+          ``liveness_timeout`` / ``connect_timeout`` /
+          ``inbound_idle_timeout`` / ``request_timeout`` — read from
+          yaml_config and parsed via ``_safe_float`` (matches
+          ``apply_configvalues``' parsing with identical ``<= 0``
+          rejection boundary, utils.py:1124-1166).
+        * ``pool_size`` / ``max_outbound_connections`` — read from
+          yaml_config and parsed via ``_safe_int`` (int sibling of
+          ``_safe_float``; ``<= 0`` / bad-type → default). ``pool_size``
+          is additionally clamped by the ``NetworkManager.pool_size``
+          property setter.
+        * ``secret`` / ``cert_file`` / ``key_file`` — read raw from
+          yaml_config. ``apply_configvalues`` currently passes these
+          through unchanged (utils.py:1098-1101), so behavior matches
+          the inline construction sites' ``getattr(self,
+          "networking_*")`` path.
 
         ASSUMPTION: any future change to ``apply_configvalues`` that
         transforms ``secret`` / ``cert_file`` / ``key_file`` /
@@ -1627,6 +1679,10 @@ class Plexus(EventMixin):
             DEFAULT_LOOKUP_INTERVAL as _DEF_LOOK,
             DEFAULT_LIVENESS_TIMEOUT as _DEF_LIVE,
             DEFAULT_RESYNC_INTERVAL as _DEF_RESYNC,
+            DEFAULT_CONNECT_TIMEOUT as _DEF_CONNECT,
+            DEFAULT_INBOUND_IDLE_TIMEOUT as _DEF_INBOUND,
+            DEFAULT_REQUEST_TIMEOUT as _DEF_REQUEST,
+            DEFAULT_MAX_OUTBOUND_CONNECTIONS as _DEF_MAXOUT,
         )
 
         nw_cfg = yaml_config.get("networking") or {}
@@ -1635,6 +1691,16 @@ class Plexus(EventMixin):
             try:
                 f = float(val)
                 return f if f > 0 else default
+            except (TypeError, ValueError):
+                return default
+
+        # HUNT-070: int sibling to _safe_float for pool_size (Queue maxsize /
+        # drain-loop bound). Same fail-silent contract; NetworkManager.pool_size
+        # also clamps on assignment.
+        def _safe_int(val, default):
+            try:
+                i = int(val)
+                return i if i > 0 else default
             except (TypeError, ValueError):
                 return default
 
@@ -1658,7 +1724,24 @@ class Plexus(EventMixin):
             # schema; `cert_file`/`key_file` in nw_cfg are now ignored
             # silently. Future enhancement: warn at config-load time if
             # legacy keys are present (operator hint).
-            pool_size=nw_cfg.get("pool_size", 5),
+            pool_size=_safe_int(nw_cfg.get("pool_size", 5), 5),
+            # HUNT-108/109/110/111/142 (R6): coerce the bounded-await + cap
+            # knobs at the config boundary, same fail-silent contract as the
+            # timing knobs, so a bad value defaults instead of crashing NM
+            # construction. inbound_idle_timeout is floored 3x heartbeat inside
+            # NetworkManager.__init__.
+            connect_timeout=_safe_float(
+                nw_cfg.get("connect_timeout", _DEF_CONNECT), _DEF_CONNECT
+            ),
+            inbound_idle_timeout=_safe_float(
+                nw_cfg.get("inbound_idle_timeout", _DEF_INBOUND), _DEF_INBOUND
+            ),
+            request_timeout=_safe_float(
+                nw_cfg.get("request_timeout", _DEF_REQUEST), _DEF_REQUEST
+            ),
+            max_outbound_connections=_safe_int(
+                nw_cfg.get("max_outbound_connections", _DEF_MAXOUT), _DEF_MAXOUT
+            ),
             networking_config=nw_cfg,
             config_dir=cfg_dir,
             heartbeat_interval=_safe_float(

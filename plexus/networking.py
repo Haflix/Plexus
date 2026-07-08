@@ -7277,7 +7277,18 @@ class NetworkManager:
             self._logger.debug(
                 f"[HEARTBEAT] Pinging node {node.IP} (timeout={timeout})"
             )
-            reader, writer = await self._get_connection(node.IP)
+            # R1: bound the connection acquire by the probe budget. HUNT-109's
+            # GLOBAL checkout semaphore is shared with the data plane, so if all
+            # permits are held by concurrent streams/slow calls an unbounded
+            # acquire here would STALL the whole heartbeat tick -> healthy peers
+            # accrue misses -> false _mark_node_dead (a data->control priority
+            # inversion). Bounding it degrades a saturated cap to a single
+            # self-healing heartbeat MISS (the except below) instead of a stalled
+            # loop. The _get_connection wrapper releases the permit on this
+            # cancellation (its finally, transferred=False), so no permit leaks.
+            reader, writer = await asyncio.wait_for(
+                self._get_connection(node.IP), timeout=timeout
+            )
 
             await self._send_message(writer, MSG_PING, {})
 
