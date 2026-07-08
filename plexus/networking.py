@@ -524,6 +524,33 @@ class NetworkManager:
         # churn. Per O7 (current-session only).
         self.peer_stats: Dict[str, Dict[str, int]] = {}
 
+    # ── pool_size invariant ────────────────────────────────────────────
+
+    @property
+    def pool_size(self) -> int:
+        """Connection-pool size, always a positive int (HUNT-070/145).
+
+        pool_size feeds ``asyncio.Queue(maxsize=...)`` (where <=0 means an
+        UNBOUNDED queue -> fd/connection leak) and the ``attempts <
+        self.pool_size`` stale-drain loop bound (where a non-int raises on the
+        comparison). The setter is the last-line type invariant: EVERY write
+        (ctor, the config hot-reload's ``nm.pool_size = ...``, or a direct set)
+        is coerced to ``max(1, int(value))``, so no reader ever sees a 0 /
+        negative / non-int value regardless of how it arrived. The config
+        boundary in core.py additionally applies the default-5 semantics via
+        _safe_int, mirroring the _safe_float timing knobs; this guards the
+        attribute itself.
+        """
+        return getattr(self, "_pool_size", 5)
+
+    @pool_size.setter
+    def pool_size(self, value) -> None:
+        try:
+            coerced = int(value)
+        except (TypeError, ValueError):
+            coerced = 5
+        self._pool_size = max(1, coerced)
+
     # ── Per-node port helpers ──────────────────────────────────────────
 
     def _parse_endpoint(self, entry) -> tuple[str, Optional[int]]:
