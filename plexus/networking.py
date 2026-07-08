@@ -330,6 +330,15 @@ class NetworkManager:
         # Server state
         self.server = None
         self.server_task = None
+        # HUNT-113: registry of the per-client handler Tasks that
+        # asyncio.start_server spawns (one per accepted inbound connection).
+        # handle_client adds asyncio.current_task() on entry and discards it in
+        # its finally, so the set stays bounded to currently-live handlers.
+        # stop() snapshots this set and cancel+awaits each after closing the
+        # listener, so a handler parked in the receive loop cannot survive
+        # shutdown as a leaked coroutine + fd (Python 3.11 has no
+        # Server.close_clients()/abort_clients()).
+        self._handler_tasks: set = set()
         self.heartbeat_task = None
         self.discovery_task = None
 
@@ -1468,14 +1477,33 @@ class NetworkManager:
             reader: asyncio.StreamReader, writer: asyncio.StreamWriter
         ):
             """Handle incoming client connection."""
+            # HUNT-113: register this per-client handler Task so stop() can
+            # cancel+await it. asyncio.start_server runs this callback as its
+            # own Task, so current_task() is that handler Task. Discarded in the
+            # finally on completion so self._handler_tasks stays bounded.
+            # Registration is best-effort: start_server owns Task creation so
+            # there is no synchronous spawn hook, and a connection accepted at
+            # the exact instant of stop() could self-register just after stop()
+            # snapshots the set. stop() does several awaits between
+            # server.close() and the snapshot, so in practice the pending
+            # handler runs this line first; Python 3.11 offers no
+            # Server.close_clients()/abort_clients() to close that window.
+            handler_task = asyncio.current_task()
+            if handler_task is not None:
+                self._handler_tasks.add(handler_task)
             try:
                 await self._handle_client(reader, writer)
             except Exception as e:
                 self._logger.exception("Error handling client connection")
             finally:
+                if handler_task is not None:
+                    self._handler_tasks.discard(handler_task)
                 try:
                     writer.close()
-                    await writer.wait_closed()
+                    # HUNT-110 bonus: bound the close handshake so a stalled
+                    # TLS close_notify cannot hang this per-connection callback.
+                    # Mirrors the wait_for(wait_closed, 1.0) sibling elsewhere.
+                    await asyncio.wait_for(writer.wait_closed(), timeout=1.0)
                 except Exception:
                     pass
 
@@ -1724,6 +1752,27 @@ class NetworkManager:
                     e,
                     exc_info=True,
                 )
+
+        # HUNT-113: cancel + await the per-client handler Tasks that
+        # asyncio.start_server spawned. The listener is already closed above,
+        # so no NEW handler can be accepted and this snapshot is complete.
+        # Inbound handlers never pool a writer or hold a HUNT-109 permit, and
+        # stop() holds NO lock here (the _adverts_struct_lock was released
+        # right after the host snapshot above), so awaiting a cancelled
+        # handler's finally (writer close + advert-state drop) cannot deadlock.
+        # Done BEFORE the pool / _checked_out_writers drains (which cover
+        # OUTBOUND connections only) so each cancelled handler's finally runs
+        # against a still-intact NM. getattr-defensive for scaffold NMs;
+        # return_exceptions=True so nothing raises out of stop().
+        handler_tasks = list(getattr(self, "_handler_tasks", ()) or ())
+        if handler_tasks:
+            self._logger.info(
+                "[SERVER] Cancelling %d in-flight client handler task(s) on stop()",
+                len(handler_tasks),
+            )
+            for task in handler_tasks:
+                task.cancel()
+            await asyncio.gather(*handler_tasks, return_exceptions=True)
 
         # Close all pooled connections (key is (ip, port))
         # BUG-023: snapshot items() so a concurrent _get_connection insert
