@@ -155,6 +155,25 @@ DEFAULT_LIVENESS_TIMEOUT: float = 30.0
 # operator. Configurable via networking.probe_timeout in config.yml.
 DEFAULT_PROBE_TIMEOUT: Optional[float] = None
 
+# HUNT-108: max seconds for a single outbound TLS connect + handshake
+# (asyncio.open_connection with ssl=). Bounds _create_connection so a
+# half-open peer cannot stall a caller indefinitely. Kept below
+# probe_timeout so heartbeat_node (which connects OUTSIDE its own probe
+# wait_for) still strikes a half-open peer fast.
+DEFAULT_CONNECT_TIMEOUT: float = 10.0
+# HUNT-110: generous idle ceiling for an INBOUND server-side connection
+# between requests. Floored at 3x heartbeat_interval in __init__. A false
+# idle-reap is benign: the inbound socket only reads requests / writes
+# responses (never pushes), so the peer just reconnects on demand.
+DEFAULT_INBOUND_IDLE_TIMEOUT: float = 120.0
+# HUNT-111/142: fallback per-frame read deadline for an OUTBOUND request
+# when the caller supplies no explicit timeout.
+DEFAULT_REQUEST_TIMEOUT: float = 30.0
+# HUNT-109: default GLOBAL cap on concurrently checked-out OUTBOUND
+# connections (one process-wide semaphore, not per-(IP,port)). Bounds the
+# fd/TLS-socket storm a wide/slow publish fan-out would otherwise open.
+DEFAULT_MAX_OUTBOUND_CONNECTIONS: int = 20
+
 
 class _DrainTimeout(asyncio.TimeoutError):
     """Marker: a bounded ``writer.drain()`` exceeded its timeout (R3-MM-4 /
@@ -192,6 +211,15 @@ class NetworkManager:
         # defaults to ``min(heartbeat_interval, liveness_timeout)`` (set
         # below after both fields are resolved).
         probe_timeout: Optional[float] = DEFAULT_PROBE_TIMEOUT,
+        # HUNT-108/110/111/142/109: bounded-await + checkout-cap knobs. Passed
+        # pre-coerced from core.py (_safe_float / _safe_int), same as the timing
+        # knobs above, so a malformed config value defaults instead of crashing
+        # NM construction. ``inbound_idle_timeout=None`` -> default, then floored
+        # at 3x heartbeat_interval below.
+        connect_timeout: float = DEFAULT_CONNECT_TIMEOUT,
+        inbound_idle_timeout: Optional[float] = None,
+        request_timeout: float = DEFAULT_REQUEST_TIMEOUT,
+        max_outbound_connections: int = DEFAULT_MAX_OUTBOUND_CONNECTIONS,
     ):
         self.plexus = plexus
         self._logger = logger
@@ -332,6 +360,33 @@ class NetworkManager:
             if probe_timeout is not None and float(probe_timeout) > 0
             else min(heartbeat_interval, liveness_timeout)
         )
+        # HUNT-108/110/111/142: bounded-await budgets. connect_timeout caps a
+        # single outbound TLS connect; inbound_idle_timeout is the server-side
+        # between-requests idle ceiling (floored at 3x heartbeat_interval so a
+        # healthy peer that only heartbeats us is never false-reaped);
+        # request_timeout is the outbound per-frame read fallback when a caller
+        # supplies no timeout. Passed pre-coerced from core.py (_safe_float),
+        # same as the timing knobs above, so a bad config value defaults rather
+        # than crashing __init__ (R6). Operator-tunable via networking: keys.
+        self.connect_timeout = connect_timeout
+        self.inbound_idle_timeout = max(
+            inbound_idle_timeout
+            if inbound_idle_timeout is not None
+            else DEFAULT_INBOUND_IDLE_TIMEOUT,
+            3.0 * self.heartbeat_interval,
+        )
+        self.request_timeout = request_timeout
+        # HUNT-109: GLOBAL cap on concurrently checked-out OUTBOUND
+        # connections. A blocking asyncio.Semaphore (lazily minted in
+        # _get_connection, one for the whole NetworkManager) held for the
+        # LIFETIME of each checkout, so a wide/slow publish fan-out cannot
+        # open unbounded TLS sockets/fds. Operator-tunable via
+        # networking.max_outbound_connections; passed pre-coerced from core.py
+        # (_safe_int). NOTE: the semaphore is minted once (lazily) so a
+        # hot-reload of the cap updates this attr but does NOT resize the live
+        # semaphore — the cap is effectively restart-only (documented).
+        self._max_outbound_connections = max_outbound_connections
+        self._conn_semaphore: Optional[asyncio.Semaphore] = None
         # C-109: monotonic timestamp of the most recent periodic
         # full-snapshot resync sweep. Compared against
         # time.monotonic() inside heartbeat_loop to decide when the
@@ -1242,6 +1297,61 @@ class NetworkManager:
             self._logger.exception("[MESSAGE] Error receiving message")
             raise
 
+    def _client_read_timeout(self, timeout=None) -> float:
+        """Resolve the per-frame read deadline for an OUTBOUND request.
+
+        Honors the caller's own ``timeout`` SLA (the remote is bounded by the
+        same value, so a legitimate inter-frame gap is < timeout and will not
+        false-trip); falls back to ``request_timeout`` when the caller passed
+        no timeout. Unwraps the legacy ``(duration, created_at)`` tuple/list
+        shape to its scalar first element.
+        """
+        if isinstance(timeout, (tuple, list)) and timeout:
+            timeout = timeout[0]
+        try:
+            t = float(timeout) if timeout is not None else 0.0
+        except (TypeError, ValueError):
+            t = 0.0
+        return (
+            t
+            if t > 0
+            else getattr(self, "request_timeout", DEFAULT_REQUEST_TIMEOUT)
+        )
+
+    def _discard_checked_out(self, writer) -> None:
+        """Best-effort remove a writer from the checked-out set on any close
+        path (C-043 leak fix). Guarded via getattr because test scaffolds
+        build NM via object.__new__ without running __init__. Race-safe: the
+        _return_connection happy path is synchronous through put_nowait, so no
+        await-gap precedes the finally that calls this.
+        """
+        co = getattr(self, "_checked_out_writers", None)
+        if co is not None and writer is not None:
+            co.discard(writer)
+        # HUNT-109: the checkout is ending on every path that reaches here, so
+        # release the global concurrency permit too (marker-gated, so this
+        # also fixes any set-membership leak without double-releasing).
+        self._release_conn_permit(writer)
+
+    def _release_conn_permit(self, writer) -> None:
+        """HUNT-109: release the global outbound-connection permit held for a
+        checkout, exactly once. Marker-gated (``_aio_pool_has_permit``) so it
+        can be called on EVERY close path — ``_return_connection``,
+        ``_discard_checked_out``, and ``stop()``'s drain — yet release the
+        semaphore exactly once per checkout, and never on a writer that never
+        held a permit. Synchronous (no await) so it cannot interleave under the
+        single-threaded loop and double-release. getattr-guarded because test
+        scaffolds build NM via ``object.__new__`` without running __init__.
+        """
+        if writer is None:
+            return
+        if not getattr(writer, "_aio_pool_has_permit", False):
+            return
+        writer._aio_pool_has_permit = False
+        sem = getattr(self, "_conn_semaphore", None)
+        if sem is not None:
+            sem.release()
+
     async def _send_stream_chunk(
         self, writer: asyncio.StreamWriter, chunk: any
     ) -> None:
@@ -1669,6 +1779,11 @@ class NetworkManager:
                 len(checked_out),
             )
         for writer in checked_out:
+            # HUNT-109: release each drained writer's permit so an acquirer
+            # blocked on the semaphore unblocks, re-checks the _stopping guard
+            # at the top of _get_connection, and bails instead of handing out
+            # a socket during shutdown.
+            self._release_conn_permit(writer)
             try:
                 writer.close()
                 try:
@@ -1778,7 +1893,27 @@ class NetworkManager:
             # Process requests
             while True:
                 try:
-                    msg_type, data = await self._receive_message(reader)
+                    # HUNT-110: bound the between-requests idle wait. INVARIANT:
+                    # this inbound handler only READS requests / WRITES responses
+                    # on this socket — it NEVER pushes (every outbound push uses
+                    # its own _get_connection; this writer is never pooled and
+                    # never in _checked_out_writers). So a false idle reap is
+                    # benign: the peer reconnects on demand and advert-state
+                    # cleanup defers to heartbeat (the finally below).
+                    msg_type, data = await asyncio.wait_for(
+                        self._receive_message(reader),
+                        timeout=getattr(
+                            self,
+                            "inbound_idle_timeout",
+                            DEFAULT_INBOUND_IDLE_TIMEOUT,
+                        ),
+                    )
+                except asyncio.TimeoutError:
+                    self._logger.debug(
+                        f"Idle timeout on inbound connection from {client_addr}"
+                    )
+                    disconnect_reason = "idle_timeout"
+                    break
                 except (ConnectionError, ConnectionResetError):
                     self._logger.debug(
                         f"Connection lost while handling client {client_addr}"
@@ -3975,6 +4110,9 @@ class NetworkManager:
                 peer_hostname, peer_ip, exc_info=True,
             )
         finally:
+            # HUNT-109: release the checkout permit on every path (the else
+            # branch below closes the writer inline without _discard/_return).
+            self._discard_checked_out(writer)
             if reader and writer:
                 if send_ok:
                     try:
@@ -4101,6 +4239,9 @@ class NetworkManager:
                 "[PUBLISH_EVENT_REMOTE] failed to send to %s", IP, exc_info=True
             )
         finally:
+            # HUNT-109: release the checkout permit on every path (the else
+            # branch below closes the writer inline without _discard/_return).
+            self._discard_checked_out(writer)
             if reader and writer:
                 if send_ok:
                     try:
@@ -4159,9 +4300,12 @@ class NetworkManager:
             # from a prior streaming request — ignore rather than crash.
             result: Any = None
             have_result = False
+            read_deadline = self._client_read_timeout(timeout)
             while True:
                 try:
-                    msg_type, chunk = await self._receive_message(reader)
+                    msg_type, chunk = await asyncio.wait_for(
+                        self._receive_message(reader), timeout=read_deadline
+                    )
                 except (TimeoutError, ConnectionError) as e:
                     raise NetworkRequestException(str(e))
                 except pickle.UnpicklingError as _e:
@@ -4210,6 +4354,7 @@ class NetworkManager:
             )
             raise NetworkRequestException(str(e))
         finally:
+            self._discard_checked_out(writer)
             if reader and writer and not connection_returned:
                 try:
                     writer.close()
@@ -4263,19 +4408,27 @@ class NetworkManager:
             # MSG_ERROR frames, and a legitimate 2-tuple item must not be
             # mistaken for an error.
             current_item_chunks: list = []
+            read_deadline = self._client_read_timeout(timeout)
             while True:
                 try:
-                    length_bytes = await reader.readexactly(4)
+                    length_bytes = await asyncio.wait_for(
+                        reader.readexactly(4), timeout=read_deadline
+                    )
                     msg_length = struct.unpack(">I", length_bytes)[0]
                     if msg_length >= MAX_MESSAGE_SIZE:
                         raise NetworkRequestException(
                             f"Message length {msg_length} exceeds maximum "
                             f"{MAX_MESSAGE_SIZE}"
                         )
-                    msg_type = (await reader.readexactly(1))[0]
+                    msg_type = (await asyncio.wait_for(
+                        reader.readexactly(1), timeout=read_deadline
+                    ))[0]
                     payload_length = msg_length - 1
                     payload = (
-                        await reader.readexactly(payload_length)
+                        await asyncio.wait_for(
+                            reader.readexactly(payload_length),
+                            timeout=read_deadline,
+                        )
                         if payload_length > 0
                         else b""
                     )
@@ -4338,6 +4491,7 @@ class NetworkManager:
             )
             raise NetworkRequestException(str(e))
         finally:
+            self._discard_checked_out(writer)
             if reader and writer and not connection_returned:
                 try:
                     writer.close()
@@ -4433,6 +4587,9 @@ class NetworkManager:
                     self._outbound_adverts.pop(peer_hostname, None)
                 raise
             finally:
+                # HUNT-109: release the checkout permit on every path (the else
+                # branch below closes the writer inline without _discard/_return).
+                self._discard_checked_out(writer)
                 # Cycle-4 fix: only pool on confirmed send success. Mirrors
                 # send_sub_delta_remote pattern. Without send_ok, a partial
                 # MSG_SUB_ADVERTISE would pool a framing-corrupt writer that
@@ -4581,6 +4738,9 @@ class NetworkManager:
                             # converges the state.
                             outbound_now[sub.sub_uuid] = prior_advert
             finally:
+                # HUNT-109: release the checkout permit on every path (the else
+                # branch below closes the writer inline without _discard/_return).
+                self._discard_checked_out(writer)
                 if reader and writer:
                     if send_ok:
                         try:
@@ -5536,14 +5696,30 @@ class NetworkManager:
         ssl_context = self._create_client_ssl_context()
 
         try:
-            reader, writer = await asyncio.open_connection(
-                IP,
-                port,
-                ssl=ssl_context,
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(
+                    IP,
+                    port,
+                    ssl=ssl_context,
+                ),
+                timeout=getattr(self, "connect_timeout", DEFAULT_CONNECT_TIMEOUT),
             )
             self._logger.debug(
                 f"[CONNECTION] TLS connection established to {IP}:{port}"
             )
+        except asyncio.TimeoutError as e:
+            # HUNT-108: bound the connect + handshake. R4: on timeout the inner
+            # open_connection coroutine is cancelled; if the connect race
+            # already produced a transport it is NOT reachable here (the
+            # reader/writer assignment above never completed), so we rely on
+            # the cancelled coroutine to close its own transport.
+            self._logger.warning(
+                f"[CONNECTION] Timed out connecting to {IP}:{port} after "
+                f"{getattr(self, 'connect_timeout', DEFAULT_CONNECT_TIMEOUT)}s"
+            )
+            raise ConnectionError(
+                f"Timed out connecting to {IP}:{port}"
+            ) from e
         except Exception as e:
             self._logger.warning(
                 f"[CONNECTION] Failed to establish connection to {IP}:{port}: {e}"
@@ -5700,6 +5876,57 @@ class NetworkManager:
         return closed
 
     async def _get_connection(
+        self, IP: str
+    ) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        """Acquire a checked-out connection, bounded by a GLOBAL concurrency
+        cap (HUNT-109).
+
+        Holds one permit of a process-wide ``asyncio.Semaphore`` for the
+        LIFETIME of the checkout: the permit is acquired here and released only
+        when the writer leaves the checked-out set (``_release_conn_permit``,
+        marker-gated so it fires exactly once, on return/close/drain). The
+        blocking acquire applies backpressure so a wide/slow publish fan-out
+        cannot open unbounded outbound TLS sockets/fds.
+
+        The pool / health-check / fresh-connect logic lives in
+        ``_get_connection_inner``; this wrapper only owns the semaphore
+        lifecycle. getattr-defensive so test scaffolds built via
+        ``object.__new__`` work.
+        """
+        # Abort before taking a permit if we're already shutting down: a
+        # blocked acquirer released by stop()'s drain re-enters here and bails
+        # rather than handing out a socket during teardown.
+        if getattr(self, "_stopping", False):
+            raise NetworkRequestException(
+                "connection acquired during shutdown"
+            )
+
+        # Lazily mint the process-wide semaphore on first use (the ctor stores
+        # only the cap + a None holder, so a hot-reloaded / test-scaffolded NM
+        # still gets a valid semaphore here).
+        sem = getattr(self, "_conn_semaphore", None)
+        if sem is None:
+            cap = int(getattr(self, "_max_outbound_connections", 20) or 20)
+            sem = asyncio.Semaphore(max(1, cap))
+            self._conn_semaphore = sem
+
+        await sem.acquire()
+        # The try MUST begin AFTER acquire() returns: a cancellation raised
+        # while awaiting acquire() leaves us holding no permit, so it must not
+        # reach the finally's release (over-release guard).
+        transferred = False
+        try:
+            reader, writer = await self._get_connection_inner(IP)
+            # Stamp the permit marker so _release_conn_permit releases exactly
+            # once when the checkout ends (return / close / stop-drain).
+            writer._aio_pool_has_permit = True
+            transferred = True
+            return reader, writer
+        finally:
+            if not transferred:
+                sem.release()
+
+    async def _get_connection_inner(
         self, IP: str
     ) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
         """Get a connection from pool or create new one.
@@ -5876,6 +6103,11 @@ class NetworkManager:
         self, IP: str, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ):
         """Return a connection to the pool (keyed by (IP, port))."""
+        # HUNT-109: the checkout is ending regardless of whether we pool or
+        # close below — release the concurrency permit now. Marker-gated in
+        # _release_conn_permit so a caller whose finally ALSO routes through
+        # _discard_checked_out releases exactly once.
+        self._release_conn_permit(writer)
         key = self._pool_key(IP)
 
         # R2-CC-1: revoke-race guard. If the peer was revoked between
@@ -6011,9 +6243,12 @@ class NetworkManager:
             result_chunks_bytes = []
             total_bytes = 0
             chunks = 0
+            read_deadline = self._client_read_timeout(timeout)
             while True:
                 # Read raw message to get pickled bytes (don't unpickle yet for chunks)
-                length_bytes = await reader.readexactly(4)
+                length_bytes = await asyncio.wait_for(
+                    reader.readexactly(4), timeout=read_deadline
+                )
                 msg_length = struct.unpack(">I", length_bytes)[0]
 
                 # R2-CC-4: sender/receiver parity — both reject at exactly MAX.
@@ -6022,12 +6257,16 @@ class NetworkManager:
                         f"Message length {msg_length} exceeds maximum {MAX_MESSAGE_SIZE}"
                     )
 
-                msg_type_byte = await reader.readexactly(1)
+                msg_type_byte = await asyncio.wait_for(
+                    reader.readexactly(1), timeout=read_deadline
+                )
                 msg_type = msg_type_byte[0]
 
                 payload_length = msg_length - 1
                 if payload_length > 0:
-                    payload = await reader.readexactly(payload_length)
+                    payload = await asyncio.wait_for(
+                        reader.readexactly(payload_length), timeout=read_deadline
+                    )
 
                     # B-071: per-peer recv counter (with-payload frame).
                     self._count_recv(reader, 4 + 1 + payload_length)
@@ -6149,6 +6388,11 @@ class NetworkManager:
                 connection_returned = True
             raise
         finally:
+            # HUNT-111 / C-043: drop the writer from the checked-out set on
+            # EVERY close path — top-of-finally also covers the cancel /
+            # BaseException path. Safe: the happy path's _return_connection
+            # already discarded, and discard() on an absent element is a no-op.
+            self._discard_checked_out(writer)
             # Return connection to pool ONLY on success (success path sets
             # connection_returned=True via _return_connection). On exception
             # the except-block above closed it and set connection_returned=True
@@ -6227,9 +6471,12 @@ class NetworkManager:
             items_yielded = 0
             item_bytes = 0
             item_chunks = 0
+            read_deadline = self._client_read_timeout(timeout)
             while True:
                 # Read raw message
-                length_bytes = await reader.readexactly(4)
+                length_bytes = await asyncio.wait_for(
+                    reader.readexactly(4), timeout=read_deadline
+                )
                 msg_length = struct.unpack(">I", length_bytes)[0]
 
                 # R2-CC-4: sender/receiver parity — both reject at exactly MAX.
@@ -6238,12 +6485,16 @@ class NetworkManager:
                         f"Message length {msg_length} exceeds maximum {MAX_MESSAGE_SIZE}"
                     )
 
-                msg_type_byte = await reader.readexactly(1)
+                msg_type_byte = await asyncio.wait_for(
+                    reader.readexactly(1), timeout=read_deadline
+                )
                 msg_type = msg_type_byte[0]
 
                 payload_length = msg_length - 1
                 if payload_length > 0:
-                    payload = await reader.readexactly(payload_length)
+                    payload = await asyncio.wait_for(
+                        reader.readexactly(payload_length), timeout=read_deadline
+                    )
 
                     # B-071: per-peer recv counter (with-payload frame).
                     self._count_recv(reader, 4 + 1 + payload_length)
@@ -6500,6 +6751,10 @@ class NetworkManager:
                 f"Remote stream error from {IP}: {e}"
             ) from e
         finally:
+            # HUNT-111 / C-043: drop the writer from the checked-out set on
+            # EVERY close path, including the GeneratorExit consumer break-out
+            # path that bypasses the except clauses above.
+            self._discard_checked_out(writer)
             # R2-AA-10: pool ONLY on clean MSG_END_STREAM termination.
             # GeneratorExit (consumer break-out) bypasses every except
             # clause above and arrives here with clean_exit=False — the
@@ -6789,7 +7044,9 @@ class NetworkManager:
             self._logger.debug(f"[GET_INFO] Sending INFO to {IP}: {request_data}")
             await self._send_message(writer, MSG_INFO, request_data)
 
-            msg_type, data = await self._receive_message(reader)
+            msg_type, data = await asyncio.wait_for(
+                self._receive_message(reader), timeout=timeout
+            )
             self._logger.debug(
                 f"[GET_INFO] Received message from {IP}: type={msg_type}, data_type={type(data).__name__}"
             )
@@ -6833,6 +7090,10 @@ class NetworkManager:
                 connection_returned = True
             return None
         finally:
+            # HUNT-142 / C-043: drop the writer from the checked-out set on
+            # EVERY close path — the unexpected-msg_type `else` branch is a 3rd
+            # close path a discard-in-except would miss.
+            self._discard_checked_out(writer)
             # Defensive: only reached on clean MSG_RESULT / MSG_ERROR exits.
             if reader and writer and not connection_returned:
                 try:
@@ -6977,6 +7238,11 @@ class NetworkManager:
                 connection_returned = True
             return False
         finally:
+            # HUNT-109: release the checkout permit on every path. This method
+            # has NO _discard_checked_out and closes the writer inline in three
+            # branches (unexpected-type / except / finally); top-of-finally
+            # discard covers them all, releasing the permit exactly once.
+            self._discard_checked_out(writer)
             # Defensive: if for some reason connection_returned is still
             # False (early exit before the success/error branches), close
             # the writer rather than pooling a connection of unknown state.
@@ -7021,7 +7287,10 @@ class NetworkManager:
             self._logger.debug(f"[ENDPOINT] HAS_ENDPOINT message sent to {IP}")
 
             self._logger.debug(f"[ENDPOINT] Waiting for response from {IP}")
-            msg_type, data = await self._receive_message(reader)
+            msg_type, data = await asyncio.wait_for(
+                self._receive_message(reader),
+                timeout=getattr(self, "request_timeout", DEFAULT_REQUEST_TIMEOUT),
+            )
             self._logger.debug(
                 f"[ENDPOINT] Received message from {IP}: type={msg_type}, "
                 f"data_keys={list(data.keys()) if isinstance(data, dict) else 'N/A'}"
@@ -7072,6 +7341,10 @@ class NetworkManager:
                 connection_returned = True
             return None
         finally:
+            # HUNT-142 / C-043: drop the writer from the checked-out set on
+            # EVERY close path — the unexpected-msg_type `else` branch is a 3rd
+            # close path a discard-in-except would miss.
+            self._discard_checked_out(writer)
             # Defensive: only reached on clean MSG_RESULT / MSG_ERROR exits
             # (which left framing intact). Unexpected-type and exception
             # paths already closed above.
@@ -7116,7 +7389,10 @@ class NetworkManager:
 
             await self._send_message(writer, MSG_FIND_TAGGED_ENDPOINTS, {"tag": tag})
 
-            msg_type, data = await self._receive_message(reader)
+            msg_type, data = await asyncio.wait_for(
+                self._receive_message(reader),
+                timeout=getattr(self, "request_timeout", DEFAULT_REQUEST_TIMEOUT),
+            )
 
             if msg_type == MSG_RESULT:
                 remote_endpoints = []
@@ -7172,6 +7448,10 @@ class NetworkManager:
                 connection_returned = True
             return None
         finally:
+            # HUNT-142 / C-043: drop the writer from the checked-out set on
+            # EVERY close path — the unexpected-msg_type branch is a 3rd close
+            # path a discard-in-except would miss.
+            self._discard_checked_out(writer)
             # Defensive: only reached on clean MSG_RESULT / MSG_ERROR exits.
             if reader and writer and not connection_returned:
                 try:
