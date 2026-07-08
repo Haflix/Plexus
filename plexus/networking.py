@@ -1799,7 +1799,11 @@ class NetworkManager:
                     break
                 try:
                     writer.close()
-                    await writer.wait_closed()
+                    # HUNT-048: bound wait_closed() (mirror the _checked_out
+                    # drain sibling below) so one half-open pooled peer cannot
+                    # deadlock shutdown. The TimeoutError is an Exception, so the
+                    # existing handler catches it, logs, and continues the drain.
+                    await asyncio.wait_for(writer.wait_closed(), timeout=1.0)
                     closed += 1
                 except Exception as e:
                     self._logger.warning(
@@ -5375,7 +5379,14 @@ class NetworkManager:
                     break
                 try:
                     w.close()
-                    await w.wait_closed()
+                    # HUNT-050: bound wait_closed() (mirror stop()'s pool drain /
+                    # the _checked_out sibling) so a stuck half-open peer cannot
+                    # pin this drop path. stop() calls this for every peer BEFORE
+                    # its own bounded drains, and it's reachable on any
+                    # heartbeat-dead/flap drop, so an unbounded await here could
+                    # hang a healthy process. TimeoutError falls to the existing
+                    # handler, which logs and the while loop continues.
+                    await asyncio.wait_for(w.wait_closed(), timeout=1.0)
                 except Exception as e:
                     self._logger.debug(
                         "_drop_peer_advert_state pool close error for %s: %s — continuing drain",
@@ -5915,7 +5926,12 @@ class NetworkManager:
                 break
             try:
                 writer.close()
-                await writer.wait_closed()
+                # HUNT-048/050 sibling: bound wait_closed() here too so a stuck
+                # half-open pooled peer cannot pin revoke_peer's drain (same
+                # unbounded-await bug class as the stop() / _drop_peer_advert_state
+                # drains). TimeoutError falls to the existing handler, which logs
+                # and the while loop continues.
+                await asyncio.wait_for(writer.wait_closed(), timeout=1.0)
                 closed += 1
             except Exception as e:
                 self._logger.warning(
