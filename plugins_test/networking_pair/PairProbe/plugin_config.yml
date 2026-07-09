@@ -1,0 +1,19 @@
+description: >-
+  Networking pair-harness probe (guards B-082). role=sub subscribes the
+  pair/probe topic at runtime (hosts=any) so its sub advertises cross-node;
+  role=ask does NOT subscribe (so its request_event can only be answered by the
+  REMOTE peer), polls its own network._inbound_adverts for the peer's subs, then
+  fires request_event and writes a JSON result file the test asserts on.
+version: 0.1.0
+arguments:
+events:
+  pair_probe:
+    topic: pair/probe
+endpoints:
+  pair_probe_handler:
+    internal_name: pair_probe_handler
+    remote: True
+    accessible_by_other_plugins: True
+    description: Handler for the pair/probe topic; returns a pong payload.
+    arguments:
+      - name: value

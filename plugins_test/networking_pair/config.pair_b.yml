@@ -1,0 +1,24 @@
+# Pair-harness node B (subscriber). Hostname "pair-b" is the HIGHER of the pair,
+# so it defers to reciprocate the exchange. keys_dir / peer / port are injected
+# at runtime by pair_node.py.
+plugins:
+  - name: PairProbe
+    enabled: true
+    path: ./plugins_test/networking_pair/PairProbe
+
+general:
+    hostname: "pair-b"
+    plugin_package: plugins_test
+    console_log_level: "WARNING"
+    file_log_level: "DEBUG"
+    asyncio_debug: false
+    logger_levels:
+        asyncio: "MUTE"
+        urllib3: "MUTE"
+
+networking:
+    enabled: true
+    port: 0
+    discover_nodes: true
+    direct_discoverable: true
+    auto_discoverable: true
