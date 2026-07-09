@@ -171,6 +171,13 @@ plugins:
     enabled: true
     path: ./plugins_test/TestAuditPortUnitSuite
 
+  # In-process minimal-NM guards for the networking advert/liveness layer
+  # (the B-085 "P-cell" family); the real-socket half lives in
+  # plugins_test/networking_pair/ behind PLEXUS_PAIR_TEST.
+  - name: TestNetPairUnitSuite
+    enabled: true
+    path: ./plugins_test/TestNetPairUnitSuite
+
   # Pure-function unit suites ported from the former root-level test_*.py
   # scripts (one suite, no scattered root tests). Each pairs with an
   # integration suite (TestCapabilitySuite / TestIdentitySuite / TestRateLimitSuite).
