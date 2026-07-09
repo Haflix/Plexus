@@ -33,6 +33,14 @@ from plexus.decorators import async_log_errors, log_errors
 _ASK_BUDGET_S = 25.0
 _POLL_INTERVAL_S = 0.5
 
+# S4 (drop+reconnect) per-phase budgets. Death is bounded by
+# heartbeat_strikes x heartbeat_interval + probe_timeout (turned down to
+# seconds by pair_node.py), plus slack. Each phase fails fast on its own
+# deadline rather than hanging the whole run.
+_RECOVER_ESTABLISH_S = 25.0
+_RECOVER_DEATH_S = 20.0
+_RECOVER_REJOIN_S = 25.0
+
 
 class PairProbe(Plugin):
     @log_errors
@@ -53,10 +61,128 @@ class PairProbe(Plugin):
                 target_access_name="pair_probe_handler",
             )
             self._sub_ids.append(sid)
+        elif os.environ.get("PAIR_RECOVER") == "1":
+            # role=ask + S4: run the 4-phase drop+reconnect probe.
+            self._ask_task = asyncio.create_task(self._run_recover_ask())
         else:
             # role=ask: no local sub, so request_event can only be answered by
             # the remote peer. Run the probe in the background.
             self._ask_task = asyncio.create_task(self._run_ask())
+
+    def _peer_advert_present(self, net) -> bool:
+        """True iff the peer's pair/probe subscription is currently in this
+        node's _inbound_adverts (the advert layer, distinct from the handshake
+        layer that _peer_connected reads). Used by the S4 recovery probe to
+        watch the advert appear -> vanish (peer killed) -> reappear (peer
+        respawned + reconnected)."""
+        if net is None:
+            return False
+        inbound = getattr(net, "_inbound_adverts", {}) or {}
+        for subs in inbound.values():
+            for s in (subs or {}).values():
+                if getattr(s, "topic_pattern", None) == "pair/probe":
+                    return True
+        return False
+
+    def _write_phase(self, phase: str) -> None:
+        """S4: signal the parent test how far the recovery probe has got, so it
+        can time the kill (after phase 1) and the respawn (after phase 2)."""
+        phase_file = os.environ.get("PAIR_PHASE_FILE", "")
+        if not phase_file:
+            return
+        try:
+            with open(phase_file, "w", encoding="utf-8") as f:
+                f.write(phase)
+        except OSError:
+            self._logger.exception("PairProbe: failed to write phase file")
+
+    async def _run_recover_ask(self):
+        """S4 drop+reconnect probe. Four bounded phases, each writing a boolean:
+          1. advert_before  — peer connected AND its pair/probe advert seen.
+          2. advert_gone    — after the parent kills the sub, its advert vanishes
+                              from _inbound_adverts (proves the kill + strike-
+                              death landed, so a later reappearance is genuine
+                              recovery, not a stale positive).
+          3. advert_after   — after the parent respawns the sub (same identity,
+                              new session), its advert RE-propagates.
+          4. request_ok     — a cross-node request_event(hosts="any") is answered
+                              again.
+        Each phase has its own deadline so a stuck phase fails fast instead of
+        hanging the run. The parent watches PAIR_PHASE_FILE to time the kill
+        (after "1") and respawn (after "2")."""
+        result_file = os.environ.get("PAIR_RESULT_FILE", "")
+        loop = asyncio.get_running_loop()
+        net = getattr(self._plexus, "network", None)
+        advert_before = advert_gone = advert_after = request_ok = False
+        error = ""
+
+        async def _poll_until(pred, budget_s):
+            deadline = loop.time() + budget_s
+            while loop.time() < deadline:
+                if pred():
+                    return True
+                await asyncio.sleep(_POLL_INTERVAL_S)
+            return pred()
+
+        # Phase 1: establish (peer connected + its advert seen).
+        advert_before = await _poll_until(
+            lambda: self._peer_connected(net) and self._peer_advert_present(net),
+            _RECOVER_ESTABLISH_S,
+        )
+        if advert_before:
+            self._write_phase("1")
+            # Phase 2: the parent now kills the sub; wait for its advert to
+            # vanish (strike-death -> _drop_peer_advert_state).
+            advert_gone = await _poll_until(
+                lambda: not self._peer_advert_present(net), _RECOVER_DEATH_S
+            )
+            if advert_gone:
+                self._write_phase("2")
+                # Phase 3: the parent now respawns the sub; wait for its advert
+                # to re-propagate over the real reconnect.
+                advert_after = await _poll_until(
+                    lambda: self._peer_advert_present(net), _RECOVER_REJOIN_S
+                )
+
+        # Phase 4: the actual cross-node ask (hosts="any" to route remotely).
+        try:
+            await self.request_event(
+                "pair_probe", payload={"value": 1}, hosts="any")
+            request_ok = True
+        except Exception as e:  # noqa: BLE001
+            error = f"{type(e).__name__}: {e}"
+
+        node_hosts = [
+            getattr(n, "hostname", None) for n in (getattr(net, "nodes", ()) or ())
+        ]
+        # FAITHFULNESS GATE (mirrors _peer_connected for B-082): did the peer
+        # genuinely RE-CONNECT after respawn (an ENABLED Node with its hostname)?
+        # If it did but no advert came back, that is a real restart-recovery
+        # advert bug; if it never reconnected, the missing advert is just a
+        # connection failure and the test must treat it as SETUP FAIL, not a
+        # confirmed recovery-advert bug.
+        peer = os.environ.get("PAIR_PEER_HOSTNAME", "")
+        peer_reconnected = any(
+            getattr(n, "hostname", None) == peer and getattr(n, "enabled", False)
+            for n in (getattr(net, "nodes", ()) or ())
+        )
+        if result_file:
+            try:
+                with open(result_file, "w", encoding="utf-8") as f:
+                    json.dump(
+                        {
+                            "advert_before": advert_before,
+                            "advert_gone": advert_gone,
+                            "advert_after": advert_after,
+                            "request_ok": request_ok,
+                            "peer_reconnected": peer_reconnected,
+                            "error": error,
+                            "node_hosts": node_hosts,
+                        },
+                        f,
+                    )
+            except OSError:
+                self._logger.exception("PairProbe: failed to write result file")
 
     def _peer_connected(self, net) -> bool:
         """True once this node has learned the peer via an AUTHENTICATED

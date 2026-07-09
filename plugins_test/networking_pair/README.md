@@ -38,9 +38,33 @@ runner does not run pytest files). Wire them into CI as a separate step.
 - `config.pair_a.yml` / `config.pair_b.yml` — the two node configs (hostnames
   `pair-a` < `pair-b` drive the tiebreak).
 
+- `test_S4_drop_and_reconnect_recovers` — the drop+reconnect cell. Boots the
+  pair, establishes the advert, KILLS the subscriber (asker strikes it dead,
+  advert vanishes), then RESPAWNS it on the same identity/port (new session_id)
+  and requires the advert to re-propagate + a cross-node request to be answered.
+  Currently **xfail**: it reproduces **B-088** (a strike-dead peer that restarts
+  is not recovered — the asker never re-probes a peer it marked dead, and the
+  respawn does not re-enable it). Flips to xpass when B-088 is fixed. `resync_
+  interval` is pinned longer than the recovery budget so a pass proves the real
+  reconnect healed it, not the periodic sweep.
+
+## Running / Windows socket budget
+
+Each test boots 2-3 real nodes; the whole file is ~9-11 boots. On Windows these
+accumulate TIME_WAIT sockets and can starve Winsock (WinError 10055), surfacing
+as a spurious advert failure in a LATER test. An autouse cooldown between tests
+mitigates it, but on a constrained box run in smaller batches (e.g. the B-082
+cases, then S4 separately). **Each test passes cleanly in isolation** — a full-
+file failure that disappears when the failing test is run alone is starvation,
+not a regression.
+
 ## Extending (B-085 matrix)
 
-`_run_pair(asker_is_lower, break_cert)` + the `@parametrize` are the seam. New
-angles (boot order, discovery-only vs configured-peer topology, fault injection
-— peer silent / restart mid-exchange / revoke, >2 nodes) are added as new params
-/ `_run_pair` flags. See bug **B-085** (test-suite gap analysis).
+`_run_pair(asker_is_lower, break_cert)` / `_run_drop_reconnect()` + the
+`@parametrize` are the seam. The `--recover` / `--phase-file` / timer CLI args on
+`pair_node.py` and the `role=ask` recovery probe in PairProbe are the fault-
+injection plumbing (kill+respawn via the parent; per-run timer knobs live-set on
+the NM). New angles (env-scheduled runtime subscribe/unsubscribe for the M3
+delta guard, asker-local revoke for HUNT-014/182) are added the same way. See
+bug **B-085** (the reconciled Phase-1 plan) and **B-086** (the advert-layer
+rework this matrix is the acceptance net for).

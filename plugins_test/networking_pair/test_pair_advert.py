@@ -80,6 +80,18 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+@pytest.fixture(autouse=True)
+def _socket_cooldown():
+    """Each test boots 2-3 real nodes; across the suite these accumulate
+    TIME_WAIT sockets on Windows and can starve Winsock (WinError 10055),
+    surfacing as a spurious advert-propagation failure in a LATER test. A short
+    cooldown between the boot-heavy tests lets sockets drain. Even so, on a
+    constrained box the full suite may need to run in smaller batches (see
+    README); each test passes cleanly in isolation."""
+    yield
+    time.sleep(5.0)
+
+
 def _free_port() -> int:
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
@@ -90,7 +102,7 @@ def _free_port() -> int:
 
 
 def _spawn(config, port, peer_host, peer_port, keys_dir, peer_pem, ready, role,
-           result, log):
+           result, log, extra_args=None):
     cmd = [
         sys.executable, str(PAIR_NODE),
         "--config", str(config),
@@ -105,6 +117,8 @@ def _spawn(config, port, peer_host, peer_port, keys_dir, peer_pem, ready, role,
     ]
     if result:
         cmd += ["--result-file", str(result)]
+    if extra_args:
+        cmd += [str(a) for a in extra_args]
     lf = open(log, "w", encoding="utf-8")
     try:
         proc = subprocess.Popen(
@@ -220,6 +234,129 @@ def _run_pair(asker_is_lower: bool, break_cert: bool = False) -> dict:
             shutil.rmtree(d, ignore_errors=True)
 
 
+def _wait_phase(path: Path, want: str, timeout: float) -> bool:
+    """Poll the recovery probe's phase file until its content equals `want`."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            if path.exists() and path.read_text(encoding="utf-8").strip() == want:
+                return True
+        except OSError:
+            pass
+        time.sleep(0.25)
+    return False
+
+
+# S4 timers (must match what pair_node.py sets on the live NM): fast heartbeat +
+# low strikes so a kill is detected in seconds; resync LONG so recovery is
+# proven to come from the real reconnect, not the 300s periodic sweep.
+_S4_TIMER_ARGS = [
+    "--heartbeat-interval", "1.0",
+    "--heartbeat-strikes", "2",
+    "--probe-timeout", "1.0",
+    "--liveness-timeout", "4.0",
+    "--resync-interval", "120.0",
+]
+_S4_PHASE1_TIMEOUT = 35.0   # advert established after concurrent boot
+_S4_PHASE2_TIMEOUT = 25.0   # advert vanishes after the kill (strike-death)
+
+
+def _run_drop_reconnect() -> dict:
+    """S4: boot the pair, let the advert establish, KILL the subscriber, wait
+    for the asker to see the advert vanish (strike-death), then RESPAWN the
+    subscriber on the SAME identity/port (new session_id) and check the advert
+    re-propagates + a cross-node request is answered again. Asker = pair-a
+    (lower), killed/respawned sub = pair-b (higher)."""
+    tmp = Path(tempfile.mkdtemp(prefix="pair_s4_"))
+    a_keys = Path(tempfile.mkdtemp(prefix="pair_s4_a_keys_"))
+    b_keys = Path(tempfile.mkdtemp(prefix="pair_s4_b_keys_"))
+    a_proc = b_proc = b_proc2 = a_lf = b_lf = b_lf2 = None
+    try:
+        _ac, _ak, _afp, a_pem = generate_keypair(str(a_keys), A_HOST)
+        _bc, _bk, _bfp, b_pem = generate_keypair(str(b_keys), B_HOST)
+        a_pem_f = tmp / "a_cert.pem"
+        a_pem_f.write_text(a_pem, encoding="utf-8")
+        b_pem_f = tmp / "b_cert.pem"
+        b_pem_f.write_text(b_pem, encoding="utf-8")
+        a_peer_pem, b_peer_pem = b_pem_f, a_pem_f  # A pins B's cert, B pins A's
+
+        a_port, b_port = _free_port(), _free_port()
+        while b_port == a_port:
+            b_port = _free_port()
+
+        result_f = tmp / "ask_result.json"
+        phase_f = tmp / "phase.txt"
+        a_ready, b_ready, b_ready2 = (
+            tmp / "a_ready.json", tmp / "b_ready.json", tmp / "b_ready2.json")
+        a_log, b_log, b_log2 = tmp / "a.log", tmp / "b.log", tmp / "b2.log"
+
+        # sub (pair-b) — killed + respawned.
+        b_proc, b_lf = _spawn(
+            CONFIG_B, b_port, A_HOST, a_port, b_keys, b_peer_pem, b_ready,
+            "sub", None, b_log, extra_args=_S4_TIMER_ARGS)
+        # asker (pair-a) — recovery probe.
+        a_extra = _S4_TIMER_ARGS + ["--recover", "--phase-file", str(phase_f)]
+        a_proc, a_lf = _spawn(
+            CONFIG_A, a_port, B_HOST, b_port, a_keys, a_peer_pem, a_ready,
+            "ask", result_f, a_log, extra_args=a_extra)
+
+        a_info = _wait_file(a_ready, READY_TIMEOUT)
+        b_info = _wait_file(b_ready, READY_TIMEOUT)
+
+        established = killed = respawn_ready = False
+        b_info2 = None
+        if a_info and b_info:
+            # Phase 1: wait until the asker records the advert established.
+            established = _wait_phase(phase_f, "1", _S4_PHASE1_TIMEOUT)
+            if established:
+                # Kill the subscriber (hard) so the asker strikes it dead.
+                if b_proc.poll() is None:
+                    b_proc.kill()
+                    try:
+                        b_proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        pass
+                killed = True
+                # Phase 2: wait for the asker to see the advert vanish, then
+                # respawn (bounded — respawn even if it never vanishes so the
+                # run completes and reports).
+                _wait_phase(phase_f, "2", _S4_PHASE2_TIMEOUT)
+                b_proc2, b_lf2 = _spawn(
+                    CONFIG_B, b_port, A_HOST, a_port, b_keys, b_peer_pem,
+                    b_ready2, "sub", None, b_log2, extra_args=_S4_TIMER_ARGS)
+                b_info2 = _wait_file(b_ready2, READY_TIMEOUT)
+                respawn_ready = b_info2 is not None
+
+        result = _wait_file(result_f, RESULT_TIMEOUT) if (a_info and b_info) else None
+
+        return {
+            "a_ready": a_info is not None,
+            "b_ready": b_info is not None,
+            "established": established,
+            "killed": killed,
+            "respawn_ready": respawn_ready,
+            "result": result,
+            "a_tail": _tail(a_log),
+            "b_tail": _tail(b_log) + "\n--- b respawn ---\n" + _tail(b_log2),
+        }
+    finally:
+        for proc in (a_proc, b_proc, b_proc2):
+            if proc is not None and proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+        for lf in (a_lf, b_lf, b_lf2):
+            try:
+                if lf:
+                    lf.close()
+            except Exception:
+                pass
+        for d in (tmp, a_keys, b_keys):
+            shutil.rmtree(d, ignore_errors=True)
+
+
 def _assert_booted(run: dict):
     if not (run["a_ready"] and run["b_ready"]):
         pytest.fail(
@@ -314,4 +451,83 @@ def test_broken_cert_control():
     assert result.get("request_ok") is False, (
         "control: request_event should fail when the peer never connected "
         f"(request_ok={result.get('request_ok')})."
+    )
+
+
+@pytest.mark.xfail(
+    strict=False,
+    reason="B-088 (HUNT-092/093 family): a strike-dead peer that RESTARTS is not "
+    "recovered by this node. The asker never re-probes a peer it marked dead "
+    "(discovery skips enabled=False), and the respawned peer's re-connect does "
+    "not re-enable the asker's node, so the advert never re-propagates and the "
+    "cross-node request stays unanswered. Flips to XPASS when recovery is fixed.",
+)
+def test_S4_drop_and_reconnect_recovers():
+    """S4 (B-088 repro / M4 restart-recovery acceptance guard): boot the pair,
+    establish the advert, KILL the subscriber (asker strikes it dead — advert
+    vanishes), then RESPAWN it on the same identity/port (new session_id) and
+    require the advert to RE-propagate + a cross-node request to be answered.
+
+    SETUP GATE = advert_before AND advert_gone: the pair really established and
+    the kill really landed (so a missing recovery is genuinely the recovery
+    path, not a boot/kill artifact). ``resync_interval`` is pinned LONGER than
+    the recovery budget so a pass would prove recovery came from the real
+    reconnect, not the 300s periodic sweep.
+
+    XFAIL (bug present) = recovery fails (advert_after/request_ok False after a
+    clean establish+death). XPASS = recovery works -> B-088 fixed for this
+    direction (asker=lower, killed peer=higher)."""
+    run = _run_drop_reconnect()
+    if not (run["a_ready"] and run["b_ready"]):
+        pytest.fail(
+            "S4 SETUP FAILED: a node did not boot "
+            f"(a_ready={run['a_ready']}, b_ready={run['b_ready']}).\n"
+            f"{run['a_tail']}{run['b_tail']}"
+        )
+    if not run["respawn_ready"]:
+        pytest.fail(
+            "S4 SETUP FAILED: the subscriber did not respawn on the same port "
+            "(same-port re-bind failed — e.g. Windows TIME_WAIT / WinError "
+            f"10048).\n{run['b_tail']}"
+        )
+    result = run["result"]
+    if result is None:
+        pytest.fail(
+            "S4 SETUP FAILED: the asker never wrote a recovery result within "
+            f"budget.\n{run['a_tail']}{run['b_tail']}"
+        )
+
+    # SETUP GATE: the pair established the advert AND the kill dropped it. If
+    # either did not happen, this is a boot/kill artifact, not a recovery result.
+    if not result.get("advert_before"):
+        pytest.fail(
+            "S4 SETUP FAILED: the advert never established before the kill "
+            f"(advert_before=False, node_hosts={result.get('node_hosts')}). "
+            f"Not a recovery result.\n{run['a_tail']}{run['b_tail']}"
+        )
+    if not result.get("advert_gone"):
+        pytest.fail(
+            "S4 SETUP FAILED: the advert did not vanish after the kill "
+            "(advert_gone=False) — the strike-death did not drop the advert, so "
+            "a later reappearance would be a stale positive, not recovery.\n"
+            f"{run['a_tail']}{run['b_tail']}"
+        )
+
+    ctx = (
+        f"peer_reconnected={result.get('peer_reconnected')}, "
+        f"advert_after={result.get('advert_after')}, "
+        f"request_ok={result.get('request_ok')}, "
+        f"node_hosts={result.get('node_hosts')}, error={result.get('error')!r}"
+    )
+    if result.get("advert_after") and result.get("request_ok"):
+        # Recovery worked -> B-088 fixed for this direction. Clean return so the
+        # strict=False xfail flips to XPASS (then convert to a passing guard).
+        return
+
+    pytest.fail(
+        "B-088 CONFIRMED (restart-recovery deadlock): the pair established the "
+        "advert and the kill dropped it, but after the subscriber respawned on "
+        "the same identity the advert did NOT re-propagate and the cross-node "
+        f"request was not answered. {ctx}. The asker never re-probes a peer it "
+        "marked dead and the respawn does not re-enable it. See B-088."
     )
