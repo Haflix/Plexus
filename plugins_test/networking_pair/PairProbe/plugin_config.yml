@@ -4,7 +4,7 @@ description: >-
   role=ask does NOT subscribe (so its request_event can only be answered by the
   REMOTE peer), polls its own network._inbound_adverts for the peer's subs, then
   fires request_event and writes a JSON result file the test asserts on.
-version: 0.1.0
+version: 0.1.1
 arguments:
 events:
   pair_probe:

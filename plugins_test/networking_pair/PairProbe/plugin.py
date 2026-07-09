@@ -7,13 +7,16 @@ the ``PAIR_ROLE`` env var set by pair_node.py:
     node's subscription is advertised to the peer. Idle otherwise.
   * role=ask  — do NOT subscribe (so a local sub can't answer), then poll this
     node's ``network._inbound_adverts`` for the peer's subs and fire
-    request_event("pair_probe"). Write {adverts_seen, request_ok, error,
-    inbound_hosts} to ``PAIR_RESULT_FILE`` for the test to assert on.
+    request_event("pair_probe", hosts="any"). Write {adverts_seen,
+    inbound_advert_topics, request_ok, error, inbound_hosts} to
+    ``PAIR_RESULT_FILE`` for the test to assert on.
 
-B-082 (open): in a same-machine pair booting concurrently as mutual mTLS-pinned
-peers, the advert exchange never fires, so the asker's _inbound_adverts stays
-empty and request_event raises "no subscriber matches". This fixture makes that
-observable; when B-082 is fixed the asker sees the advert and the call succeeds.
+B-082 (FIXED 2026-07-09): in a same-machine pair booting concurrently as mutual
+mTLS-pinned peers, the tiebreak initiator poisoned its _snapshot_sent slot with a
+pre-is_ready advert that silently no-op'd, so the exchange never fired and the
+asker's _inbound_adverts stayed empty. Fixed in plexus/networking.py (0.69.13).
+This fixture is the regression guard: the asker now sees the pair/probe advert
+and the cross-node request_event(hosts="any") is answered.
 """
 
 import asyncio
@@ -94,14 +97,29 @@ class PairProbe(Plugin):
                 break
             await asyncio.sleep(_POLL_INTERVAL_S)
 
-        # Regardless of the polls, try the actual cross-node ask.
+        # Regardless of the polls, try the actual cross-node ask. hosts="any"
+        # is REQUIRED: a request_event that omits hosts defaults to "local"
+        # (docs/notifier.md — publisher default hosts="local"), so it would
+        # only search local subs and never route to the remote peer. The asker
+        # has no local pair/probe sub, so without hosts="any" this always
+        # raises "no subscriber matches" regardless of advert propagation.
         try:
-            await self.request_event("pair_probe", payload={"value": 1})
+            await self.request_event(
+                "pair_probe", payload={"value": 1}, hosts="any")
             request_ok = True
         except Exception as e:  # noqa: BLE001
             error = f"{type(e).__name__}: {e}"
 
-        inbound_hosts = list(getattr(net, "_inbound_adverts", {}).keys()) if net else []
+        inbound = getattr(net, "_inbound_adverts", {}) if net else {}
+        inbound_hosts = list(inbound.keys())
+        # Diagnostic: the actual topic patterns advertised per peer, so the
+        # test can tell "received the pair/probe advert" from "received only
+        # some other (framework-internal) advert". adverts_seen alone is too
+        # coarse to distinguish those.
+        inbound_advert_topics = {
+            host: [getattr(s, "topic_pattern", None) for s in (subs or {}).values()]
+            for host, subs in inbound.items()
+        }
         node_hosts = [
             getattr(n, "hostname", None) for n in (getattr(net, "nodes", ()) or ())
         ]
@@ -115,6 +133,7 @@ class PairProbe(Plugin):
                             "request_ok": request_ok,
                             "error": error,
                             "inbound_hosts": inbound_hosts,
+                            "inbound_advert_topics": inbound_advert_topics,
                             "node_hosts": node_hosts,
                         },
                         f,

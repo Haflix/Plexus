@@ -5,33 +5,37 @@ CONCURRENTLY (each lists the other as a configured peer), mirroring the actual
 deployment topology (tui_smoke_pair.py) rather than TestRemoteSuite's
 parent-up-first ordering that dodges the race. One node subscribes pair/probe;
 the other (the asker) polls its network for the peer's advert and fires
-request_event. The PairProbe fixture writes the result; this test asserts on it.
+request_event(hosts="any"). The PairProbe fixture writes the result; this test
+asserts on it.
 
-B-082 (OPEN): the advert exchange never fires in this topology (a "deadlock of
-politeness" — the tiebreak initiator's update_single succeeds but never arms the
-exchange; the configured peer Node is created hostname=None), so the asker's
-_inbound_adverts stays empty and request_event raises "no subscriber matches".
+B-082 (FIXED 2026-07-09, plexus __version__ 0.69.13): in this concurrent-boot
+topology the tiebreak initiator (lower hostname) ran its initial advert exchange
+BEFORE networking flipped is_ready. advertise_subs_remote silently no-op'd on the
+is_ready guard (no send, no raise), but _perform_initial_exchange had already
+claimed the _snapshot_sent slot and only rolled back on an exception — so the
+slot was poisoned as "sent" with an empty wire. Every later trigger then
+short-circuited on the poisoned slot; the reciprocator deferred forever; only the
+300s periodic resync healed it. Fix: advertise_subs_remote now returns whether it
+actually sent, and _perform_initial_exchange releases the slot when it didn't, so
+the next post-is_ready discovery tick re-initiates and sends. Both tiebreak
+directions are guarded because the bug was initiator/reciprocator asymmetric.
 
-Angles covered (both are B-082, xfail):
+Angles covered (both must PASS):
   * asker = LOWER hostname (pair-a, the tiebreak INITIATOR)
   * asker = HIGHER hostname (pair-b, the RECIPROCATOR)
-B-082 is initiator-vs-reciprocator asymmetric, so both directions are guarded; a
-partial fix that flips only one would leave the other red.
 
-FAITHFULNESS GATE: a true advert deadlock and an unrelated no-connection failure
+FAITHFULNESS GATE: a broken advert path and an unrelated no-connection failure
 (bad cert, wrong port, plugin didn't enable) both leave _inbound_adverts empty.
 So the asker also records ``peer_connected`` — whether it learned the peer via
 the AUTHENTICATED handshake/discovery layer (a Node with the peer hostname),
-which is set in a true B-082 but NOT on a broken handshake. If the peer was never
-connected, the result is a SETUP FAILURE, not a B-082 confirmation. The
-``test_broken_cert_control`` case proves this gate by pinning a wrong cert and
-asserting the harness reports no connection (not "B-082 confirmed").
+which is set on a real advert-path failure but NOT on a broken handshake. If the
+peer was never connected the result is a SETUP FAILURE, not a B-082 regression.
+The ``test_broken_cert_control`` case proves this gate by pinning a wrong cert
+and asserting the harness reports no connection.
 
-PASS/FAIL (per B-082 angle):
-  * XFAIL (strict=False) = bug present: peer connected, but no advert + the ask
-    failed.
-  * XPASS = B-082 fixed: peer connected, advert seen, ask answered. (strict=False
-    so an xpass is silent; when it flips, convert B-082 to fixed and harden.)
+NOTE on hosts="any": a request_event that omits ``hosts`` defaults to "local"
+(docs/notifier.md), so it never routes to a remote peer. The asker must pass
+hosts="any" — this is real cross-node API usage, not a harness workaround.
 
 Real-socket, multi-subprocess (~25-90s). GATED behind PLEXUS_PAIR_TEST so a
 blanket ``pytest plugins_test/`` does NOT boot real nodes (avoids Windows socket
@@ -234,25 +238,20 @@ def _assert_booted(run: dict):
 @pytest.mark.parametrize(
     "asker_is_lower",
     [
-        pytest.param(
-            True, id="asker_lower_initiator",
-            marks=pytest.mark.xfail(
-                strict=False,
-                reason="B-082: cross-node adverts don't propagate in a "
-                "same-machine mutual-peer pair; asker=lower (tiebreak initiator).",
-            ),
-        ),
-        pytest.param(
-            False, id="asker_higher_reciprocator",
-            marks=pytest.mark.xfail(
-                strict=False,
-                reason="B-082 reciprocal direction: asker=higher hostname. The "
-                "bug is initiator/reciprocator asymmetric, so both are guarded.",
-            ),
-        ),
+        pytest.param(True, id="asker_lower_initiator"),
+        pytest.param(False, id="asker_higher_reciprocator"),
     ],
 )
 def test_B082_pair_cross_node_advert_propagation(asker_is_lower):
+    """B-082 REGRESSION GUARD (fixed 2026-07-09). In a same-machine mutual-peer
+    pair booting concurrently, the tiebreak initiator (lower hostname) used to
+    poison its own _snapshot_sent slot with a pre-is_ready advert that silently
+    no-op'd, so adverts never propagated and the reciprocator deferred forever
+    (healed only by the 300s resync). Fixed by making advertise_subs_remote
+    report whether it actually sent and releasing the slot when it didn't
+    (plexus/networking.py, __version__ 0.69.13). Both tiebreak directions are
+    guarded because the bug was initiator/reciprocator asymmetric.
+    """
     run = _run_pair(asker_is_lower=asker_is_lower)
     _assert_booted(run)
     result = run["result"]
@@ -264,24 +263,30 @@ def test_B082_pair_cross_node_advert_propagation(asker_is_lower):
             "PAIR SETUP FAILED: the asker never established an authenticated "
             "connection to the peer (peer_connected=False, "
             f"node_hosts={result.get('node_hosts')}). This is a connection/mTLS "
-            "failure, not the B-082 advert deadlock — do not attribute it to "
+            "failure, not the B-082 advert path — do not attribute it to "
             f"B-082.\n--- asker log tail ---\n{run['a_tail']}{run['b_tail']}"
         )
 
-    if result.get("adverts_seen") and result.get("request_ok"):
-        # Peer connected, advert propagated, cross-node ask answered -> B-082 is
-        # fixed for this direction. Clean return -> strict=False xfail -> XPASS.
-        return
-
-    pytest.fail(
-        "B-082 CONFIRMED (advert deadlock in a same-machine mutual-peer pair): "
-        f"asker_is_lower={asker_is_lower}; the peer WAS connected "
-        f"(peer_connected=True, node_hosts={result.get('node_hosts')}) but "
+    ctx = (
+        f"asker_is_lower={asker_is_lower}, node_hosts={result.get('node_hosts')}, "
         f"adverts_seen={result.get('adverts_seen')}, "
-        f"request_ok={result.get('request_ok')}, "
-        f"inbound_hosts={result.get('inbound_hosts')}, "
-        f"error={result.get('error')!r}. The advert exchange never fired despite "
-        "an established connection — the B-082 deadlock. See B-082."
+        f"inbound_advert_topics={result.get('inbound_advert_topics')}, "
+        f"request_ok={result.get('request_ok')}, error={result.get('error')!r}"
+    )
+    # The peer's pair/probe sub must have propagated over the wire...
+    assert result.get("adverts_seen"), (
+        f"B-082 REGRESSION: peer connected but no advert propagated. {ctx}\n"
+        f"--- asker log tail ---\n{run['a_tail']}{run['b_tail']}"
+    )
+    topics = result.get("inbound_advert_topics") or {}
+    assert any("pair/probe" in v for v in topics.values()), (
+        f"B-082 REGRESSION: an advert propagated but not the pair/probe sub. "
+        f"{ctx}"
+    )
+    # ...and the cross-node request_event must route to it and be answered.
+    assert result.get("request_ok"), (
+        f"B-082 REGRESSION: advert propagated but the cross-node request_event "
+        f"was not answered. {ctx}"
     )
 
 

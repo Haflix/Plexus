@@ -1,6 +1,7 @@
 # Pair-harness node A (asker). Hostname "pair-a" is the LOWER of the pair, so
 # it is the tiebreak initiator of the advert exchange (the exact spot B-082
-# deadlocks). keys_dir / peer / port are injected at runtime by pair_node.py.
+# used to deadlock; fixed in plexus 0.69.13). keys_dir / peer / port are
+# injected at runtime by pair_node.py.
 plugins:
   - name: PairProbe
     enabled: true

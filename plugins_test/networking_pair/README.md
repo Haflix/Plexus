@@ -22,13 +22,16 @@ runner does not run pytest files). Wire them into CI as a separate step.
 
 ## What's here
 
-- `test_pair_advert.py` — the orchestrator. Currently guards **B-082**
-  (cross-node subscription adverts never propagate in this topology), xfail in
-  both directions (asker = lower/initiator and asker = higher/reciprocator,
-  since B-082 is initiator-vs-reciprocator asymmetric). Includes
-  `test_broken_cert_control`, which pins a wrong cert and asserts the harness
-  reports *no connection* — proving its `peer_connected` gate distinguishes a
-  real advert deadlock from an unrelated mTLS/connection failure.
+- `test_pair_advert.py` — the orchestrator. Regression guard for **B-082**
+  (FIXED 2026-07-09, plexus 0.69.13): cross-node subscription adverts used to
+  never propagate in this concurrent-boot topology. Now asserts, in both
+  directions (asker = lower/initiator and asker = higher/reciprocator, since
+  B-082 was initiator-vs-reciprocator asymmetric), that the peer's `pair/probe`
+  advert propagates and a cross-node `request_event(hosts="any")` is answered.
+  Includes `test_broken_cert_control`, which pins a wrong cert and asserts the
+  harness reports *no connection* — proving its `peer_connected` gate
+  distinguishes a real advert-path failure from an unrelated mTLS/connection
+  failure.
 - `pair_node.py` — headless node runner (one half of the pair; role via CLI).
 - `PairProbe/` — the fixture plugin: role=sub subscribes; role=ask polls its
   own network for the peer connection + advert and reports a result file.

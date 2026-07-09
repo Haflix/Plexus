@@ -4561,7 +4561,7 @@ class NetworkManager:
                 except Exception:
                     pass
 
-    async def advertise_subs_remote(self, peer_ip: str, peer_hostname: str) -> None:
+    async def advertise_subs_remote(self, peer_ip: str, peer_hostname: str) -> bool:
         """Send full snapshot to a peer (Tree 2 step 13 — content built
         INSIDE per-peer lock so snapshot vs delta serialise per locked #9).
 
@@ -4576,16 +4576,25 @@ class NetworkManager:
         invoke this between Plexus.start_framework's network bring-up and
         stop()'s shutdown sequence; without the guard a post-stop call
         would touch torn-down structures.
+
+        BUG-082: returns True iff a snapshot actually hit the wire, False if
+        the send was SKIPPED without raising (is_ready guard below, or the
+        list_local_subs failure). A send failure raises. Callers that pair a
+        _snapshot_sent slot-claim with this call (_perform_initial_exchange)
+        rely on the bool to release the slot when nothing was sent — otherwise
+        the slot is poisoned as "sent" with an empty wire, deadlocking the
+        advert exchange until the periodic resync. The other callers
+        (_spawn_periodic_resync, _resend_and_bump_retry) ignore the return.
         """
         if not getattr(self, "is_ready", False):
-            return
+            return False
         try:
             subs = await self.plexus.topic_registry.list_local_subs()
         except Exception:
             self._logger.exception(
                 "[ADVERTISE] list_local_subs failed for peer %s", peer_hostname
             )
-            return
+            return False
 
         lock = self._advert_locks.setdefault(peer_hostname, asyncio.Lock())
         async with lock:
@@ -4672,6 +4681,12 @@ class NetworkManager:
                             await writer.wait_closed()
                         except Exception:
                             pass
+        # BUG-082: reached only on the confirmed-success fall-through — the
+        # send-failure branch raises out of the try above, and the two skip
+        # paths near the top return False. Report the send so
+        # _perform_initial_exchange keeps its _snapshot_sent slot claim only
+        # when a snapshot genuinely went out.
+        return True
 
     async def send_sub_delta_remote(
         self,
@@ -5258,7 +5273,7 @@ class NetworkManager:
             # a spurious second snapshot send on first contact.
             self._snapshot_sent[host] = self._peer_session_ids.get(host)
         try:
-            await self.advertise_subs_remote(peer_ip, host)
+            sent = await self.advertise_subs_remote(peer_ip, host)
         except BaseException:
             async with self._adverts_struct_lock:
                 self._snapshot_sent.pop(host, None)
@@ -5266,6 +5281,15 @@ class NetworkManager:
                 "initial advert exchange to %s failed", host
             )
             raise
+        if not sent:
+            # BUG-082: advertise_subs_remote SKIPPED the send without raising
+            # (is_ready False during pre-ready initial discovery, or a
+            # list_local_subs failure). We claimed the _snapshot_sent slot
+            # above; release it so a later discovery pass / reciprocal trigger
+            # re-initiates and actually sends, instead of short-circuiting on
+            # the poisoned slot until the periodic resync heals it.
+            async with self._adverts_struct_lock:
+                self._snapshot_sent.pop(host, None)
 
     async def _initial_advert_exchange(self, node) -> None:
         """Authoritative check-then-set wrapper for Node-backed peers.
