@@ -1,33 +1,50 @@
-"""B-082 regression guard — cross-node subscription adverts must propagate in a
-same-machine 2-node pair.
+"""B-082 regression guard + connection failure-angle harness.
 
-Two REAL Plexus nodes are booted as a mutual mTLS-pinned pair on loopback,
-CONCURRENTLY (both list the other as a configured peer), mirroring the actual
+Boots two REAL Plexus nodes as a mutual mTLS-pinned pair on loopback,
+CONCURRENTLY (each lists the other as a configured peer), mirroring the actual
 deployment topology (tui_smoke_pair.py) rather than TestRemoteSuite's
-parent-up-first ordering. Node B (pair-b) subscribes pair/probe; node A (pair-a,
-the lower hostname / tiebreak initiator) polls its own network._inbound_adverts
-for the peer's subs and fires request_event("pair_probe"). PairProbe writes the
-result; this test asserts on it.
+parent-up-first ordering that dodges the race. One node subscribes pair/probe;
+the other (the asker) polls its network for the peer's advert and fires
+request_event. The PairProbe fixture writes the result; this test asserts on it.
 
 B-082 (OPEN): the advert exchange never fires in this topology (a "deadlock of
-politeness" — the initiator's update_single succeeds but never arms the
-exchange; the peer Node is created hostname=None), so A's _inbound_adverts stays
-empty forever and request_event raises "no subscriber matches".
+politeness" — the tiebreak initiator's update_single succeeds but never arms the
+exchange; the configured peer Node is created hostname=None), so the asker's
+_inbound_adverts stays empty and request_event raises "no subscriber matches".
 
-PASS/FAIL CONTRACT
-* XFAIL (strict=False) = bug present: A saw no adverts AND request_event failed.
-* XPASS = B-082 fixed: A saw the peer's advert AND request_event succeeded ->
-  the guard flips, and this is B-082's regression test.
+Angles covered (both are B-082, xfail):
+  * asker = LOWER hostname (pair-a, the tiebreak INITIATOR)
+  * asker = HIGHER hostname (pair-b, the RECIPROCATOR)
+B-082 is initiator-vs-reciprocator asymmetric, so both directions are guarded; a
+partial fix that flips only one would leave the other red.
 
-This is a real-socket, two-subprocess integration test (~30-60s). It is kept out
-of the boot-heavy in-process suite (which can starve Windows sockets); run it on
-its own: ``python -m pytest plugins_test/networking_pair/``.
+FAITHFULNESS GATE: a true advert deadlock and an unrelated no-connection failure
+(bad cert, wrong port, plugin didn't enable) both leave _inbound_adverts empty.
+So the asker also records ``peer_connected`` — whether it learned the peer via
+the AUTHENTICATED handshake/discovery layer (a Node with the peer hostname),
+which is set in a true B-082 but NOT on a broken handshake. If the peer was never
+connected, the result is a SETUP FAILURE, not a B-082 confirmation. The
+``test_broken_cert_control`` case proves this gate by pinning a wrong cert and
+asserting the harness reports no connection (not "B-082 confirmed").
+
+PASS/FAIL (per B-082 angle):
+  * XFAIL (strict=False) = bug present: peer connected, but no advert + the ask
+    failed.
+  * XPASS = B-082 fixed: peer connected, advert seen, ask answered. (strict=False
+    so an xpass is silent; when it flips, convert B-082 to fixed and harden.)
+
+Real-socket, multi-subprocess (~25-90s). GATED behind PLEXUS_PAIR_TEST so a
+blanket ``pytest plugins_test/`` does NOT boot real nodes (avoids Windows socket
+starvation). Run it explicitly:
+    PLEXUS_PAIR_TEST=1 python -m pytest plugins_test/networking_pair/
 """
 
 from __future__ import annotations
 
 import json
 import os
+import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -46,12 +63,26 @@ from plexus.serialization import generate_keypair  # noqa: E402
 PAIR_NODE = _HERE / "pair_node.py"
 CONFIG_A = _HERE / "config.pair_a.yml"
 CONFIG_B = _HERE / "config.pair_b.yml"
-
 A_HOST, B_HOST = "pair-a", "pair-b"
-A_PORT, B_PORT = 25100, 25101   # unusual ports, unlikely to clash with 2510
 
-READY_TIMEOUT = 40.0            # per-node boot
-RESULT_TIMEOUT = 45.0          # asker's _ASK_BUDGET (25s) + margin
+READY_TIMEOUT = 40.0   # per-node boot
+RESULT_TIMEOUT = 45.0  # asker's poll budget (~25s) + margin
+
+# Real-socket integration; opt in explicitly so it isn't swept into a blanket
+# `pytest plugins_test/` run (which would boot two real nodes each time).
+pytestmark = pytest.mark.skipif(
+    not os.environ.get("PLEXUS_PAIR_TEST"),
+    reason="real-socket 2-node integration; set PLEXUS_PAIR_TEST=1 to run",
+)
+
+
+def _free_port() -> int:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+    finally:
+        s.close()
 
 
 def _spawn(config, port, peer_host, peer_port, keys_dir, peer_pem, ready, role,
@@ -71,10 +102,15 @@ def _spawn(config, port, peer_host, peer_port, keys_dir, peer_pem, ready, role,
     if result:
         cmd += ["--result-file", str(result)]
     lf = open(log, "w", encoding="utf-8")
-    return subprocess.Popen(
-        cmd, cwd=str(REPO_ROOT), stdin=subprocess.DEVNULL,
-        stdout=lf, stderr=subprocess.STDOUT,
-    ), lf
+    try:
+        proc = subprocess.Popen(
+            cmd, cwd=str(REPO_ROOT), stdin=subprocess.DEVNULL,
+            stdout=lf, stderr=subprocess.STDOUT,
+        )
+    except Exception:
+        lf.close()
+        raise
+    return proc, lf
 
 
 def _wait_file(path: Path, timeout: float) -> dict | None:
@@ -84,97 +120,84 @@ def _wait_file(path: Path, timeout: float) -> dict | None:
             try:
                 return json.loads(path.read_text(encoding="utf-8"))
             except json.JSONDecodeError:
-                pass
+                pass  # partial write; retry
         time.sleep(0.25)
     return None
 
 
-@pytest.mark.xfail(
-    reason=(
-        "B-082: cross-node subscription adverts never propagate in a "
-        "same-machine 2-node pair booted concurrently as mutual mTLS-pinned "
-        "peers. The advert exchange fires only from the outbound discovery "
-        "cascade in update_single (guarded on node.hostname); the tiebreak "
-        "initiator's update_single succeeds but never arms _spawn_initial_"
-        "exchange, and the configured peer Node is created hostname=None, so "
-        "the guard never passes. The asker's network._inbound_adverts stays "
-        "empty and request_event raises 'no subscriber matches'. This test "
-        "boots the REAL topology and asserts the asker saw no advert and the "
-        "cross-node request_event failed. When B-082 is fixed the asker sees "
-        "the peer's advert and the call succeeds -> this xfail flips to xpass."
-    ),
-    strict=False,
-)
-def test_B082_pair_cross_node_advert_propagation():
-    tmp = Path(tempfile.mkdtemp(prefix="pair_b082_"))
+def _tail(path: Path, n: int = 1500) -> str:
+    try:
+        return path.read_text(encoding="utf-8")[-n:]
+    except OSError:
+        return ""
+
+
+def _run_pair(asker_is_lower: bool, break_cert: bool = False) -> dict:
+    """Boot the mutual-peer pair once and return the asker's result + boot state.
+
+    asker_is_lower: True  -> pair-a (lower hostname, tiebreak initiator) asks.
+                    False -> pair-b (higher hostname, reciprocator) asks.
+    break_cert: pin a WRONG cert for the asker's peer so the mTLS handshake
+                fails (control: proves the peer-connection gate distinguishes a
+                no-connection failure from a true B-082 deadlock).
+    """
+    tmp = Path(tempfile.mkdtemp(prefix="pair_"))
     a_keys = Path(tempfile.mkdtemp(prefix="pair_a_keys_"))
     b_keys = Path(tempfile.mkdtemp(prefix="pair_b_keys_"))
-    # Provision each node's mTLS identity; the peer consumes the OTHER's cert.
-    _ac, _ak, _afp, a_pem = generate_keypair(str(a_keys), A_HOST)
-    _bc, _bk, _bfp, b_pem = generate_keypair(str(b_keys), B_HOST)
-    a_pem_f = tmp / "a_cert.pem"
-    a_pem_f.write_text(a_pem, encoding="utf-8")
-    b_pem_f = tmp / "b_cert.pem"
-    b_pem_f.write_text(b_pem, encoding="utf-8")
-
-    a_ready, b_ready = tmp / "a_ready.json", tmp / "b_ready.json"
-    result_f = tmp / "ask_result.json"
-    a_log, b_log = tmp / "a.log", tmp / "b.log"
-
-    a_proc = b_proc = None
-    a_lf = b_lf = None
+    a_proc = b_proc = a_lf = b_lf = None
     try:
-        # Spawn BOTH concurrently (mutual peers): B (sub) then A (ask), back to
-        # back, so they race through boot the way the real deployment does.
-        b_proc, b_lf = _spawn(CONFIG_B, B_PORT, A_HOST, A_PORT, b_keys, a_pem_f,
-                              b_ready, "sub", None, b_log)
-        a_proc, a_lf = _spawn(CONFIG_A, A_PORT, B_HOST, B_PORT, a_keys, b_pem_f,
-                              a_ready, "ask", result_f, a_log)
+        _ac, _ak, _afp, a_pem = generate_keypair(str(a_keys), A_HOST)
+        _bc, _bk, _bfp, b_pem = generate_keypair(str(b_keys), B_HOST)
+        a_pem_f = tmp / "a_cert.pem"
+        a_pem_f.write_text(a_pem, encoding="utf-8")
+        b_pem_f = tmp / "b_cert.pem"
+        b_pem_f.write_text(b_pem, encoding="utf-8")
+
+        a_port, b_port = _free_port(), _free_port()
+        while b_port == a_port:
+            b_port = _free_port()
+
+        # Roles: the asker gets role=ask + a result-file; the peer subscribes.
+        a_role = "ask" if asker_is_lower else "sub"
+        b_role = "sub" if asker_is_lower else "ask"
+        result_f = tmp / "ask_result.json"
+
+        # Each node pins the OTHER's cert. For the control, corrupt the cert the
+        # ASKER pins so its handshake to the peer fails.
+        a_peer_pem, b_peer_pem = b_pem_f, a_pem_f  # A pins B's cert, B pins A's
+        if break_cert:
+            _wc, _wk, _wfp, wrong_pem = generate_keypair(
+                str(tmp / "wrong_keys"), "wrong-host"
+            )
+            wrong_f = tmp / "wrong_cert.pem"
+            wrong_f.write_text(wrong_pem, encoding="utf-8")
+            if asker_is_lower:
+                a_peer_pem = wrong_f  # A (asker) pins a wrong cert for B
+            else:
+                b_peer_pem = wrong_f  # B (asker) pins a wrong cert for A
+
+        a_ready, b_ready = tmp / "a_ready.json", tmp / "b_ready.json"
+        a_log, b_log = tmp / "a.log", tmp / "b.log"
+
+        # Spawn BOTH concurrently (back-to-back) so they race through boot.
+        b_proc, b_lf = _spawn(
+            CONFIG_B, b_port, A_HOST, a_port, b_keys, b_peer_pem, b_ready,
+            b_role, result_f if b_role == "ask" else None, b_log)
+        a_proc, a_lf = _spawn(
+            CONFIG_A, a_port, B_HOST, b_port, a_keys, a_peer_pem, a_ready,
+            a_role, result_f if a_role == "ask" else None, a_log)
 
         a_info = _wait_file(a_ready, READY_TIMEOUT)
         b_info = _wait_file(b_ready, READY_TIMEOUT)
+        result = _wait_file(result_f, RESULT_TIMEOUT) if (a_info and b_info) else None
 
-        # SETUP CHECK: both nodes must have booted, else this isn't the bug shape.
-        if a_info is None or b_info is None:
-            a_tail = a_log.read_text(encoding="utf-8")[-1500:] if a_log.exists() else ""
-            b_tail = b_log.read_text(encoding="utf-8")[-1500:] if b_log.exists() else ""
-            pytest.fail(
-                "B-082 SETUP FAILED: a node did not become ready "
-                f"(A={a_info is not None}, B={b_info is not None}). The pair "
-                "never came up, so the advert result is meaningless.\n"
-                f"--- A log tail ---\n{a_tail}\n--- B log tail ---\n{b_tail}"
-            )
-
-        result = _wait_file(result_f, RESULT_TIMEOUT)
-        # SETUP CHECK: the asker's probe task must have run and reported.
-        if result is None:
-            a_tail = a_log.read_text(encoding="utf-8")[-1500:] if a_log.exists() else ""
-            pytest.fail(
-                "B-082 SETUP FAILED: the asker never wrote a result file within "
-                f"{RESULT_TIMEOUT}s (PairProbe role=ask task did not report). "
-                f"--- A log tail ---\n{a_tail}"
-            )
-
-        adverts_seen = bool(result.get("adverts_seen"))
-        request_ok = bool(result.get("request_ok"))
-
-        if adverts_seen and request_ok:
-            # Adverts propagated AND the cross-node ask was answered by the peer
-            # -> B-082 is fixed. Return cleanly so the strict=False xfail -> XPASS.
-            return
-
-        # CONFIRMED B-082: no advert reached the asker and/or the remote ask
-        # failed in the concurrent mutual-peer topology.
-        pytest.fail(
-            "B-082 CONFIRMED (cross-node adverts do not propagate in a "
-            "same-machine mutual-peer pair): after both nodes booted, the "
-            f"asker (pair-a) reported adverts_seen={adverts_seen}, "
-            f"request_ok={request_ok}, inbound_hosts={result.get('inbound_hosts')}, "
-            f"error={result.get('error')!r}. The advert exchange never fired in "
-            "the concurrent-boot mutual-mTLS-peer topology, so request_event "
-            "found no remote subscriber. See B-082 for the root cause "
-            "(update_single arms no exchange; peer Node created hostname=None)."
-        )
+        return {
+            "a_ready": a_info is not None,
+            "b_ready": b_info is not None,
+            "result": result,
+            "a_tail": _tail(a_log),
+            "b_tail": _tail(b_log),
+        }
     finally:
         for proc in (a_proc, b_proc):
             if proc is not None and proc.poll() is None:
@@ -189,3 +212,101 @@ def test_B082_pair_cross_node_advert_propagation():
                     lf.close()
             except Exception:
                 pass
+        for d in (tmp, a_keys, b_keys):
+            shutil.rmtree(d, ignore_errors=True)
+
+
+def _assert_booted(run: dict):
+    if not (run["a_ready"] and run["b_ready"]):
+        pytest.fail(
+            "PAIR SETUP FAILED: a node did not become ready "
+            f"(A={run['a_ready']}, B={run['b_ready']}). The pair never came up.\n"
+            f"--- A log tail ---\n{run['a_tail']}\n--- B log tail ---\n{run['b_tail']}"
+        )
+    if run["result"] is None:
+        pytest.fail(
+            "PAIR SETUP FAILED: the asker never wrote a result within "
+            f"{RESULT_TIMEOUT}s (PairProbe role=ask task did not report).\n"
+            f"--- asker log tail ---\n{run['a_tail']}{run['b_tail']}"
+        )
+
+
+@pytest.mark.parametrize(
+    "asker_is_lower",
+    [
+        pytest.param(
+            True, id="asker_lower_initiator",
+            marks=pytest.mark.xfail(
+                strict=False,
+                reason="B-082: cross-node adverts don't propagate in a "
+                "same-machine mutual-peer pair; asker=lower (tiebreak initiator).",
+            ),
+        ),
+        pytest.param(
+            False, id="asker_higher_reciprocator",
+            marks=pytest.mark.xfail(
+                strict=False,
+                reason="B-082 reciprocal direction: asker=higher hostname. The "
+                "bug is initiator/reciprocator asymmetric, so both are guarded.",
+            ),
+        ),
+    ],
+)
+def test_B082_pair_cross_node_advert_propagation(asker_is_lower):
+    run = _run_pair(asker_is_lower=asker_is_lower)
+    _assert_booted(run)
+    result = run["result"]
+
+    # FAITHFULNESS GATE: an authenticated peer connection must have been
+    # established, else "no adverts" is a connection/setup failure, NOT B-082.
+    if not result.get("peer_connected"):
+        pytest.fail(
+            "PAIR SETUP FAILED: the asker never established an authenticated "
+            "connection to the peer (peer_connected=False, "
+            f"node_hosts={result.get('node_hosts')}). This is a connection/mTLS "
+            "failure, not the B-082 advert deadlock — do not attribute it to "
+            f"B-082.\n--- asker log tail ---\n{run['a_tail']}{run['b_tail']}"
+        )
+
+    if result.get("adverts_seen") and result.get("request_ok"):
+        # Peer connected, advert propagated, cross-node ask answered -> B-082 is
+        # fixed for this direction. Clean return -> strict=False xfail -> XPASS.
+        return
+
+    pytest.fail(
+        "B-082 CONFIRMED (advert deadlock in a same-machine mutual-peer pair): "
+        f"asker_is_lower={asker_is_lower}; the peer WAS connected "
+        f"(peer_connected=True, node_hosts={result.get('node_hosts')}) but "
+        f"adverts_seen={result.get('adverts_seen')}, "
+        f"request_ok={result.get('request_ok')}, "
+        f"inbound_hosts={result.get('inbound_hosts')}, "
+        f"error={result.get('error')!r}. The advert exchange never fired despite "
+        "an established connection — the B-082 deadlock. See B-082."
+    )
+
+
+def test_broken_cert_control():
+    """Control: with a WRONG peer cert the mTLS handshake fails, so the asker
+    never connects. Proves the peer_connected gate distinguishes a no-connection
+    failure from a true B-082 deadlock — the main test would (correctly) SETUP
+    FAIL on this, not report 'B-082 confirmed'. This is a normal passing test."""
+    run = _run_pair(asker_is_lower=True, break_cert=True)
+    # Both nodes still BOOT (peers are configured; the handshake fails later).
+    if not (run["a_ready"] and run["b_ready"] and run["result"] is not None):
+        pytest.fail(
+            "control SETUP FAILED: nodes/result did not come up "
+            f"(a_ready={run['a_ready']}, b_ready={run['b_ready']}, "
+            f"result={run['result'] is not None}).\n{run['a_tail']}{run['b_tail']}"
+        )
+    result = run["result"]
+    assert result.get("peer_connected") is False, (
+        "control: expected NO authenticated connection with a wrong pinned cert, "
+        f"but peer_connected={result.get('peer_connected')} "
+        f"(node_hosts={result.get('node_hosts')}). If this is True the mTLS pin "
+        "isn't actually being enforced, and the main test's peer_connected gate "
+        "cannot distinguish a broken connection from a B-082 deadlock."
+    )
+    assert result.get("request_ok") is False, (
+        "control: request_event should fail when the peer never connected "
+        f"(request_ok={result.get('request_ok')})."
+    )

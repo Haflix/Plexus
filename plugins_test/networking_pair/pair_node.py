@@ -38,6 +38,10 @@ async def main() -> None:
     os.environ["PAIR_ROLE"] = args.role
     if args.result_file:
         os.environ["PAIR_RESULT_FILE"] = args.result_file
+    if args.peer_hostname:
+        # Lets role=ask assert an authenticated peer connection was established
+        # (a Node with this hostname) before concluding a B-082 advert deadlock.
+        os.environ["PAIR_PEER_HOSTNAME"] = args.peer_hostname
 
     pc = Plexus(args.config)
 

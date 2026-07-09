@@ -55,24 +55,46 @@ class PairProbe(Plugin):
             # the remote peer. Run the probe in the background.
             self._ask_task = asyncio.create_task(self._run_ask())
 
+    def _peer_connected(self, net) -> bool:
+        """True once this node has learned the peer via an AUTHENTICATED
+        exchange (a Node with the peer's hostname). This is set by the
+        handshake/discovery layer (_handle_info), NOT the advert layer, so it
+        stays True in a genuine B-082 (adverts starved but the peer IS known)
+        and False on a broken handshake / no connection. Lets the test tell a
+        true advert deadlock apart from an unrelated connection failure (FA1)."""
+        peer = os.environ.get("PAIR_PEER_HOSTNAME", "")
+        if not peer or net is None:
+            return False
+        for n in getattr(net, "nodes", ()) or ():
+            if getattr(n, "hostname", None) == peer:
+                return True
+        return False
+
     async def _run_ask(self):
         result_file = os.environ.get("PAIR_RESULT_FILE", "")
         loop = asyncio.get_running_loop()
         net = getattr(self._plexus, "network", None)
         adverts_seen = False
+        peer_connected = False
         request_ok = False
         error = ""
 
-        # Poll our inbound advert state for ANY peer's subs to appear.
+        # Poll for BOTH the peer connection (authenticated, handshake layer) and
+        # the peer's advert (advert layer). In a healthy pair both appear; in a
+        # true B-082 the connection appears but the advert never does; in a
+        # no-connection failure neither appears (-> test treats as SETUP FAIL).
         deadline = loop.time() + _ASK_BUDGET_S
         while loop.time() < deadline:
+            if not peer_connected and self._peer_connected(net):
+                peer_connected = True
             inbound = getattr(net, "_inbound_adverts", {}) if net else {}
             if any(bool(v) for v in inbound.values()):
                 adverts_seen = True
+            if peer_connected and adverts_seen:
                 break
             await asyncio.sleep(_POLL_INTERVAL_S)
 
-        # Regardless of the advert poll, try the actual cross-node ask.
+        # Regardless of the polls, try the actual cross-node ask.
         try:
             await self.request_event("pair_probe", payload={"value": 1})
             request_ok = True
@@ -80,15 +102,20 @@ class PairProbe(Plugin):
             error = f"{type(e).__name__}: {e}"
 
         inbound_hosts = list(getattr(net, "_inbound_adverts", {}).keys()) if net else []
+        node_hosts = [
+            getattr(n, "hostname", None) for n in (getattr(net, "nodes", ()) or ())
+        ]
         if result_file:
             try:
                 with open(result_file, "w", encoding="utf-8") as f:
                     json.dump(
                         {
+                            "peer_connected": peer_connected,
                             "adverts_seen": adverts_seen,
                             "request_ok": request_ok,
                             "error": error,
                             "inbound_hosts": inbound_hosts,
+                            "node_hosts": node_hosts,
                         },
                         f,
                     )
