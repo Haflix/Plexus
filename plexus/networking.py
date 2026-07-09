@@ -528,18 +528,11 @@ class NetworkManager:
 
     @property
     def pool_size(self) -> int:
-        """Connection-pool size, always a positive int (HUNT-070/145).
-
-        pool_size feeds ``asyncio.Queue(maxsize=...)`` (where <=0 means an
-        UNBOUNDED queue -> fd/connection leak) and the ``attempts <
-        self.pool_size`` stale-drain loop bound (where a non-int raises on the
-        comparison). The setter is the last-line type invariant: EVERY write
-        (ctor, the config hot-reload's ``nm.pool_size = ...``, or a direct set)
-        is coerced to ``max(1, int(value))``, so no reader ever sees a 0 /
-        negative / non-int value regardless of how it arrived. The config
-        boundary in core.py additionally applies the default-5 semantics via
-        _safe_int, mirroring the _safe_float timing knobs; this guards the
-        attribute itself.
+        """Connection-pool size, clamped to a positive int on every write
+        (HUNT-070/145): ``0`` would make ``Queue(maxsize=...)`` unbounded and a
+        non-int breaks the ``attempts < self.pool_size`` drain bound. The setter
+        is the last-line invariant; core.py additionally coerces at the config
+        boundary via ``_safe_int``.
         """
         return getattr(self, "_pool_size", 5)
 
@@ -1504,17 +1497,11 @@ class NetworkManager:
             reader: asyncio.StreamReader, writer: asyncio.StreamWriter
         ):
             """Handle incoming client connection."""
-            # HUNT-113: register this per-client handler Task so stop() can
-            # cancel+await it. asyncio.start_server runs this callback as its
-            # own Task, so current_task() is that handler Task. Discarded in the
-            # finally on completion so self._handler_tasks stays bounded.
-            # Registration is best-effort: start_server owns Task creation so
-            # there is no synchronous spawn hook, and a connection accepted at
-            # the exact instant of stop() could self-register just after stop()
-            # snapshots the set. stop() does several awaits between
-            # server.close() and the snapshot, so in practice the pending
-            # handler runs this line first; Python 3.11 offers no
-            # Server.close_clients()/abort_clients() to close that window.
+            # HUNT-113: register this handler Task so stop() can cancel+await it
+            # (discarded in the finally to stay bounded). Best-effort: no
+            # synchronous spawn hook exists, so a connection accepted right at
+            # stop() could register just after stop() snapshots the set; benign
+            # given the awaits stop() does before the snapshot.
             handler_task = asyncio.current_task()
             if handler_task is not None:
                 self._handler_tasks.add(handler_task)
@@ -1780,17 +1767,12 @@ class NetworkManager:
                     exc_info=True,
                 )
 
-        # HUNT-113: cancel + await the per-client handler Tasks that
-        # asyncio.start_server spawned. The listener is already closed above,
-        # so no NEW handler can be accepted and this snapshot is complete.
-        # Inbound handlers never pool a writer or hold a HUNT-109 permit, and
-        # stop() holds NO lock here (the _adverts_struct_lock was released
-        # right after the host snapshot above), so awaiting a cancelled
-        # handler's finally (writer close + advert-state drop) cannot deadlock.
-        # Done BEFORE the pool / _checked_out_writers drains (which cover
-        # OUTBOUND connections only) so each cancelled handler's finally runs
-        # against a still-intact NM. getattr-defensive for scaffold NMs;
-        # return_exceptions=True so nothing raises out of stop().
+        # HUNT-113: cancel + await the start_server-spawned handler Tasks. Runs
+        # after the listener close (snapshot is complete) but before the OUTBOUND
+        # pool drains, so each cancelled handler's finally runs against an intact
+        # NM. No lock held here (_adverts_struct_lock released above), so a
+        # cancelled handler's finally can't deadlock. return_exceptions=True so
+        # nothing raises out of stop(); getattr-defensive for scaffold NMs.
         handler_tasks = list(getattr(self, "_handler_tasks", ()) or ())
         if handler_tasks:
             self._logger.info(
@@ -5795,11 +5777,8 @@ class NetworkManager:
                 f"[CONNECTION] TLS connection established to {IP}:{port}"
             )
         except asyncio.TimeoutError as e:
-            # HUNT-108: bound the connect + handshake. R4: on timeout the inner
-            # open_connection coroutine is cancelled; if the connect race
-            # already produced a transport it is NOT reachable here (the
-            # reader/writer assignment above never completed), so we rely on
-            # the cancelled coroutine to close its own transport.
+            # HUNT-108: connect+handshake timed out. The cancelled
+            # open_connection closes its own transport (no writer bound here).
             self._logger.warning(
                 f"[CONNECTION] Timed out connecting to {IP}:{port} after "
                 f"{getattr(self, 'connect_timeout', DEFAULT_CONNECT_TIMEOUT)}s"
@@ -5970,32 +5949,21 @@ class NetworkManager:
     async def _get_connection(
         self, IP: str
     ) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
-        """Acquire a checked-out connection, bounded by a GLOBAL concurrency
-        cap (HUNT-109).
-
-        Holds one permit of a process-wide ``asyncio.Semaphore`` for the
-        LIFETIME of the checkout: the permit is acquired here and released only
-        when the writer leaves the checked-out set (``_release_conn_permit``,
-        marker-gated so it fires exactly once, on return/close/drain). The
-        blocking acquire applies backpressure so a wide/slow publish fan-out
-        cannot open unbounded outbound TLS sockets/fds.
-
-        The pool / health-check / fresh-connect logic lives in
-        ``_get_connection_inner``; this wrapper only owns the semaphore
-        lifecycle. getattr-defensive so test scaffolds built via
-        ``object.__new__`` work.
+        """Acquire a checked-out connection under a GLOBAL concurrency cap
+        (HUNT-109). Holds one permit of a process-wide semaphore for the
+        LIFETIME of the checkout (released via ``_release_conn_permit`` when the
+        writer leaves the checked-out set), applying backpressure so a wide/slow
+        fan-out can't open unbounded sockets/fds. Pool logic lives in
+        ``_get_connection_inner``; this wrapper only owns the semaphore.
         """
-        # Abort before taking a permit if we're already shutting down: a
-        # blocked acquirer released by stop()'s drain re-enters here and bails
-        # rather than handing out a socket during teardown.
+        # Refuse new connections during shutdown (a blocked acquirer woken by
+        # stop()'s drain re-enters and bails).
         if getattr(self, "_stopping", False):
             raise NetworkRequestException(
                 "connection acquired during shutdown"
             )
 
-        # Lazily mint the process-wide semaphore on first use (the ctor stores
-        # only the cap + a None holder, so a hot-reloaded / test-scaffolded NM
-        # still gets a valid semaphore here).
+        # Lazily mint the semaphore (getattr-defensive for object.__new__ scaffolds).
         sem = getattr(self, "_conn_semaphore", None)
         if sem is None:
             cap = int(getattr(self, "_max_outbound_connections", 20) or 20)
@@ -6003,14 +5971,12 @@ class NetworkManager:
             self._conn_semaphore = sem
 
         await sem.acquire()
-        # The try MUST begin AFTER acquire() returns: a cancellation raised
-        # while awaiting acquire() leaves us holding no permit, so it must not
-        # reach the finally's release (over-release guard).
+        # try opens only AFTER acquire() returns: a cancel while awaiting
+        # acquire() holds no permit, so the finally must not release it.
         transferred = False
         try:
             reader, writer = await self._get_connection_inner(IP)
-            # Stamp the permit marker so _release_conn_permit releases exactly
-            # once when the checkout ends (return / close / stop-drain).
+            # Stamp the marker so the permit is released once when checkout ends.
             writer._aio_pool_has_permit = True
             transferred = True
             return reader, writer
