@@ -18,6 +18,9 @@ class TestRemoteTarget(Plugin):
     @log_errors
     def on_load(self, *args, **kwargs):
         self._sub_ids: list[str] = []
+        # TG-12 (B-029): callee-cancellation observability flags for the slow
+        # TP-16: ordered record of per-peer publish_event payloads.
+        self._order_log: list = []
 
     @async_log_errors
     async def on_enable(self):
@@ -49,6 +52,14 @@ class TestRemoteTarget(Plugin):
             # subscriptions: entry was hosts="local"-style and not reached over
             # the wire.)
             ("test/r/huge_stream", "r_topic_huge_stream"),
+            # ── Wave-1 cross-node gap coverage ─────────────────────────
+            ("test/r/order", "r_order_handler"),                    # TP-16
+            ("test/r/req_stream_empty",
+             "r_request_stream_empty_handler"),                     # TP-12
+            ("test/r/req_stream_one",
+             "r_request_stream_one_handler"),                       # TP-12 control
+            ("test/r/req_stream_hang",
+             "r_request_stream_hang_handler"),                      # TG-11
         ):
             sid = await self._plexus.subscribe_event(
                 topic,
@@ -225,3 +236,52 @@ class TestRemoteTarget(Plugin):
         yield {"chunk": 0}
         yield {"chunk": 1}
         raise RequestException("reqexc-midstream-marker")
+
+    # ── Wave-1 cross-node gap coverage: endpoints + topic handlers ──────
+
+    @async_log_errors
+    async def r_huge_result(self) -> dict:
+        """TP-13: a >100MB UNARY execute result (101MB). The unary return path
+        sends the pickled result via _send_stream_chunk (split across
+        MSG_STREAM_CHUNK frames), so the bytes must arrive byte-exact despite
+        exceeding MAX_MESSAGE_SIZE (parity with execute_stream)."""
+        return {"data": b"\xab" * (101 * 1024 * 1024)}
+
+    @async_log_errors
+    async def r_order_handler(self, event=None):
+        """TP-16: append each event payload to an ordered log so the parent can
+        verify per-peer publish ORDER was preserved (no reorder)."""
+        self._order_log.append(event.payload if event is not None else None)
+
+    @async_log_errors
+    async def r_read_order(self) -> list:
+        """TP-16 readback: the recorded per-peer publish order."""
+        return list(self._order_log)
+
+    @async_log_errors
+    async def r_reset_order(self) -> bool:
+        """TP-16: clear the order log before a fresh publish sequence."""
+        self._order_log = []
+        return True
+
+    @async_gen_log_errors
+    async def r_request_stream_empty_handler(self, event=None):
+        """TP-12: async generator that yields ZERO items. The consumer must
+        see a clean close with no items (matched subscriber, empty stream)."""
+        if False:  # pragma: no cover - forces async-generator type; yields nothing
+            yield
+
+    @async_gen_log_errors
+    async def r_request_stream_one_handler(self, event=None):
+        """TP-12 control: a 1-item stream, so the empty-vs-one distinction is
+        observable."""
+        yield {"chunk": 0}
+
+    @async_gen_log_errors
+    async def r_request_stream_hang_handler(self, event=None):
+        """TG-11 (B-045): yield ONE chunk then hang forever, so the caller's
+        stream idle/chunk-deadline TIMEOUT fires waiting for the 2nd chunk.
+        The surfaced error must be a RequestException, not a raw
+        asyncio.TimeoutError."""
+        yield {"chunk": 0}
+        await asyncio.Event().wait()

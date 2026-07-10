@@ -458,6 +458,194 @@ class TestRemoteSuite(Plugin):
                     f"got {len(chunks)}"
                 )
 
+        # ── Wave-1 cross-node gap coverage ────────────────────────────
+
+        async def body_request_event_handler_raises_type(c):
+            """TP-17 strengthen: the RequestException surfaced from a remote
+            handler raise must preserve the original exception TYPE NAME
+            (ValueError), not just the message — mirrors the mid_stream_raise
+            type assertion on the stream path."""
+            from plexus.exceptions import RequestException
+            raised: Optional[BaseException] = None
+            try:
+                await self.request_event(
+                    "r_request_raise", payload={},
+                    hosts="remote", timeout=5.0,
+                )
+            except RequestException as e:
+                raised = e
+            if raised is None:
+                c.set_marker("no_exception")
+                raise AssertionError(
+                    "request_event did not raise for a raising handler"
+                )
+            if "requested-error-marker" not in str(raised):
+                c.set_marker("error_message_lost")
+                raise AssertionError(
+                    f"original message lost: {raised!r}"
+                )
+            if "ValueError" not in str(raised):
+                c.set_marker("error_type_lost")
+                raise AssertionError(
+                    f"surfaced exception dropped the type name: {raised!r}"
+                )
+
+        async def body_hosts_explicit_list(c):
+            """TP-57: hosts=[<subnode-hostname>] targeting reaches the peer and
+            returns its value; a non-listed host does NOT (raises / no-match).
+            peer_host is the resolved subnode hostname."""
+            from plexus.exceptions import RequestException
+            r = await self.execute(
+                "TestRemoteTarget", "r_open", {"value": "x"},
+                hosts=[peer_host],
+            )
+            c.expect(r, "x")
+            # Control: a host nobody answers for must NOT reach the endpoint.
+            raised: Optional[BaseException] = None
+            try:
+                await self.execute(
+                    "TestRemoteTarget", "r_open", {"value": "x"},
+                    hosts=["no-such-host"], timeout=10.0,
+                )
+            except RequestException as e:
+                raised = e
+            if raised is None:
+                c.set_marker("control_reached")
+                raise AssertionError(
+                    "hosts=['no-such-host'] unexpectedly resolved to a live "
+                    "endpoint"
+                )
+
+        async def body_execute_uuid_targeted(c):
+            """TP-52a: discover the subnode TestRemoteTarget instance's
+            plugin_uuid (via find_endpoints_by_tag), then execute targeting
+            that uuid reaches the right instance and returns its value."""
+            res = await self._plexus.find_endpoints_by_tag("r_probe")
+            entry = next(
+                (e for e in res if e.get("access_name") == "r_open"), None
+            )
+            if entry is None:
+                raise AssertionError(f"r_open not discovered: {res}")
+            remote_instances = [
+                i for i in entry["instances"] if i["host"] != "local"
+            ]
+            if not remote_instances:
+                raise AssertionError(
+                    f"no remote instance: {entry['instances']}"
+                )
+            target_uuid = remote_instances[0]["plugin_uuid"]
+            r = await self.execute(
+                "TestRemoteTarget", "r_open", {"value": "uuidtarget"},
+                plugin_uuid=target_uuid, hosts=c.hosts,
+            )
+            c.expect(r, "uuidtarget")
+
+        async def body_execute_huge_unary_result(c):
+            """TP-13: a >100MB UNARY execute result round-trips byte-exact. The
+            unary result path splits the pickled value across MSG_STREAM_CHUNK
+            frames (parity with execute_stream), so 101MB arrives intact."""
+            r = await self.execute(
+                "TestRemoteTarget", "r_huge_result", {},
+                hosts=c.hosts, timeout=30.0,
+            )
+            expected_size = 101 * 1024 * 1024
+            if not isinstance(r, dict) or "data" not in r:
+                raise AssertionError(
+                    f"expected dict with 'data', got {type(r).__name__}"
+                )
+            if len(r["data"]) != expected_size:
+                raise AssertionError(
+                    f"huge unary result corrupted: got {len(r['data'])} "
+                    f"bytes, expected {expected_size}"
+                )
+            # Byte-exact spot check without allocating a second 101MB buffer.
+            if r["data"][:1] != b"\xab" or r["data"][-1:] != b"\xab":
+                raise AssertionError(
+                    "huge unary result bytes not byte-exact (fill byte wrong)"
+                )
+
+        async def body_publish_event_per_peer_order(c):
+            """TP-16 (B-019): per-peer publish ORDER preserved. Publish N events
+            in order to the peer, then read the recorded order back — must
+            match with no reorder."""
+            await self.execute(
+                "TestRemoteTarget", "r_reset_order", {}, hosts=c.hosts,
+            )
+            n = 10
+            for k in range(n):
+                await self.publish_event(
+                    "r_order", payload={"i": k}, hosts="remote",
+                )
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + 5.0
+            recorded: List[Any] = []
+            while loop.time() < deadline:
+                recorded = await self.execute(
+                    "TestRemoteTarget", "r_read_order", {}, hosts=c.hosts,
+                )
+                if len(recorded) >= n:
+                    break
+                await asyncio.sleep(0.05)
+            c.expect(len(recorded), n)
+            order = [p.get("i") for p in recorded]
+            c.expect(order, list(range(n)))
+
+        async def body_request_event_stream_empty(c):
+            """TP-12: an empty successful stream → clean close, ZERO items.
+            Control: a 1-item stream yields exactly 1."""
+            chunks: List[Any] = []
+            async for chunk in self.request_event_stream(
+                "r_req_stream_empty", payload={},
+                hosts="remote", timeout=10.0,
+            ):
+                chunks.append(chunk)
+            c.expect(len(chunks), 0)
+            control: List[Any] = []
+            async for chunk in self.request_event_stream(
+                "r_req_stream_one", payload={},
+                hosts="remote", timeout=10.0,
+            ):
+                control.append(chunk)
+            c.expect(len(control), 1)
+
+        async def body_request_event_stream_timeout_type(c):
+            """TG-11 (B-045): a remote stream that hangs after the first chunk
+            must surface the idle/chunk-deadline TIMEOUT as RequestException /
+            NetworkRequestException, NOT a raw asyncio.TimeoutError."""
+            from plexus.exceptions import RequestException
+            chunks: List[Any] = []
+            raised: Optional[BaseException] = None
+            try:
+                async for chunk in self.request_event_stream(
+                    "r_req_stream_hang", payload={},
+                    hosts="remote", timeout=2.0,
+                ):
+                    chunks.append(chunk)
+            except BaseException as e:
+                raised = e
+            if raised is None:
+                c.set_marker("no_exception")
+                raise AssertionError(
+                    f"hung stream did not raise; got {len(chunks)} chunk(s)"
+                )
+            if isinstance(raised, asyncio.TimeoutError):
+                c.set_marker("raw_timeout_error")
+                raise AssertionError(
+                    f"stream timeout surfaced as raw asyncio.TimeoutError, "
+                    f"not RequestException: {raised!r}"
+                )
+            if not isinstance(raised, RequestException):
+                c.set_marker("wrong_exc_type")
+                raise AssertionError(
+                    f"stream timeout surfaced as {type(raised).__name__}, "
+                    f"expected RequestException: {raised!r}"
+                )
+            if len(chunks) != 1:
+                c.set_marker("chunk_count_wrong")
+                raise AssertionError(
+                    f"expected 1 chunk before the hang, got {len(chunks)}"
+                )
+
         # ── B-071: per-peer wire counter coverage ─────────────────────
         # Sanity checks that peer_stats actually tracks bytes/messages
         # for both unary execute_remote and streaming paths, and that
@@ -576,14 +764,22 @@ class TestRemoteSuite(Plugin):
         # bug.B-018b.uuid_spoof_denied_local_endpoint in TestBugSuite.
 
         async def body_b019_count_per_node(c):
-            # On the parent's side we have one local sub for test/r/multi (set up
-            # by code below); on the peer we'd register 3 more. Then publish_event
-            # hosts=any returns count == 1 + 1 (one per remote node) instead of
-            # 1 + 3 (one per actual sub).
+            # TP-04 (B-019): publish_event's scheduled-count must be per matching
+            # SUBSCRIPTION, not per node. RELOCATED to the socket pair harness
+            # (wave-2 group). This case needs the parent to KNOW the subnode's
+            # test/r/multi subs to fan out to them (an advert/directory dependency),
+            # but the in-process-subnode topology here routes remote traffic via
+            # on-demand endpoint probes / node-broadcast, so _inbound_adverts is
+            # empty at this point — worse, a sibling case (body_wire_counter_reset,
+            # B-071) calls nm._drop_peer_advert_state(peer) mid-suite and the
+            # advert does not re-propagate within the window. Per-sub fan-out count
+            # over the wire is exactly the advert/directory-propagation class the
+            # networking_pair socket harness owns (cf. B-082); build it there.
             c.skip(
-                "B-019 case requires registering N peer-side subs at runtime; "
-                "fixture wiring TBD — use the existing remote.publish_event.basic "
-                "matrix-expansion to validate basic count==1 path"
+                "TP-04/B-019 per-sub fan-out count is advert/directory-propagation "
+                "dependent; the in-process-subnode topology's _inbound_adverts is "
+                "empty here (sibling _drop_peer_advert_state, probe-based routing) — "
+                "relocated to the networking_pair socket harness (wave-2)."
             )
 
         async def body_b021_first_sub_not_remote_eligible(c):
@@ -637,17 +833,42 @@ class TestRemoteSuite(Plugin):
             )
 
         async def body_b029_code_driven_timeout_ignored(c):
+            # TG-12 (B-029): a request_event to a slow remote handler with a
+            # timeout must CANCEL the callee handler on expiry (no leak).
+            # RELOCATED to the socket pair harness (wave-2 group). request_event
+            # ROUTED BY TOPIC to a remote handler needs the parent to hold the
+            # subnode's sub advert; in the in-process-subnode topology here
+            # _inbound_adverts is empty at this point (probe-based routing +
+            # a sibling _drop_peer_advert_state), so the request falls through to
+            # a no-match instead of reaching the slow handler. This is the same
+            # advert/directory-propagation class the networking_pair harness owns.
             c.skip(
-                "B-029 requires a code-driven topic handler that hangs and "
-                "the caller passes timeout — fixture wiring TBD"
+                "TG-12/B-029 callee-cancel-on-timeout needs request_event-by-topic "
+                "to reach a remote handler, which is advert/directory dependent; "
+                "the in-process-subnode topology's _inbound_adverts is empty here — "
+                "relocated to the networking_pair socket harness (wave-2)."
             )
 
         async def body_b030_unpicklable_args(c):
-            c.skip(
-                "B-030 requires passing an unpicklable arg through "
-                "Plugin.publish_event; the arg never crosses the Plugin "
-                "wrapper unmodified — fixture TBD"
-            )
+            # TG-13 (B-030): a cross-node execute carrying an UNPICKLABLE arg
+            # (a lambda) must raise (NetworkRequestException / RequestException),
+            # never be silently lost. The arg is serialized before the wire
+            # send, so the serialize-fail surfaces to the caller.
+            from plexus.exceptions import RequestException
+            raised: Optional[BaseException] = None
+            try:
+                await self.execute(
+                    "TestRemoteTarget", "r_open", {"value": (lambda: 1)},
+                    hosts=c.hosts, timeout=10.0,
+                )
+            except RequestException as e:
+                raised = e
+            if raised is None:
+                c.set_marker("no_exception")
+                raise AssertionError(
+                    "cross-node execute with an unpicklable (lambda) arg did "
+                    "not raise — the arg was silently lost"
+                )
 
         async def body_b027_publish_event_return_count(c):
             c.skip(
@@ -1235,6 +1456,34 @@ class TestRemoteSuite(Plugin):
             ("remote.request_event_stream.mid_stream_raise_reqexc",
              body_request_event_stream_mid_stream_raise_reqexc,
              ("basic", "request_event_stream", "regression_guard"), ()),
+            # ── Wave-1 cross-node gap coverage ────────────────────────
+            # TP-17 — exception TYPE fidelity on the unary request_event path
+            ("remote.request_event.handler_raises_type",
+             body_request_event_handler_raises_type,
+             ("basic", "request_event", "regression_guard"), ()),
+            # TP-57 — hosts=[explicit list] targeting + non-listed control
+            ("remote.hosts_explicit_list", body_hosts_explicit_list,
+             ("access", "regression_guard"), ()),
+            # TP-52a — uuid-targeted cross-node execute reaches the instance
+            ("remote.execute.uuid_targeted", body_execute_uuid_targeted,
+             ("basic", "discovery"), ()),
+            # TP-13 — >100MB unary execute result byte-exact
+            ("remote.execute.huge_unary_result",
+             body_execute_huge_unary_result,
+             ("basic", "regression_guard", "slow"), ("B-024",)),
+            # TP-16 — per-peer publish_event ORDER preserved
+            ("remote.publish_event.per_peer_order",
+             body_publish_event_per_peer_order,
+             ("basic", "request_event"), ("B-019",)),
+            # TP-12 — empty stream clean close (+ 1-item control)
+            ("remote.request_event_stream.empty",
+             body_request_event_stream_empty,
+             ("basic", "request_event_stream"), ()),
+            # TG-11 — remote stream timeout surfaces as RequestException
+            ("remote.request_event_stream.timeout_type",
+             body_request_event_stream_timeout_type,
+             ("basic", "request_event_stream", "regression_guard", "slow"),
+             ("B-045",)),
             # B-024: must run BEFORE the wire_counter.reset_on_drop case below,
             # which drops the peer and clears its adverts (the huge-item stream
             # needs the subnode's advert present to route over the wire).
