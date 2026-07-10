@@ -1,5 +1,5 @@
 description: Phase 5 fixture — remote=True endpoints + topic handlers used by TestRemoteSuite cases (+ Step 6 rate-limit control + reverse-call + wave-1 cross-node gap coverage)
-version: 0.5.1
+version: 0.5.2
 remote: True
 arguments:
 subscriptions:
@@ -156,32 +156,6 @@ endpoints:
     remote: True
     accessible_by_other_plugins: True
     description: TP-13 — a >100MB UNARY execute result (101MB) to prove byte-exact round-trip of a large unary result
-    arguments:
-
-  r_multi_handler:
-    internal_name: r_multi_handler
-    tags:
-    remote: True
-    accessible_by_other_plugins: True
-    description: TP-04 (B-019) — no-op handler; one of three runtime subs on test/r/multi for the publish_event per-sub count check
-    arguments:
-      - name: event
-
-  r_slow_cancel_handler:
-    internal_name: r_slow_cancel_handler
-    tags:
-    remote: True
-    accessible_by_other_plugins: True
-    description: TG-12 (B-029) — slow request_event handler subscribed at runtime to test/r/slow_cancel; hangs forever and records cancellation on timeout
-    arguments:
-      - name: event
-
-  r_read_cancel_flags:
-    internal_name: r_read_cancel_flags
-    tags:
-    remote: True
-    accessible_by_other_plugins: True
-    description: TG-12 readback — returns {started, cancelled} for the slow-cancel handler
     arguments:
 
   r_order_handler:

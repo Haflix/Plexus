@@ -491,35 +491,47 @@ class TestRemoteSuite(Plugin):
                 )
 
         async def body_hosts_explicit_list(c):
-            """TP-57: hosts=[<subnode-hostname>] targeting reaches the peer and
-            returns its value; a non-listed host does NOT (raises / no-match).
-            peer_host is the resolved subnode hostname."""
+            """TP-57: hosts=[explicit list] targeting reaches a LISTED host and
+            NOT an all-non-listed list. MULTI-element lists on BOTH arms so the
+            list-membership branch of _matches_remote_node is actually reached:
+            a single-element list collapses to a bare string in _normalize_hosts
+            (helpers/config.py) and would only exercise scalar-hostname matching
+            (identical to hosts=peer_host, already covered elsewhere). peer_host
+            is the resolved subnode hostname."""
             from plexus.exceptions import RequestException
+            # Positive: peer_host is ONE OF a real multi-entry list.
             r = await self.execute(
                 "TestRemoteTarget", "r_open", {"value": "x"},
-                hosts=[peer_host],
+                hosts=[peer_host, "decoy-host-a"],
             )
             c.expect(r, "x")
-            # Control: a host nobody answers for must NOT reach the endpoint.
+            # Control: a real list of hosts, NONE of which is the peer, must NOT
+            # reach the endpoint (proves the list branch, not just a bare miss).
             raised: Optional[BaseException] = None
             try:
                 await self.execute(
                     "TestRemoteTarget", "r_open", {"value": "x"},
-                    hosts=["no-such-host"], timeout=10.0,
+                    hosts=["decoy-host-a", "decoy-host-b"], timeout=10.0,
                 )
             except RequestException as e:
                 raised = e
             if raised is None:
                 c.set_marker("control_reached")
                 raise AssertionError(
-                    "hosts=['no-such-host'] unexpectedly resolved to a live "
+                    "hosts=[non-matching list] unexpectedly resolved to a live "
                     "endpoint"
                 )
 
         async def body_execute_uuid_targeted(c):
-            """TP-52a: discover the subnode TestRemoteTarget instance's
-            plugin_uuid (via find_endpoints_by_tag), then execute targeting
-            that uuid reaches the right instance and returns its value."""
+            """TP-52a (happy path only): discover the subnode TestRemoteTarget
+            instance's plugin_uuid (via find_endpoints_by_tag), then execute
+            targeting that uuid reaches it and returns its value — i.e. supplying
+            a valid plugin_uuid does not BREAK cross-node execute. NOTE: only one
+            remote instance exists here, so this does NOT prove uuid SELECTIVITY
+            (a broken/ignored uuid would still resolve by name+host to the sole
+            instance). Selectivity is the deferred TP-52b negative (a same-name
+            different-uuid peer must return NO_ENDPOINT), a rewrite-only guarantee
+            built in the wave-2 socket harness."""
             res = await self._plexus.find_endpoints_by_tag("r_probe")
             entry = next(
                 (e for e in res if e.get("access_name") == "r_open"), None
@@ -558,10 +570,14 @@ class TestRemoteSuite(Plugin):
                     f"huge unary result corrupted: got {len(r['data'])} "
                     f"bytes, expected {expected_size}"
                 )
-            # Byte-exact spot check without allocating a second 101MB buffer.
-            if r["data"][:1] != b"\xab" or r["data"][-1:] != b"\xab":
+            # FULL byte-exact verification (single linear scan, no second
+            # 101MB buffer): every byte must be the 0xab fill, so an interior
+            # corruption that preserves total length is still caught.
+            if r["data"].count(0xAB) != expected_size:
                 raise AssertionError(
-                    "huge unary result bytes not byte-exact (fill byte wrong)"
+                    "huge unary result not byte-exact: "
+                    f"{r['data'].count(0xAB)}/{expected_size} bytes are 0xab "
+                    "(interior corruption despite correct length)"
                 )
 
         async def body_publish_event_per_peer_order(c):

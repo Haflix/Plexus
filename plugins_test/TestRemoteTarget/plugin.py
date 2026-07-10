@@ -78,6 +78,9 @@ class TestRemoteTarget(Plugin):
             except Exception:
                 pass
         self._sub_ids = []
+        # Symmetric state cleanup so a disable→re-enable cycle does not carry
+        # stale entries (TP-16 resets before read, but keep the contract honest).
+        self._order_log = []
 
     # ── Plain remote-callable endpoints ─────────────────────────────────
 
