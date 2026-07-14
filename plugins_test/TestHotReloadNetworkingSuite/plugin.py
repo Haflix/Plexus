@@ -219,22 +219,21 @@ class TestHotReloadNetworkingSuite(Plugin):
         )
 
     async def _case04_validate_rejects_bad_cert_pem(self, rec, kw):
-        """B-070 _validate_networking_config: raises on malformed
-        ``cert_pem`` (no PEM header)."""
+        """B-079 REGRESSION GUARD: the netcore hot-reload pre-validation gate
+        (``_validate_networking_config`` -> ``NetworkManager._parse_peers_dryrun``)
+        MUST raise on a malformed peer ``cert_pem`` so a bad reload aborts CLEANLY,
+        keeping the live network. Pre-fix, the netcore port had DROPPED the
+        ``_parse_peers_dryrun`` static helper, so this gate AttributeError-aborted
+        (swallowed) on every rebuild-triggering reload — the rebuild never ran and
+        any in-flight cross-node call hung (B-079). This locks in the restored helper."""
 
         async def body(c):
             pc = self._plexus
             yaml = _baseline_yaml()
-            # Override the peer's cert_pem with a string that lacks
-            # the PEM header. _parse_one_peer's PEM-header check
-            # raises RuntimeError per networking.py:524.
-            yaml["networking"]["peers"][0]["cert_pem"] = (
-                "not a real pem block"
-            )
-            c.expect_exception(
-                RuntimeError,
-                match="missing PEM header",
-            )
+            # A cert_pem lacking a PEM header: the dry-run derives the SPKI
+            # fingerprint via `_spki_from_pem`, which raises → wrapped as ValueError.
+            yaml["networking"]["peers"][0]["cert_pem"] = "not a real pem block"
+            c.expect_exception(ValueError, match="malformed peer entry")
             pc._validate_networking_config(yaml)
 
         await rec.run_case(

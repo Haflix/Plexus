@@ -1,0 +1,33 @@
+# Wave-2 cooperative harness — PEER node RESPAWN VARIANT (same identity/hostname
+# w2b-peer) that exports DIFFERENT content: a SECOND NetFixTarget instance
+# (NetFixTargetB, same source) adds endpoints/subs so content_hash changes and a
+# new endpoint becomes routable. Used by the reboot-different-content (TP-31) and
+# plugin-hot-swap (TP-14) lifecycle cells. Boot with the SAME keys_dir/port so it
+# is the same pinned identity — only the exported directory differs.
+plugins:
+  - name: NetFixTarget
+    enabled: true
+    path: ./plugins_test/NetFixTarget
+  - name: NetFixTargetB
+    enabled: true
+    path: ./plugins_test/NetFixTarget
+  - name: NetObsProbe
+    enabled: true
+    path: ./plugins_test/NetObsProbe
+  - name: NetCtl
+    enabled: true
+    path: ./plugins_test/NetCtl
+
+general:
+    hostname: "w2b-peer"
+    plugin_package: plugins_test
+    console_log_level: "WARNING"
+    file_log_level: "DEBUG"
+    asyncio_debug: false
+    logger_levels:
+        asyncio: "MUTE"
+        urllib3: "MUTE"
+
+networking:
+    enabled: true
+    port: 0

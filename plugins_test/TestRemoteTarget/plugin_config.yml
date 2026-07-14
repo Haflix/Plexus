@@ -1,5 +1,5 @@
 description: Phase 5 fixture — remote=True endpoints + topic handlers used by TestRemoteSuite cases (+ Step 6 rate-limit control + reverse-call + wave-1 cross-node gap coverage)
-version: 0.5.2
+version: 0.5.3
 remote: True
 arguments:
 subscriptions:

@@ -1,29 +1,42 @@
 # Networking
 
-*Last updated for Plexus 0.66.0*
+*Last updated for Plexus 0.74.0*
 
-Plexus ships with an optional `NetworkManager` that bridges plugin calls between nodes over an mTLS-pinned TCP protocol. With networking enabled, calling `await self.execute("OtherPlugin", ...)` works whether `OtherPlugin` is on this node or another node. The same applies to `publish_event` and `request_event`.
+Plexus ships with an optional `NetworkManager` that bridges plugin calls between nodes over an mTLS-pinned TCP protocol. With networking enabled, calling `await self.execute("OtherPlugin", ...)` works whether `OtherPlugin` is on this node or another node. The same applies to `publish_event` and `request_event` (and their streaming variants).
 
-This document covers the trust model, peer configuration, per-node port handling, how remote dispatch flows, and the wire protocol for advanced readers.
+The current implementation lives in the `plexus/netcore/` package. The old import path `plexus.networking` is now a thin compatibility shim that re-exports `plexus.netcore.NetworkManager` plus a handful of legacy symbols (`PeerSpec`, `Node`, `RemotePlugin`, `safe_loads`, `generate_keypair`, `FINGERPRINT_CLI_CMD`, and a retired `AdvertSub` placeholder) so existing importers keep working. The old advert-push / connection-pool / `MSG_*` machinery is gone by design.
+
+This document covers the trust model, peer configuration, per-node port handling, the content-hash directory-pull model, liveness, discovery, the remote-reachability gate, how remote dispatch flows, and the wire protocol for advanced readers.
 
 For the full configuration block reference, see [configuration](./configuration.md). For local notifier semantics that the remote `publish_event` / `request_event` paths extend, see [notifier](./notifier.md).
+
+The netcore package is split into six behavioural modules that this document maps onto:
+
+| Module | Responsibility |
+|---|---|
+| `netcore/types.py` | Wire data shapes: the `Kind`/`ErrorKind`/`Mode` byte tables, `DirectorySnapshot`, `PeerSpec`, `CallerCtx`, the link exceptions. |
+| `netcore/wire.py` | Framing + codec: encode/decode frames, the pickle-value vs msgpack-control split, chunking, per-cid reassembly. |
+| `netcore/membership.py` | Roster, SPKI pins, tombstones, the mTLS context provider, liveness, the heartbeat pulse, discovery ingest. |
+| `netcore/directory.py` | The content-hash directory: local snapshot derivation, remote-snapshot reconcile, the `route_*` routing seam. |
+| `netcore/transport.py` | One bidirectional link per peer: dial election + supervisor, the write-pump, reassembly budgets, the flap guard, SPKI authentication, `InboundReject`. |
+| `netcore/dispatch.py` | The cross-node CALL senders, error mapping, and the inbound authorize/dispatch seam. |
+| `netcore/manager.py` | The `NetworkManager` root that composes the five above, parses config peers, and exposes `route_*` / the `*_remote` senders / `snapshot()` to core. |
 
 ---
 
 ## Trust model
 
-Every node holds its own self-signed certificate. Peers trust each other by **certificate pinning** on the SubjectPublicKeyInfo (SPKI) — there is no CA, no chain, no DNS-name verification. Each node's `peers:` config lists the exact other nodes it accepts.
+Every node holds its own long-lived self-signed certificate. Peers trust each other by **certificate pinning** on the SubjectPublicKeyInfo (SPKI): there is no CA, no chain, no DNS-name verification. Each node's `peers:` config lists the exact other nodes it accepts.
 
-- Each node has `cert.pem` and `key.pem` in `keys_dir` (default `_keys/`). When neither file is present, NetworkManager generates a self-signed pair via `_load_or_generate_identity`.
-- The fingerprint is the sha256 of the SPKI DER, prefixed with `sha256:`. NetworkManager derives this at parse time from each peer's cert PEM.
-- mTLS contexts are built by `_create_server_ssl_context` / `_create_client_ssl_context` / `_create_pinned_ssl_context`. Both sides require client certificates.
-- On every inbound connection, `_handle_client` extracts the peer's SPKI fingerprint as its FIRST act, BEFORE any protocol message is read or sent, and looks the fingerprint up in `peers_by_fingerprint`. A pin failure closes the socket silently — no `_send_message` ever fires on a non-pinned peer.
-- `NetworkManager.start()` hard-errors if `peers:` is empty when networking is enabled, because an empty trust store would reject every inbound connection with an opaque OpenSSL error.
-- Beyond the connection-level pin, every inbound handler (`execute`, `request_event`, `publish_event`, the streaming variants, and the sub-advert frames) runs an anti-spoof gate: the wire-claimed `author_host` on the message must match the hostname this peer was cert-pinned under. A mismatch drops the message (request-shaped frames also get an anti-spoof error response so the caller fails fast) and triggers `_warn_hostname_drift`, which logs a loud ERROR once per offending peer plus an observable `_core/peer/hostname_mismatch` event, then DEBUG for subsequent drops. In practice a mismatch is almost always config drift: the peer's `general.hostname` does not match the hostname in this node's `peers:` entry (and its cert CN).
+- Each node has `cert.pem` and `key.pem` in `keys_dir` (default `keys/`). When neither file is present, `NetworkManager` generates a self-signed pair on first boot (`_load_or_generate_identity`).
+- The fingerprint is `sha256:` followed by the hex sha256 of the SPKI DER. `NetworkManager` derives it at parse time from each peer's cert PEM (`_spki_from_pem`); a peer's `fingerprint` field is derived, never declared-and-trusted, so a fingerprint that cannot be produced from the cert is unrepresentable.
+- **The SPKI pin is the sole authentication gate.** The TLS layer itself is deliberately permissive: `check_hostname=False`, `verify_mode=CERT_REQUIRED`, `minimum_version=TLSv1_3`, and every peer's self-signed cert is loaded as its own CA via `cadata` (`Membership._new_context`). TLS therefore only proves "the other end holds the private key for some cert we were handed"; the AUTHORITATIVE trust decision is the post-handshake SPKI check.
+- On every connection, inbound or outbound, `Transport._authenticate` extracts the peer's presented SPKI, requires it in the LIVE pin set via `Membership.resolve_pin(fingerprint)`, and maps it to the expected hostname. An absent, unextractable, or unpinned SPKI **fails closed** (the socket is dropped). On a dial, the resolved hostname must also equal the peer's configured hostname, else the link is refused.
+- **Contexts are rebuilt immutably on any roster change.** `Membership` never mutates a live SSL context in place; `add_peer` / `remove_peer` build brand-new server and client contexts from the new roster's cadata and rebind them. The bound listener socket is created once with a stable context whose `sni_callback` (`_sni_swap`) swaps in the current live server context per inbound connection, so a peer added at runtime is trusted at the TLS layer without re-binding the socket.
+- An empty `peers:` list is tolerated: the acceptor binds with an empty-cadata listener and picks up the live context on the first `add_peer`, and the SPKI post-check plus the roster gate still reject any unpinned inbound. (A node with no peers simply has nothing to talk to until one is added via config or a vouch.)
+- Beyond the connection-level pin, every inbound CALL runs an **anti-spoof gate** (see [The inbound seam](#the-inbound-seam)): the wire-claimed `author_host` must equal the hostname this peer was cert-pinned under, else the call is dropped and `_core/peer/hostname_mismatch` fires. In practice a mismatch is almost always config drift: the peer's `general.hostname` does not match the hostname in this node's `peers:` entry.
 
-The legacy `node_ips:` schema is removed. Presence of `node_ips:` in a config raises `RuntimeError` at boot with migration guidance pointing at the `peers:` schema.
-
-The legacy top-level networking config fields `secret`, `cert_file`, and `key_file` (from earlier releases) are silently accepted but ignored after the PR4 K-3 cert-pinning rework — fingerprint pinning replaces them.
+The legacy `node_ips:` schema is removed; its presence is a hard boot error pointing at `peers:`. The legacy top-level networking fields `secret` / `cert_file` / `key_file` are accepted but ignored (SPKI pinning replaced the shared secret).
 
 ---
 
@@ -36,11 +49,9 @@ networking:
   enabled: true
   port: 2510                  # cluster default port; per-peer overrides allowed
   hostname: ""                # empty = socket.gethostname()
-  keys_dir: "_keys"           # where this node's cert.pem / key.pem live
-  pool_size: 5                # connection-pool depth per (ip, port)
-  discover_nodes: true
-  direct_discoverable: true
-  auto_discoverable: false
+  keys_dir: "keys"            # where this node's cert.pem / key.pem live
+  discoverable: false         # opt in to vouch-discovery (legacy
+                              # auto_discoverable / direct_discoverable accepted as aliases)
 
   peers:
     - hostname: alpha
@@ -55,312 +66,382 @@ networking:
         -----BEGIN CERTIFICATE-----
         MIIBIjANBg...
         -----END CERTIFICATE-----
-
-    - hostname: gamma
-      address: "[fe80::1]:2510"         # bracketed IPv6
-      cert_file: "_keys/peers/gamma.pem"
 ```
 
 | Field            | Type    | Required | Notes                                                                                                          |
 |------------------|---------|----------|----------------------------------------------------------------------------------------------------------------|
-| `hostname`       | `str`   | yes      | Peer's logical name. Used as the routing key in the advert tables.                                             |
-| `address`        | `str`   | yes      | `"ip"`, `"ip:port"`, `"[ipv6]"`, or `"[ipv6]:port"`. Bare IPv6 (multiple colons, no brackets) defaults to cluster port. |
-| `cert_file`      | `str`   | yes (one of) | Path to the peer's PEM cert. Resolved relative to `keys_dir.parent` if not absolute.                        |
-| `cert_pem`       | `str`   | yes (one of) | Inline PEM body. Use a YAML block scalar. Cannot be combined with `cert_file`.                              |
-| `fingerprint`    | `str`   | optional | `sha256:<hex>`. If set, must match the derived fingerprint, else `RuntimeError` on parse.                     |
-| `system_caller`  | `bool`  | optional | Default `false`. When `true`, this peer's calls inherit `"system"` author privileges (see [notifier](./notifier.md)). |
+| `hostname`       | `str`   | yes      | Peer's logical name and the routing key. Reconnects / IP changes never invalidate routing state, which keys on hostname. |
+| `address`        | `str`   | yes      | `"ip"` or `"ip:port"`. A bare IP uses the cluster default port; a single-colon `ip:port` overrides the port.    |
+| `cert_file`      | `str`   | one of   | Path to the peer's PEM cert. Resolved relative to the config file's directory if not absolute.                  |
+| `cert_pem`       | `str`   | one of   | Inline PEM body (YAML block scalar). Pick `cert_file` OR `cert_pem`.                                            |
+| `fingerprint`    | `str`   | optional | `sha256:<hex>`. If set, must match the fingerprint derived from the cert, else the entry is rejected.           |
+| `system_caller`  | `bool`  | optional | Default `false`. When `true`, this peer's inbound calls may act as the privileged `"system"` identity. See [Cross-node identity](#cross-node-identity-and-the-system-caller). |
+| `dial`           | `str`   | optional | Per-edge dialer override for a NAT edge. Its PRESENCE (any value) flips this side into a dialer when hostname-lex election would otherwise make it the acceptor; it dials the peer at its configured `address` (the field's value is never read). Rarely needed. |
 
-Validation errors that surface at parse time:
+Parse-time validation (a bad entry is skipped with a warning during a normal boot; the hot-reload pre-validation gate is strict and aborts the reload instead):
 
-- Missing `hostname` or `address`.
-- Both `cert_file` and `cert_pem` present.
-- Neither `cert_file` nor `cert_pem` present.
-- Cert content does not start with `-----BEGIN CERTIFICATE-----` after stripping.
-- Cert content is not valid PEM-encoded X.509.
-- Declared `fingerprint` does not match derived.
+- Malformed entry (missing `hostname` / cert, unparseable cert PEM).
+- Declared `fingerprint` does not match the derived fingerprint.
 - Duplicate fingerprint across the peers list.
 - Duplicate `(ip, port)` across the peers list.
-- Bracketed IPv6 with empty brackets, missing closing bracket, or non-integer port.
 
-A printable fingerprint helper is available via the networking CLI for paste-into-config workflows.
+A printable fingerprint helper is available via the networking CLI for paste-into-config workflows (`FINGERPRINT_CLI_CMD`).
 
 ---
 
 ## Per-node port
 
-Most clusters use one port for everything (`networking.port`, default `2510`). When you need otherwise (e.g. running a parent and a sub-node on the same machine), each peer entry's `address:` may override the port:
+Most clusters use one port for everything (`networking.port`, default `2510`). When you need otherwise (for example a parent and a child node on the same host), a peer entry's `address:` overrides the port:
 
-- `"10.0.0.1"` → `(10.0.0.1, cluster_default_port)`
-- `"10.0.0.1:2511"` → `(10.0.0.1, 2511)`
-- `"[::1]:2510"` → `(::1, 2510)`
+- `"10.0.0.1"` maps to `(10.0.0.1, cluster_default_port)`
+- `"10.0.0.1:2511"` maps to `(10.0.0.1, 2511)`
 
-Connection pools are keyed by `(ip, port)`, so a parent and sub-node on the same IP get separate pools. `Node` objects (in `plexus.networking_classes`) carry an optional `port` field; `None` means "use cluster default".
+There is **one long-lived bidirectional link per peer** (keyed by hostname), not a connection pool: a parent and a child on the same IP are still two distinct peers with two distinct links, distinguished by hostname and port. The old `pool_size` knob is retired.
 
 Use cases:
 
-- Two Plexus instances on the same host (parent + isolated child node).
+- Two Plexus instances on the same host (parent plus isolated child node).
 - A peer behind NAT exposing a non-standard port.
 
 ---
 
-## Hostname-based routing
+## The directory-pull model
 
-Peers are addressed by **hostname**, not IP. Internal advert tables all key on `hostname`, so reconnect or IP change does not invalidate them:
+Each node maintains, for every peer, a cached `DirectorySnapshot` describing what that peer exports. There is **no advert push, no delta, and no ack**: a node never volunteers its subscription table to peers. Instead, every heartbeat the pinger PULLS the peer's directory, gated by a single content hash.
 
-| Table                    | Shape                                              | Purpose                                                |
-|--------------------------|----------------------------------------------------|--------------------------------------------------------|
-| `_inbound_adverts`       | `Dict[hostname, Dict[sub_uuid, AdvertSub]]`        | What each peer told us about its subscriptions.        |
-| `_inbound_global_order`  | `Dict[(hostname, sub_uuid), AdvertSub]`            | Insertion-ordered for `request_event` fall-through.    |
-| `_outbound_adverts`      | `Dict[hostname, Dict[our_sub_uuid, AdvertSub]]`    | What we have already told each peer.                   |
+### Content hash is the sole freshness token
 
-This stays stable across reconnects and IP changes. As long as the hostname matches the manifest, advert state survives.
+Each heartbeat, the pinger sends `PING{have_hash}` where `have_hash` is the `content_hash` it last cached for that peer (or `""` if it has none). The peer replies `PONG{epoch, content_hash, snapshot_follows}`, where:
+
+```
+snapshot_follows = (have_hash != current content_hash)
+```
+
+- If the hashes match, the PONG is header-terminal: nothing else is sent. A steady peer costs only PING/PONG headers per heartbeat.
+- If they differ, `snapshot_follows` is `true` and the full `DirectorySnapshot` trails on the SAME cid as a run of `CHUNK` frames, settled by an `END` frame. So a changed peer ships its snapshot exactly once, on the pulse after it changed.
+
+The `content_hash` is re-derived from the LIVE plugin/subscription registry on every serve (`Directory.build_pong` → `_export_snapshot` → `_content_hash`), in one synchronous await-free pass. There is no version counter, no monotone guard, no memo. The hash is a **recursive canonical sha256** over the exported endpoints, subs, and vouched peers (strings NFC-normalized, lists ordered by canonical content, `arguments` canonicalized full-depth). The builtin `hash()` is deliberately not used.
+
+Deliberately EXCLUDED from the hash (they are identity, not content, so a same-content reboot re-derives the SAME hash and forces no needless re-apply):
+
+- `epoch` — a `uuid4` boot nonce.
+- the per-boot `plugin_uuid` and `sub_uuid` values (regenerated every boot, never persisted).
+
+Those fields still ride the exported wire shape; only the freshness hash omits them.
+
+`epoch` is a restart signal only. It rides the PONG header and is tracked in `Membership` independently of the apply decision: when a peer's `epoch` changes, `_core/peer/restarted` fires even if a same-content reboot means the snapshot itself did not change.
+
+Applying a fetched snapshot (`Directory.replace`) is one synchronous roster-gated critical section: apply only if the peer is in-roster and the content hash actually differs; on apply, atomically rebind the remote-snapshot map and fire `_core/directory/replaced`.
+
+### What is in a snapshot
+
+`_export_snapshot` builds the immutable snapshot from the live registry with these export filters:
+
+- **Endpoints** (`EndpointEntry`): exported only if the endpoint is `remote` AND `enabled` AND its owner plugin is active AND `accessible_by_other_plugins` is true. Each entry carries `access_name`, `plugin_name`, `plugin_uuid`, `plugin_version`, `description`, `arguments`, `tags`, and the `remote` / `accessible_by_other_plugins` flags.
+- **Subs** (`RemoteSub`): exported only if the sub is `remote`-eligible (`enabled` AND `hosts != "local"`) AND its owner plugin is active. Carries `sub_uuid`, `topic_pattern`, the raw `authors` / `blocked_authors` / `hosts` / `blocked_hosts` filter values, and `plugin_name`. The filter values are exported RAW (a bare string like `"any"` stays a single token) so the receiver's filter chain interprets them identically to a local sub.
+- **`vouched_peers`** (`VouchedPeer`): the node's CONFIG-ORIGIN peers only (single-hop; learned peers are never relayed), included in EVERY snapshot regardless of this node's own `discoverable` setting and folded into the content hash. Whether a RECEIVER acts on them is the `discoverable` gate (see [Discovery](#discovery)).
+- **`tagged`**: a derived index (tag → endpoints) rebuilt from the endpoint tags; it is not serialized (the receiver re-derives it on decode).
+
+The snapshot body is encoded as **msgpack**, never through the pickle allowlist (see the [codec split](#codec-split)), so a possibly-compromised vouched peer's snapshot can never reach the unpickler. On decode, count bounds drop an over-large snapshot whole (that peer becomes un-routable rather than partially applied): at most `10000` endpoints, `10000` subs, `256` vouched peers.
+
+### Serving is floor-gated
+
+`Directory.serve_ping` allows at most one PONG per `ping_floor_interval` window per peer. A below-floor PING returns nothing, so a PING flood cannot flood PONGs or snapshot serves on the shared loop. An at-interval PING (at least one floor apart) is always answered.
 
 ---
 
-## Discovery and heartbeat
+## Liveness and heartbeat
 
-Three flags control discovery behaviour:
+Liveness is pure `last_seen` age-out on the monotonic clock. There is **no strike counter and no `_mark_node_dead`**.
 
-| Flag                  | Default | Effect                                                                                                              |
-|-----------------------|---------|---------------------------------------------------------------------------------------------------------------------|
-| `discover_nodes`      | `false` | Toggles the periodic `update_all_nodes` loop. When `true`, the node periodically retries dead/missing peers.        |
-| `direct_discoverable` | `false` | Peer can find this node when it explicitly knows the IP.                                                            |
-| `auto_discoverable`   | `false` | Peer can find this node via subnet scan. Setting `true` auto-coerces `direct_discoverable=true`.                    |
+- `Membership.pulse_all` is a single task that, each `heartbeat_interval`, pings every rostered peer CONCURRENTLY (`asyncio.gather`), so one slow or catatonic peer cannot delay the others. Each ping uses the smaller per-probe `probe_timeout` budget, not `liveness_timeout`.
+- A successful pulse stamps `last_seen = monotonic()` (roster-gated, so a revoke mid-await is safe). A `pong.epoch` change fires `_core/peer/restarted`.
+- `reachable_set` is recomputed each pulse as `roster INTERSECT { p : now - last_seen[p] < liveness_timeout }`. A peer that transitions reachable → unreachable on a pass fires `_core/peer/down` with reason `unreachable`, edge-triggered (once, on the transition).
+- `reachable(peer)` is simply `(monotonic() - last_seen) < liveness_timeout`.
 
-Discovery does not bypass trust: a discovered peer still needs a matching cert / fingerprint in `peers:` to connect. Auto-discovery is helpful in development; in production, an explicit peer list is usually clearer.
+So transient-blip tolerance is not a separate knob: it is `liveness_timeout / heartbeat_interval` (default `30 / 10 = 3` missed pulses). Widen it by raising `liveness_timeout`. A peer that ages out or is revoked simply drops out of `reachable_set` and stops being a routing target; there is no explicit "dead" transition. Keep the pulse-timing knobs (`heartbeat_interval`, `probe_timeout`, `liveness_timeout`) sane and positive: unlike the reassembly and timeout caps (which clamp a non-positive value back to their default), the timing knobs are used as given, so a `0` busy-spins the pulse or marks every peer instantly unreachable, and a non-numeric `liveness_timeout` fails the boot.
 
-Heartbeat parameters live under the `networking:` block in `config.yml`:
+Two failure modes are distinguished at the transport layer:
 
-| Knob                | Default   | Meaning                                                                |
-|---------------------|-----------|------------------------------------------------------------------------|
-| `heartbeat_interval`| `10.0` s  | How often to ping every peer.                                          |
-| `lookup_interval`   | `60.0` s  | How often the node-lookup loop runs.                                   |
-| `liveness_timeout`  | `30.0` s  | A peer is considered dead if its last heartbeat is older than this. Should be `>= heartbeat_interval`; 2-3× is typical. |
+- A **refused** dial (`LinkRefused`, e.g. `ECONNREFUSED`) hard-downs the peer immediately by stamping `last_seen = -inf`, so a peer that is up-but-not-listening goes unreachable fast rather than waiting out the timeout.
+- A **dropped or timed-out** link (`LinkDown` / `Timeout`) simply ages out via `last_seen`.
 
-The heartbeat loop probes every peer in the node list CONCURRENTLY (`asyncio.gather`), so one slow or catatonic peer cannot delay the others. Each per-peer probe is `heartbeat_node(node, timeout=probe_timeout)`, where `probe_timeout` is a dedicated, smaller per-probe budget, NOT the larger `liveness_timeout`. A failed probe does NOT mark the peer dead on the spot: an N-strikes miss counter (`_record_heartbeat_miss`, default 3 strikes) absorbs transient blips first. Only once a peer accumulates the strike threshold does the loop call `_mark_node_dead`, which drops advert state for that peer. A successful probe resets that peer's miss counter. `Node.is_alive(timeout=30)` returns `True` if the last heartbeat was within `timeout` seconds.
-
-Bad values (non-numeric or `<= 0`) fall back to the defaults with a warning logged at config-load time, so a typo can never silently zero an interval and starve the heartbeat / discovery loops. See `docs/configuration.md` for the full `networking:` knob table.
+When a link comes up (dialed or accepted), `Membership.on_link_up` stamps `last_seen`, adds the peer to `reachable_set` immediately, fires `_core/peer/up`, and kicks a one-shot pulse to fetch the directory. This gives a routable-within-a-heartbeat-of-link-up guarantee.
 
 ---
 
-## The `remote: true` flag
+## Discovery
 
-A plugin endpoint is reachable from peer nodes if and only if BOTH conditions hold:
+Discovery is a single opt-in gate: `discoverable` (default `false`). It replaced the old three-flag model; legacy `auto_discoverable` / `direct_discoverable` are accepted as aliases (either one `true` maps to `discoverable`).
+
+**Advertising.** EVERY node includes its CONFIG-ORIGIN peers in the `vouched_peers` list of the snapshot it serves, regardless of its own `discoverable` setting. This is single-hop only: a node never relays peers it itself learned by vouch, only ones it was configured with. The export is unconditional; the `discoverable` flag gates only the RECEIVER, below.
+
+**Ingesting.** A `discoverable` RECEIVER, on each pulse, feeds a peer's advertised `vouched_peers` through `Membership.ingest_vouched`. An OFF node ignores them entirely (it never pins a learned peer, so a star stays a star; an edge forms only when BOTH ends are `discoverable`). Ingest is fully validated and budgeted:
+
+- If the voucher is tombstoned or no longer in-roster at apply time, the whole batch is dropped.
+- A hostname that is tombstoned is skipped.
+- A CONFIG pin is never overwritten; a re-vouch of a known hostname is idempotent; a fingerprint conflict with an existing roster entry fires `_core/peer/vouch_conflict` and is otherwise ignored.
+- A per-voucher ACTIVE budget cap (`vouch_active_cap`, default 64) bounds how many peers one voucher may introduce; over-budget fires `_core/peer/vouch_rejected` with reason `budget`.
+- Every config-time validation is mirrored before the entry reaches the roster: the cert must parse, its derived SPKI must equal the declared fingerprint, the fingerprint must not duplicate an existing pin, the address must parse, it must fall inside `lan_cidrs`, and its `(ip, port)` must not duplicate an existing peer. Each failure fires `_core/peer/vouch_rejected` with a specific reason (`cert_parse`, `fingerprint_mismatch`, `dup_fingerprint`, `bad_address`, `cidr`, `dup_address`).
+- An accepted vouched peer is added with `system_caller=False` **always**. Discovery confers no privilege escalation. Its acceptance fires `_core/peer/vouched`.
+
+Explicit `peers:` pins work regardless of `discoverable`.
+
+### Tombstones and revoke durability
+
+`Membership.remove_peer` writes a HOSTNAME-keyed persisted tombstone to `revoked_peers.json` in `keys_dir` (atomic tmp-file + replace, so a crash mid-write cannot corrupt the revoke list). The revoke also removes the peer from the roster and pin set, rebuilds the SSL contexts, clears its liveness, drops its cached remote snapshot, decrements its voucher's active budget, and tears down the link.
+
+A persisted tombstone is cleared ONLY by an explicit operator `add_peer`. `seed_config_peers` skips a hostname whose runtime-revoke is persisted, so a revoke survives a restart even if the peer is still listed in `peers:`.
+
+---
+
+## The remote-reachability gate
+
+An endpoint is reachable cross-node if and only if **all three** hold:
 
 1. The plugin's manifest has top-level `remote: true`.
 2. The endpoint's entry has `remote: true`.
+3. The endpoint's entry has `accessible_by_other_plugins: true`.
 
-`find_endpoint` checks both. Forgetting either produces an "endpoint not found" error from a peer caller.
+This is enforced at two points, both of which must agree:
 
-The `accessible_by_other_plugins` flag is NOT consulted for inbound peer requests — that flag only gates LOCAL cross-plugin access. So an endpoint can be `accessible_by_other_plugins: false` (only this plugin can call it locally) and still be `remote: true` (peers can call it across the wire).
+- **On the exporting side**, `Directory._export_snapshot` only lists an endpoint whose exported `remote` flag (which is itself `plugin.remote AND endpoint.remote`, computed in `NetworkManager._export_endpoints`) is true AND `accessible_by_other_plugins` is true AND the endpoint is enabled AND the owner plugin is active. An endpoint failing any of these never appears in the directory a peer pulls, so peers never route to it.
+- **On the callee side**, when a CALL arrives, `NetworkManager._RematchRegistry._match_execute` re-checks the LIVE registry: the plugin must be enabled, the name must match, `plugin.remote AND endpoint.remote` must hold, and `accessible_by_other_plugins` must be true. A miss raises `NoEndpointError`, which the callee returns as `NO_ENDPOINT`.
 
----
+> **Correction vs. older docs.** Earlier documentation stated that `accessible_by_other_plugins` was NOT consulted for inbound peer requests (only for local cross-plugin access). That was true of the retired `plexus/networking.py`; it is FALSE for netcore. An endpoint that is `accessible_by_other_plugins: false` is **not** reachable across the wire even if `remote: true`, because both the export filter and the callee re-match require it.
 
-## Remote `execute` flow
-
-When `find_endpoint` finds the endpoint on a `RemotePlugin` proxy instead of a local plugin, `Plexus._process_request` takes the remote branch.
-
-```
-   Plugin A on Node alpha
-     |
-     | await self.execute("PluginX", "method", args=..., hosts="any")
-     v
-   Plexus.execute (alpha)
-     |
-     | find_endpoint
-     |     ├── try local plugins: no PluginX here
-     |     └── iterate self.network.nodes:
-     |             call network.node_has_endpoint(IP, "PluginX", "method")
-     |             hit on beta
-     | --> returns (RemotePlugin, endpoint_dict, Node(beta))
-     |
-     | self.network.execute_remote(IP=beta.IP, plugin="PluginX",
-     |                              method="method", args=..., timeout=...,
-     |                              request_id=request.id)
-     |
-     |  [MSG_EXECUTE (1)] --> beta
-     |
-     |  [MSG_RESULT (10)] OR [MSG_ERROR (12)] <-- beta
-     |
-     v
-   return value (or RequestException / NetworkRequestException)
-```
-
-`request_id` round-trips so both sides correlate. Streaming execute uses `MSG_EXECUTE_STREAM` (id 2) and yields chunks via `MSG_STREAM_CHUNK` (id 11) with `MSG_END_STREAM` (id 13) as the terminator.
+**UUID targeting survives cross-node.** An `execute(..., plugin_uuid=...)` call carries the `plugin_uuid` in its selector. The callee re-rejects a call whose selector `plugin_uuid` does not exactly match the live instance with `NO_ENDPOINT` (so a same-name / different-uuid instance never answers). A `NO_ENDPOINT` reply falls through to the next candidate peer.
 
 ---
 
-## Remote `request_event` flow
+## Remote dispatch flows
 
-`request_event` is 1:1 with insertion-order tie-break. After failing to find a local match, the framework iterates `_inbound_global_order` in insertion order. For each candidate, the per-peer host filter, the sub-level remote-publisher filter, the author filter, and the topic-pattern match all apply.
+Core keeps local dispatch in the untouched in-process notifier; the netcore layer supplies the routing candidates and the cross-node CALL senders. The unifying change from the old code: **fall-through order is hostname-lexicographic**, not advert insertion order.
 
-```
-   Local Plexus.request_event
-     |
-     | find_all(topic) on local registry, take first sub past filter chain
-     |     ├── hit -> dispatch locally, return
-     |     └── miss -> proceed to remote candidates
-     |
-     | iterate self.network._inbound_global_order in insertion order:
-     |     for each candidate sub on a peer:
-     |         apply _hosts_match (peer-level)
-     |         apply _sub_accepts_remote_publisher (sub.hosts vs author_host)
-     |         apply _sub_accepts_author (authors / blocked_authors)
-     |         apply _topic_matches (does the candidate's pattern match this topic)
-     |         survivor -> try this peer:
-     |             [MSG_REQUEST_EVENT (16)] --> peer
-     |             [MSG_RESULT / MSG_ERROR] <-- peer
-     |
-     |             on NetworkRequestException -> SKIP, try next candidate
-     |             on NoLocalSubException     -> SKIP, try next candidate
-     |             on RequestException        -> propagate immediately
-     |             on success                 -> return result
-     |
-     | exhausted candidates -> raise RequestException("no subscriber matched")
-```
+### CALL modes
 
-**Why distinguish `NoLocalSubException` from `NetworkRequestException`:** the former is "the peer was reachable, just didn't have a matching sub either" — fall-through is safe. A generic `RequestException` propagating from a peer means a matched handler ran and raised; surfacing that error is the correct behavior, because replacing it with another peer's response would silently mask a real failure.
+Every cross-node call is one `CALL` frame carrying a mode:
 
-`NoLocalSubException` is a subclass of `RequestException`, so callers that just `except RequestException:` see one type. The framework only distinguishes the two for fall-through control.
+| Mode | Used by | Reply |
+|---|---|---|
+| `UNARY` | `execute` | single value, or an `ERROR` frame |
+| `FIRST` | `request_event` | single value, or an `ERROR` frame |
+| `STREAM` | `request_event_stream` / streaming `execute` | a run of `CHUNK`-carried items, `END`-terminated |
+| `FANOUT` | `publish_event` | none (fire-and-forget) |
 
-The streaming variant (`request_event_stream`, `MSG_REQUEST_EVENT_STREAM`, id 17) has identical fall-through semantics PRE-FIRST-CHUNK. Once the producer yields the first chunk, the dispatch is committed to that peer; later errors do not redirect.
+### `execute`
 
----
+Core asks `route_execute(plugin, endpoint)`, which yields `(hostname, endpoint_entry)` for every reachable, in-roster peer that exports the `(plugin, endpoint)` pair, in **hostname-lexicographic** order. Core sends a `CALL{mode=UNARY}` to the first; the value comes back on `END`, or an `ERROR` frame comes back. A `NO_ENDPOINT` (uuid miss / `remote:false` / not accessible) or a `NETWORK` error falls through to the next candidate.
 
-## Remote `publish_event` flow
+### `request_event`
 
-`publish_event` is 1:N fan-out. Local subs are dispatched in-process; for every advertised remote sub on every reachable peer that survives per-peer and sub-level filters, the framework spawns a tracked task that sends `MSG_PUBLISH_EVENT` (id 15) over the wire.
+Core tries local subscriptions first. On a local miss it asks `route_request(topic)`, which yields `(hostname, RemoteSub)` for reachable, in-roster peers whose cached subs topic-match, in **hostname-lexicographic** then declaration order. Routing is UNFILTERED beyond topic-match and reachability: core applies the author/host predicate chain (`_hosts_match`, remote-publisher, author filters) per candidate. The first surviving candidate gets a `CALL{mode=FIRST}`.
 
-```
-   Local Plexus.publish_event
-     |
-     | dispatch locally to every matching local sub
-     |
-     | for every advertised sub on every reachable peer that survived
-     |     per-peer + sub-level filters:
-     |         spawn fire-and-forget network.publish_event_remote task
-     |         [MSG_PUBLISH_EVENT (15)] --> peer
-     |
-     | tasks tracked in _inflight_publishes[hostname]
-     |
-     v
-   return total scheduled count (local + remote)
-```
+Fall-through by reply type:
 
-Per-peer ordering is preserved (one TCP stream per peer). Across peers, dispatches happen concurrently. Errors in remote publishes are logged but never raised — `publish_event` is fire-and-forget. The return value is the count of subscribers (local + remote) the dispatch was scheduled for, not the count that completed successfully.
+- `NoLocalSubException` (peer had no matching sub either) or `NetworkRequestException` (transport failure / peer down): SKIP, try the next candidate.
+- `RateLimitException` / `CapabilityException`: PROPAGATE immediately.
+- A handler that ran and raised: PROPAGATE (see [Error mapping](#error-mapping)).
+- Exhausted candidates: `RequestException` "no subscriber matched".
 
-Inflight tasks tracked in `_inflight_publishes[hostname]` are cancelled when the corresponding peer disconnects, and drained on shutdown.
+The streaming variant (`request_event_stream`) has identical fall-through semantics PRE-FIRST-CHUNK. Once the producer yields its first chunk, dispatch is committed to that peer and later errors do not redirect.
+
+### `publish_event`
+
+Local subscribers are dispatched in-process. For remote fan-out, core asks `route_publish(topic)`, which GROUPS matching subs per peer: `(hostname, list[RemoteSub])`. Core applies its predicates per sub, sums the surviving matches into the scheduled count, and sends **one** `CALL{mode=FANOUT}` frame per peer (not one per sub). The return value is the scheduled count (local plus the sum of matching remote subs across reachable peers), not a completion count. A FANOUT has no reply channel: an inbound reject at the callee stays SILENT, and a down peer is dropped silently.
+
+### Error mapping
+
+`Dispatch._map_error` maps an `ERROR` frame's `kind` to the exact caller-facing exception type:
+
+| `ERROR.kind` | Raised as | Caller behavior |
+|---|---|---|
+| `NO_MATCH` | `NoLocalSubException` | fall through |
+| `NETWORK`, `NO_ENDPOINT` | `NetworkRequestException` | fall through |
+| `RATE_LIMIT` | `RateLimitException` | propagate |
+| `CAPABILITY` | `CapabilityException` | propagate |
+| `HANDLER_RAISED` | the deserialized exception, re-raised (with the wrapping rule below) | propagate |
+
+Link-level failures (`LinkDown` / `LinkRefused` / `Timeout` / `ProtocolError`) surface as `NetworkRequestException` (fall through).
+
+`HANDLER_RAISED` carries a real improvement over the old code, which flattened the exception type. Netcore re-raises the deserialized handler exception faithfully, with two guards:
+
+- If the deserialized exception is itself a `NetworkRequestException` or `NoLocalSubException`, it is WRAPPED in a plain `RequestException`. Otherwise the notifier's fall-through arm would mistake a genuine handler failure for a network miss and silently re-run a side-effecting handler on the next peer.
+- A non-`RequestException` (e.g. a bare `ValueError`) is also wrapped in `RequestException`, so `request_event`'s documented contract (raises `RequestException`) holds; a `RequestException` subtype (`RateLimit` / `Capability`) is preserved so callers can `except` it by type.
 
 ---
 
-## Subscription advert protocol
+## The inbound seam
 
-Three message types keep peer subscription tables in sync:
+The callee side is a two-call seam in `Dispatch`, driven by `Transport` before and after arg buffering.
 
-| Wire ID | Name              | Purpose                                                                                                           |
-|---------|-------------------|-------------------------------------------------------------------------------------------------------------------|
-| 18      | `MSG_SUB_ADVERTISE` | Full sub-snapshot exchange between peers: sent on initial connection, and re-sent periodically every `resync_interval` seconds (default 300s, C-109) to scrub ghost subscriptions. |
-| 19      | `MSG_SUB_DELTA`     | Incremental subscribe/unsubscribe delta. Broadcast on every `_register_yaml_subscriptions` call after `plugin_lock` is released, and on every `subscribe_event` / `unsubscribe_event`. |
-| 21      | `MSG_SUB_ADVERTISE_ACK` | Async receiver-side acknowledgement of `MSG_SUB_ADVERTISE` snapshots and `MSG_SUB_DELTA` add-operations. Returned via the receiver's outbound connection back to the original sender; populates `acked_at` / `state` on the sender's `_outbound_adverts` entries. |
+`authorize_inbound(identity, frame)` runs SYNCHRONOUS header authorization BEFORE any arg CHUNK is buffered, in this order:
 
-Add-deltas broadcast AFTER the local registration completes; remove-deltas broadcast AFTER local removal. Each peer applies the delta to its own `_inbound_adverts` and `_inbound_global_order`.
+1. **Charge `nodes_in`** on the authenticated hostname (this counts as an attempt, and stands even if a later step rejects). A rejection here is `RATE_LIMIT`.
+2. **Anti-spoof:** the wire `caller.author_host` MUST equal the authenticated (pinned) hostname. A mismatch fires `_core/peer/hostname_mismatch`, emits `_core/net/reject`, and drops the call (`NETWORK`).
+3. **Live-roster re-check** (closes the revoke window). A miss is `NETWORK`.
+4. **Charge the callee's `framework_in`** — but ONLY for events (`TopicSelector`). An `execute` (`ExecuteSelector`) charges `framework_in` inside its own `core.execute` re-entry, so charging it here too would double-charge.
 
-Adverts are fire-and-forget on the wire — the sender does not block awaiting an ack. The receiver schedules a `MSG_SUB_ADVERTISE_ACK` frame back to the sender via its own outbound connection (a short-lived `asyncio.create_task`). The sender's heartbeat loop scans `_outbound_adverts` for entries whose `sent_at` is older than `2 * heartbeat_interval` and triggers ONE full-snapshot re-send. A second timeout marks the entry `state = "ack_timeout"` and stops retrying. Acks are sent only for snapshot ingestion and `kind="add"` deltas; `kind="remove"` deltas have no tracking entry to update on the sender side, so no ack is sent.
+A success emits `_core/net/inbound`.
 
-**Minimum compatible version: 0.27.0.** Older peers do not dispatch wire ID 21 and will close the receiver's outbound connection on receipt (sending `MSG_ERROR` then breaking the loop). In a same-version mesh this is a non-issue. In mixed-version meshes, expect periodic reconnect overhead on subscribe-heavy workloads — recommend coordinated rolling upgrades.
+`dispatch_inbound(identity, frame, args)` then re-matches against the LIVE registry with the authoritative per-sub / per-endpoint filters (the registry seam owns them and charges the IN-set on the local re-entry), runs the handler bounded by `handler_timeout`, and emits the typed reply. The `identity` is built from the authenticated roster record, never the wire.
+
+The IN-set charge happens in the registry re-entry, not in `authorize_inbound`, so a call that fails re-match is not charged the IN-set.
+
+### Cross-node identity and the system caller
+
+The right to act as `author="system"` is granted SOLELY from THIS node's authenticated record for the calling peer (`identity.system_caller`, set from the peer's `system_caller: true` config flag), NEVER from the wire. A spoofed `author="system"` claim on an inbound frame is downgraded (to the wire `author_id` or the peer hostname) before the registry re-entry, so no downstream seam ever observes a wire-asserted system author it did not grant. See [capabilities](./capabilities.md) for the cross-node impersonation non-goal.
 
 ---
 
-## Wire protocol message types
+## Wire protocol
 
-For tooling authors and protocol debuggers. Constants live at the top of `plexus.networking`. Each message is length-prefixed and routed by type ID. Numbers are part of the wire format and must not be repurposed.
+For tooling authors and protocol debuggers. The framing and codec live in `netcore/wire.py`; the byte tables in `netcore/types.py`.
 
-| ID | Name                       | Direction | Purpose                                                                       |
-|----|----------------------------|-----------|-------------------------------------------------------------------------------|
-| 1  | `MSG_EXECUTE`              | request   | Remote `execute` call.                                                        |
-| 2  | `MSG_EXECUTE_STREAM`       | request   | Remote streaming `execute`.                                                   |
-| 3  | `MSG_HAS_ENDPOINT`         | request   | Endpoint existence check (used by `find_endpoint` / `node_has_endpoint`).     |
-| 4  | `MSG_PING`                 | request   | Heartbeat.                                                                    |
-| 5  | `MSG_INFO`                 | request   | Discovery info exchange.                                                      |
-| 6  | `MSG_FIND_TAGGED_ENDPOINTS`| request   | Tag-based discovery.                                                          |
-| 10 | `MSG_RESULT`               | response  | Single response payload.                                                      |
-| 11 | `MSG_STREAM_CHUNK`         | response  | One streamed chunk.                                                           |
-| 12 | `MSG_ERROR`                | response  | Error response.                                                               |
-| 13 | `MSG_END_STREAM`           | response  | Stream terminator.                                                            |
-| 14 | `MSG_STREAM_ITEM_END`      | response  | End of one item in a stream response.                                         |
-| 15 | `MSG_PUBLISH_EVENT`        | request   | Fire-and-forget publish.                                                      |
-| 16 | `MSG_REQUEST_EVENT`        | request   | 1:1 request.                                                                  |
-| 17 | `MSG_REQUEST_EVENT_STREAM` | request   | Streaming 1:1 request.                                                        |
-| 18 | `MSG_SUB_ADVERTISE`        | request   | Initial sub-snapshot exchange between peers.                                  |
-| 19 | `MSG_SUB_DELTA`            | request   | Incremental subscribe / unsubscribe delta.                                    |
-| 21 | `MSG_SUB_ADVERTISE_ACK`    | response  | Async ack of `MSG_SUB_ADVERTISE` snapshots / `MSG_SUB_DELTA` adds.            |
+### Framing
 
-IDs 7, 8, 9 are reserved and must not be reused; they held legacy `MSG_NOTIFY`, `MSG_TOPIC_REQUEST`, and `MSG_TOPIC_REQUEST_STREAM`, retired in PR3 Stage D when `notify` / `request_topic` were removed. ID 20 is also reserved (formerly `MSG_AUTH`, removed in PR4 Stage K-3 when SPKI-pinned mTLS replaced the shared-secret auth). ID 21 was claimed in v0.27.0 by `MSG_SUB_ADVERTISE_ACK`.
+Each frame is:
 
-### Advert-table cap
+```
+[4B big-endian length][1B kind][8B big-endian cid][ fields ]
+```
 
-Each peer's inbound advert table is capped at `MAX_ADVERT_SUBS_PER_PEER = 100_000` entries (see `plexus/networking.py`). An incoming `MSG_SUB_ADVERTISE` snapshot whose `subscriptions:` list would push the receiving side's `_inbound_adverts[peer]` past the cap is rejected before any state is committed. The receiver replies with a `MSG_ERROR` so the sender can surface the rejection to operators rather than silently dropping the snapshot. The cap exists to bound `_adverts_struct_lock` hold time during snapshot ingest; honest peers stay several orders of magnitude below it.
+The length prefix EXCLUDES its own 4 bytes; it counts `[kind][cid][fields]`. A declared length below the minimum, or above `MAX_FRAME_BYTES` (`CHUNK_SIZE + 1 MB`), is a malformed frame → `ProtocolError` → the link is TORN (see [Tear vs. cancel](#tear-vs-cancel)).
+
+The `cid` (correlation id) is a per-link 63-bit counter with the high bit reserved for the DIAL ROLE (dialer allocates with the high bit set, acceptor with it clear), so the two ends never collide on a cid and a frame's owner is decidable from the bit.
+
+### Frame kinds
+
+There are exactly SEVEN kinds, in three roles:
+
+| Kind | ID | Role | Purpose |
+|---|---|---|---|
+| `PING` | 1 | control / priority | Heartbeat + directory pull; carries `have_hash`. |
+| `CALL` | 2 | app opener | Opens a cross-node call; carries the selector, mode, caller, and `handler_timeout`. Args trail as `CHUNK`s. |
+| `CANCEL` | 3 | control / priority | Cancel an in-flight cid (either direction). |
+| `PONG` | 4 | control / priority | PING reply; carries `epoch`, `content_hash`, `snapshot_follows`. |
+| `CHUNK` | 5 | data | One fragment of a logical value (args / result / stream item / snapshot body); carries `last`. |
+| `END` | 6 | terminator | Value-less; settles a unary reply, a stream, or a trailing snapshot. |
+| `ERROR` | 7 | terminator | Value-less envelope carrying an `ErrorKind` and an optional pickled `exc`. |
+
+Control frames (`PING` / `PONG` / `CANCEL`) ride a priority write lane and preempt between a value's chunks, so a large value cannot head-of-line-block a heartbeat.
+
+### Codec split
+
+Two codecs, chosen by what the bytes ARE:
+
+- **Control fields, the `DirectorySnapshot`, and `vouched_peers` are msgpack.** These are inert structured data.
+- **A logical VALUE — CALL args, a unary/FIRST result, a stream item, or the `ERROR.exc` payload — is `pickle` on the send side and the restricted `SafeUnpickler` allowlist (`safe_loads`, NOT raw `pickle.loads`) on the receive side, AFTER full reassembly, never per-chunk.** The `ERROR.kind` decodes independently of `exc`, so the disposition is known without touching the pickle path.
+
+Critically, the directory snapshot is msgpack ONLY and is never routed through the pickle allowlist, so a compromised vouched peer's snapshot cannot reach the unpickler via the discovery / PONG path.
+
+### Chunking and reassembly
+
+Every logical value is sliced into one or more `CHUNK{cid, data, last}`. A value ≤ `CHUNK_SIZE` (64 KB) is a single `CHUNK{last=true}`; a larger value splits with `last=true` only on the final fragment. `CHUNK.data` is opaque bytes at byte offsets (no per-chunk msgpack wrap).
+
+Reassembly is bounded at three levels; the config knob names match [configuration](./configuration.md):
+
+| Bound | Default | Config knob |
+|---|---|---|
+| per in-flight message (per cid) | 8 MB | `per_cid_reassembly_cap` |
+| across all in-flight messages from one peer | 16 MB | `per_peer_reassembly_cap` |
+| aggregate across all peers | 128 MB | `node_reassembly_cap` |
+
+The largest single value you can receive is `min(per_cid, per_peer)`. A per-peer guaranteed minimum (2 MB) is always admitted regardless of the node-wide total, so a newcomer can always start SOME reassembly. Independently, one peer may have at most `per_peer_cid_cap` (default 64) concurrent inbound CALLs open at once; a CALL past that cap gets an immediate `ERROR{NETWORK}` before any arg is buffered. Two per-reassembly deadlines also bound a slow drip: an absolute 60 s deadline (armed at the first chunk) and a per-chunk idle deadline (`stream_idle_deadline`, default 30 s), both on the monotonic clock.
+
+### Tear vs. cancel
+
+The distinction matters operationally:
+
+- A **malformed FRAME** (bad length, unknown kind byte, undecodable control payload) is a `ProtocolError` and is the ONLY condition that TEARS the link (drops it and fast-fails its pending requests).
+- **Exceeding a reassembly bound or a per-reassembly deadline** FAILS CLOSED for that one cid only: send `CANCEL`, free the budget, and KEEP the link. It also emits `_core/net/reject` with reason `reassembly_bound`. A hostile or buggy oversized message costs you the message, not the link.
+
+For a PING that promised `snapshot_follows` but then trips a bound, the header already settled the peer as reachable, so the snapshot resolves to nothing and the peer STAYS reachable; only a genuine link-down fails the pending snapshot.
 
 ---
 
 ## Network-side exceptions
 
-| Exception                 | Base                | When                                                                                                                                                                |
-|---------------------------|---------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `NetworkRequestException` | `RequestException`  | Network-level failure during a remote dispatch (timeout, connection failure, peer error response).                                                                  |
-| `NoLocalSubException`     | `RequestException`  | Peer signaled "no local sub matched" on a remote `request_event` / `request_event_stream`. Distinct subclass so fall-through can preserve insertion order.          |
-| `NodeException`           | `Exception`         | Generic node-level error (e.g. node unknown / disabled in helper paths).                                                                                            |
-| `RequestException`        | `Exception`         | Generic plugin-call error. Bubbles up across the wire.                                                                                                              |
+| Exception | Base | When |
+|---|---|---|
+| `NetworkRequestException` | `RequestException` | Transport-level failure or a peer `NETWORK` / `NO_ENDPOINT` reply on a remote dispatch. Fall-through-safe. |
+| `NoLocalSubException` | `RequestException` | Peer signalled "no local sub matched" (`NO_MATCH`) on a remote `request_event` / stream. Distinct subclass so fall-through can continue in hostname-lex order. |
+| `RateLimitException` | `RequestException` | Peer rejected the call at its inbound rate limiter (`RATE_LIMIT`). Propagates. |
+| `CapabilityException` | `RequestException` | Peer denied the call at its capability gate (`CAPABILITY`). Propagates. |
+| `NodeException` | `Exception` | Generic node-level error in helper paths. |
+| `RequestException` | `Exception` | Generic plugin-call error, including a wrapped remote `HANDLER_RAISED`. |
 
-For most callers, `except RequestException:` covers all of the above (since `NetworkRequestException` and `NoLocalSubException` are subclasses). Catch `NoLocalSubException` separately only if you need to distinguish "peer-side miss" from "peer-side handler raised".
+For most callers, `except RequestException:` covers all of the above (the four network subtypes descend from it). Catch `NoLocalSubException` separately only when you need to distinguish "peer-side miss" from "peer-side handler raised".
+
+---
+
+## Observability events
+
+The netcore modules emit `_core/*` events through the core notifier's internal observer bus. Subscribe with `Plugin.internal_observe(topic, callback)`. This is the operational surface for a dashboard or an alerting feed.
+
+| Event | Emitted when | Payload highlights |
+|---|---|---|
+| `_core/peer/up` | A link comes up (dialed or accepted). | `hostname` |
+| `_core/peer/down` | A peer transitions to unreachable (reason `unreachable`, edge-triggered), or is revoked (reason `revoked`). | `hostname`, `reason` |
+| `_core/peer/restarted` | A peer's `epoch` changed on a PONG (it rebooted). | `hostname`, `epoch` |
+| `_core/peer/vouched` | A vouched peer was accepted by discovery. | `hostname`, `fingerprint`, `voucher_hostname` |
+| `_core/peer/vouch_conflict` | A vouch's fingerprint conflicts with an existing roster entry. | `hostname`, existing / vouched fingerprints, `voucher_hostname` |
+| `_core/peer/vouch_rejected` | A vouch failed validation. | `hostname`, `reason` (`budget` / `cert_parse` / `fingerprint_mismatch` / `dup_fingerprint` / `bad_address` / `cidr` / `dup_address`), `voucher_hostname` |
+| `_core/peer/hostname_mismatch` | An inbound call's wire `author_host` did not match the authenticated hostname (anti-spoof). | `authenticated`, `claimed` |
+| `_core/net/inbound` | An inbound call passed header authorization. | `hostname` |
+| `_core/net/reject` | An inbound call or a reassembly was rejected. | `reason` (`nodes_in` / `hostname_mismatch` / `not_in_roster` / `framework_in` / `reassembly_bound`), `hostname` |
+| `_core/directory/replaced` | A peer's cached directory snapshot was replaced with fresher content. | `hostname`, `content_hash` |
+
+`NetworkManager.snapshot()` also exposes a point-in-time view for the TUI: per peer, its address, fingerprint, reachability, `last_seen` age, live epoch, cached content hash, an `unreachable_reason` (`connection_refused` vs `unreachable`), discovery `source` (`config` / `vouched`) and `vouched_by`, plus the cached routing table (subs + endpoints).
+
+---
+
+## Tag discovery is heartbeat-fresh
+
+`find_endpoints_by_tag(tag)` reads the CACHED directory (`route_tagged`), collecting remote endpoints carrying the tag plus local endpoints (with the self-host normalized to `local`). Because the directory is pulled at heartbeat cadence, a tag view is at most one heartbeat stale. An orchestrator that discovers tools (for example the `ai_tool` tag) should RE-QUERY at use time, not cache the result at `on_enable` — a peer that comes up, changes, or goes away after enable would otherwise be missed or stale.
 
 ---
 
 ## Adding a new node to an existing cluster
 
-Once at least one node already has a `cert.pem` and is in another node's `peers:` list, the normal mTLS exchange flow applies. To add a new node to that running cluster:
+Once at least one node already has a `cert.pem` and is in another node's `peers:` list, the normal mTLS pinning flow applies. To add a new node:
 
 1. Decide the new node's hostname (`networking.hostname`, or empty for `socket.gethostname()`) and port (`networking.port`, default `2510`).
 2. Obtain the new node's `cert.pem` and SPKI fingerprint via the networking CLI fingerprint helper.
-3. On every existing node, add a `peers:` entry for the new node with hostname, address, and `cert_file:` (or inline `cert_pem:`). Optionally pin `fingerprint` for defense in depth.
-4. On the new node, add `peers:` entries for every existing node (each with their cert and address).
+3. On every existing node, add a `peers:` entry for the new node with hostname, address, and `cert_file:` (or inline `cert_pem:`). Optionally pin `fingerprint:` for defense in depth.
+4. On the new node, add `peers:` entries for every existing node (each with its cert and address).
 5. Set `networking.enabled: true` on the new node and confirm the existing nodes still have it enabled.
-6. Restart the new node (or hot-reload config). Existing nodes can pick up the new peer via config reload as well. Each side now pins the other; mTLS handshake succeeds; advert exchange runs; calls flow.
+6. Restart the new node (or hot-reload config). Existing nodes can pick up the new peer via config reload as well. Each side now pins the other; the mTLS handshake succeeds, the directory pull runs on the next heartbeat, and calls flow.
 
-If a peer is offline at startup, that is fine — heartbeat / discovery loops bring it in when it comes back. What CANNOT be left empty is the `peers:` list when networking is enabled.
+If a peer is offline at startup, that is fine: the link comes up when it returns (the per-peer supervisor dials with capped backoff). An empty `peers:` list is also tolerated: the node simply has nothing to talk to until a peer is added via config or, with `discoverable`, a vouch.
 
 ---
 
 ## Cluster bootstrap
 
-Standing up a brand-new cluster from zero certificates (no node has a `cert.pem` yet) follows a one-shot first-boot pattern. `NetworkManager.start()` loads or generates the node's identity BEFORE checking that `peers:` is non-empty, so the very first run on a fresh node always produces `cert.pem` and `key.pem` even if the run cannot complete startup.
+Standing up a brand-new cluster from zero certificates follows a one-shot first-boot pattern. `NetworkManager` loads or generates the node's identity at CONSTRUCTION, before anything is served, so the very first run on a fresh node always produces `cert.pem` and `key.pem` even with an empty `peers:` list.
 
 ### Per-node bootstrap procedure
 
-For each node in the cluster, in any order:
+For each node, in any order:
 
-1. Install the framework on the node and write `config.yml` with `networking.enabled: true` and an empty `peers: []`.
-2. Run the application once. `start()` loads or generates the node's identity into `keys_dir` (default `_keys/`), logs the fingerprint and cert PEM at INFO level (look for `[NETWORKING] Identity ready`), then raises a `RuntimeError` because `peers:` is empty. This is expected.
-3. Copy the `sha256:...` fingerprint and the cert PEM block from the log. The same data can be re-read at any time with `python -m networking_cli show-fingerprint --config <config.yml>`.
-4. Exchange fingerprints + cert PEMs between nodes (out of band: secure messaging, encrypted file share, etc.). Each node's `peers:` block needs at least one entry per other node it wants to talk to, with that peer's `hostname`, `address`, `cert_file` or `cert_pem`, and `fingerprint`.
-5. Start each node again. With `peers:` populated, `start()` proceeds past the empty-peers check, builds the SSL context, opens the socket, and begins heartbeat / discovery loops.
+1. Install the framework and write `config.yml` with `networking.enabled: true` and an empty `peers: []`.
+2. Run the application once. Identity is loaded or generated into `keys_dir` (default `keys/`) and the fingerprint plus cert PEM are logged at INFO. An empty `peers:` list does not error — the node just waits for peers — so you can grab the fingerprint and cert from the logs to populate the OTHER nodes.
+3. Copy the `sha256:...` fingerprint and the cert PEM block from the log. The same data can be re-read with the networking CLI fingerprint helper.
+4. Exchange fingerprints and cert PEMs between nodes out of band. Each node's `peers:` block needs at least one entry per other node it wants to reach, with that peer's `hostname`, `address`, `cert_file` or `cert_pem`, and optionally `fingerprint`.
+5. Start each node again. With `peers:` populated, each node builds its SSL contexts, binds the listener, seeds its peers, and starts the heartbeat pulse.
 
-### Adding a new node to an existing cluster
+### Getting this node's fingerprint on first start
 
-Same procedure as above for the new node only. On the existing nodes, append a peer entry pointing at the new node and restart them (or hot-reload config if the application supports it).
-
-### Why the cert is generated even on a failed first boot
-
-The empty-peers check is the right place to fail — without peers the mTLS trust store is empty, and OpenSSL would otherwise reject every connection with an opaque error. But the operator needs the cert and fingerprint to populate `peers:` on other nodes. Loading or generating identity FIRST makes the failed first boot productive: the operator gets a clear error AND the data they need to fix it.
-
-The fingerprint and cert PEM are logged at INFO. If the console is configured at WARNING+ they will only appear in the file log — adjust `general.console_log_level` temporarily or read `_logs/` if that is the case.
+Identity is loaded (or generated) at `NetworkManager` construction, before anything is served, so even a node with an empty `peers:` list comes up and logs its fingerprint and cert PEM. That is the data you need to populate `peers:` on the OTHER nodes, so a first start is productive even before this node has any peers of its own. The fingerprint and cert PEM are logged at INFO; if the console is at WARNING+ they appear only in the file log.
 
 ---
 
 ## Operational notes
 
-- Peers connect on demand; the connection pool is sized by `pool_size` (default `5` per `(ip, port)`).
-- Subscribe / unsubscribe events ALWAYS log at INFO regardless of the `verbose_notifier` flag — useful when debugging cross-node subscription state.
-- An empty `peers:` list is a hard error at `start()`. Verify the list is populated before enabling networking.
-- Legacy fields `secret`, `cert_file`, and `key_file` may still appear at the top of `networking:` in older configs; they are silently accepted but ignored after the PR4 K-3 cert-pinning rework. The `node_ips:` field is a hard error.
-- A pin failure on inbound mTLS is logged at DEBUG, not WARNING — a port scanner sweeping the listener would otherwise flood the log and bury real security events.
+- Peers connect over a single long-lived bidirectional link per peer. There is no connection pool; the old `pool_size` knob is retired.
+- Which side dials is decided by lexicographic hostname election (the lex-lower hostname dials); the lex-higher side is a pure acceptor. A per-edge `dial:` override lets a NAT'd side dial as a fallback while no link exists. A brief double-connect is resolved by a deterministic survivor plus a flap-guard probation, so a reconnect race does not thrash.
+- Subscribe / unsubscribe events log at INFO regardless of `verbose_notifier` — useful when debugging cross-node subscription state.
+- Legacy fields `secret` / `cert_file` / `key_file` at the top of `networking:` are accepted but ignored. The `node_ips:` field is a hard error.
+- A pin failure on inbound mTLS is logged at INFO, not WARNING — a port scanner sweeping the listener would otherwise bury real security events.
+- All networking knobs are read once at `NetworkManager` construction. A config change to a timing / discovery / timeout / cap knob alone is adopted on the next rebuild (triggered by a change to `peers` / `port` / `enabled` / `hostname` / `keys_dir`) or on a full restart, not live mid-run.

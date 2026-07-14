@@ -1,0 +1,71 @@
+description: Wave-2 runtime-membership control — add_peer/remove_peer/snapshot + runtime sub add/remove + config-reload trigger, for the networking-rewrite socket cells
+version: 0.1.1
+remote: True
+arguments:
+subscriptions:
+endpoints:
+  ctl_add_peer:
+    internal_name: ctl_add_peer
+    tags:
+      - netctl
+    remote: True
+    accessible_by_other_plugins: True
+    description: Forward a peer spec to NM.add_peer (runtime add / operator re-add)
+    arguments:
+      - name: spec
+
+  ctl_remove_peer:
+    internal_name: ctl_remove_peer
+    tags:
+      - netctl
+    remote: True
+    accessible_by_other_plugins: True
+    description: Forward to NM.remove_peer(hostname) (revoke)
+    arguments:
+      - name: hostname
+
+  ctl_snapshot:
+    internal_name: ctl_snapshot
+    tags:
+      - netctl
+    remote: True
+    accessible_by_other_plugins: True
+    description: NM.snapshot() verbatim (immediate read-back after a mutation)
+    arguments:
+
+  ctl_sub_add:
+    internal_name: ctl_sub_add
+    tags:
+      - netctl
+    remote: True
+    accessible_by_other_plugins: True
+    description: Add a runtime subscription (fan-out count / sub toggle / author-filter), keyed by a label
+    arguments:
+      - name: label
+      - name: topic
+      - name: target_access_name
+      - name: target_plugin
+      - name: authors
+      - name: blocked_authors
+      - name: hosts
+      - name: enabled
+
+  ctl_sub_remove:
+    internal_name: ctl_sub_remove
+    tags:
+      - netctl
+    remote: True
+    accessible_by_other_plugins: True
+    description: Remove a runtime subscription by label (or raw sid)
+    arguments:
+      - name: label
+
+  ctl_reload_config:
+    internal_name: ctl_reload_config
+    tags:
+      - netctl
+    remote: True
+    accessible_by_other_plugins: True
+    description: Trigger a hot config reload (rebuild-trigger key change) via core async_load_config_yaml
+    arguments:
+      - name: config_path

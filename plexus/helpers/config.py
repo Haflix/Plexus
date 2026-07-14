@@ -322,13 +322,15 @@ def apply_overrides(
 
     Walks `overrides_block`'s top-level keys:
 
-      * Known SECTION (``arguments``, ``endpoints``) — deep-merged against
+      * Known SECTION (``arguments``, ``endpoints``, ``events``,
+        ``subscriptions`` — see ``_OVERRIDE_SECTIONS``) — deep-merged against
         plugin_config[section] via ``_deep_merge_args``. For STRICT sections
         (currently ``endpoints``), unknown subkeys (entries not present in
         the base plugin_config[section]) are a fail-load ERROR per Q2.
         For other sections, unknown subkeys are added per existing
         ``_deep_merge_args`` behavior (lenient, Q14).
-      * Known PLUGIN-LEVEL FIELD (``description``, ``remote``, ``version``)
+      * Known PLUGIN-LEVEL FIELD (``description``, ``remote``, ``version``,
+        ``prefix``, ``verbose_notifier`` — see ``_PLUGIN_LEVEL_OVERRIDE_FIELDS``)
         — value-replaces plugin_config[field] outright.
       * Anything else at the top level — WARN and ignore (Q22).
 

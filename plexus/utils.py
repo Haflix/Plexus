@@ -1253,17 +1253,14 @@ class ConfigUtil:
         # no NetworkManager attribute is populated from them and the
         # shared-secret deprecation warning is gone — there is no
         # shared-secret auth anywhere in the framework anymore.
-        plexus.networking_pool_size = networking_config.get("pool_size", 5)
-
-        # Heartbeat / lookup / liveness intervals (B-069 fix). Default
-        # values come from the DEFAULT_HEARTBEAT_INTERVAL /
-        # DEFAULT_LOOKUP_INTERVAL / DEFAULT_LIVENESS_TIMEOUT module
-        # constants in networking.py. Bad values fall back to default
-        # with a warning so a typo can never silently zero an interval
-        # and starve the heartbeat / discovery loops.
+        # Heartbeat / liveness intervals (B-069 fix). Default values come from the
+        # DEFAULT_HEARTBEAT_INTERVAL / DEFAULT_LIVENESS_TIMEOUT module constants in
+        # networking.py. Bad values fall back to default with a warning so a typo
+        # can never silently zero an interval and starve the heartbeat loop.
+        # (`pool_size` / `lookup_interval` retired with the netcore rewrite — the
+        # connection pool + node-lookup loop no longer exist.)
         from .networking import (  # local import — avoids circular import at module load
             DEFAULT_HEARTBEAT_INTERVAL,
-            DEFAULT_LOOKUP_INTERVAL,
             DEFAULT_LIVENESS_TIMEOUT,
         )
 
@@ -1282,20 +1279,6 @@ class ConfigUtil:
             )
             heartbeat_interval = DEFAULT_HEARTBEAT_INTERVAL
         plexus.networking_heartbeat_interval = heartbeat_interval
-
-        raw_lookup = networking_config.get("lookup_interval", DEFAULT_LOOKUP_INTERVAL)
-        try:
-            lookup_interval = float(raw_lookup)
-            if lookup_interval <= 0:
-                raise ValueError("must be > 0")
-        except (TypeError, ValueError):
-            plexus._logger.warning(
-                "Invalid networking.lookup_interval=%r; defaulting to %.1f",
-                raw_lookup,
-                DEFAULT_LOOKUP_INTERVAL,
-            )
-            lookup_interval = DEFAULT_LOOKUP_INTERVAL
-        plexus.networking_lookup_interval = lookup_interval
 
         raw_liveness = networking_config.get(
             "liveness_timeout", DEFAULT_LIVENESS_TIMEOUT
@@ -2113,10 +2096,10 @@ class Plugin(ABC):
 
         Wraps ``Plexus.set_subscription_enabled``. Returns True when
         ``sub_uuid`` is found (covers both "toggled" and "no-op already
-        at target value"); False on unknown sub_uuid. On True
-        transition, an add-delta is broadcast to peers; on False
-        transition, a remove-delta. Broadcast failures are logged at
-        DEBUG and not propagated.
+        at target value"); False on unknown sub_uuid. There is no per-toggle
+        push to peers (netcore is pull-based): the flag change alters what
+        this node exports in its content-hash directory snapshot, and peers
+        converge on their next heartbeat pull.
         """
         return await self._plexus.set_subscription_enabled(sub_uuid, enabled)
 
@@ -2392,7 +2375,10 @@ class Request:
         # and the return — a torn-read window. The local is the value
         # this caller actually waited for.
         if error:
-            raise RequestException(f"Request failed: {result}")
+            # Preserve a RequestException SUBTYPE (RateLimit/Capability/etc.) by
+            # re-raising the OBJECT so a sync caller can `except` it by type, matching
+            # the async path; wrap a string/other result as the canonical type.
+            raise result if isinstance(result, RequestException) else RequestException(f"Request failed: {result}")
         return result
 
     async def wait_for_result_async(self) -> Tuple[Any, bool, bool]:

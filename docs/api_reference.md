@@ -1,6 +1,6 @@
 # API Reference
 
-*Last updated for Plexus 0.66.0*
+*Last updated for Plexus 0.74.0*
 
 Reference manual for the public surface of `Plugin` (in `plexus.utils`) — the methods and attributes a plugin author calls from inside their own class. Methods on `Plexus` itself are covered at the end for tooling and harness authors.
 
@@ -182,7 +182,7 @@ Sync equivalent. Pre-start guard included.
 
 1:1 ask. Returns the FIRST matching handler's result, where matching order is the insertion order in the topic registry (YAML declaration order plus runtime registrations as they happen).
 
-Local subs are tried first, in insertion order. On no local match, remote candidates are tried in advert-insertion order. Remote candidates that fail with `NoLocalSubException` (peer says "no local sub matched") or `NetworkRequestException` (transport-level failure) are SKIPPED, and the next candidate is tried. A generic `RequestException` from the handler itself PROPAGATES — fall-through stops the moment a handler runs and either returns or raises non-network errors.
+Local subs are tried first, in insertion order. On no local match, remote candidates are tried in hostname-lexicographic order (netcore pulls each peer's exported subs on the heartbeat; there is no advert-insertion order). Remote candidates that fail with `NoLocalSubException` (peer says "no local sub matched") or `NetworkRequestException` (transport-level failure) are SKIPPED, and the next candidate is tried. A generic `RequestException` from the handler itself PROPAGATES — fall-through stops the moment a handler runs and either returns or raises non-network errors.
 
 | Argument | Type | Default | Notes |
 |---|---|---|---|
@@ -275,11 +275,11 @@ Sync equivalents that bridge to the event loop via `run_coroutine_threadsafe`.
 
 ## Runtime sub/event enable-toggle
 
-Flip the `enabled` flag on an existing subscription or event without unsubscribing / re-declaring it. The registry keeps the entry; matching just skips it while disabled. Idempotent — a no-op call (already at target value) returns `True` without broadcasting or emitting.
+Flip the `enabled` flag on an existing subscription or event without unsubscribing / re-declaring it. The registry keeps the entry; matching just skips it while disabled. Idempotent — a no-op call (already at target value) returns `True` without emitting.
 
 ### `await self.set_subscription_enabled(sub_uuid, enabled) -> bool`
 
-Toggle one of this plugin's runtime subscriptions. Returns `True` when `sub_uuid` is in the registry (covers toggled + no-op), `False` on unknown uuid. On a True transition, the framework broadcasts an add-delta to peers (peer starts advertising the sub); on False, a remove-delta. Broadcast failures are logged at DEBUG and do not propagate.
+Toggle one of this plugin's runtime subscriptions. Returns `True` when `sub_uuid` is in the registry (covers toggled + no-op), `False` on unknown uuid. There is no delta broadcast to peers: toggling the flag changes what this node exports in its directory snapshot, hence its content hash, so peers pick the change up when they pull the directory on their next heartbeat.
 
 After mutation, the framework emits `_core/subscription/state_changed` (only on actual change) so TUI and other observers can react.
 
@@ -289,7 +289,7 @@ Sync variant — bridges via `run_coroutine_threadsafe`.
 
 ### `await self.set_event_enabled(event_id, enabled) -> bool`
 
-Toggle one of this plugin's declared events. Returns `True` when the `event_id` exists on this plugin (covers toggled + no-op), `False` if not declared. Local-only — events are not advertised to peers (publishers don't advertise; only subscribers do).
+Toggle one of this plugin's declared events. Returns `True` when the `event_id` exists on this plugin (covers toggled + no-op), `False` if not declared. Local-only — publishers are not exported in the directory (only subscriptions and remote endpoints are), so this never affects peers.
 
 For cross-plugin toggling (rare), call `self._plexus.set_event_enabled(other_plugin_name, event_id, enabled)` directly.
 

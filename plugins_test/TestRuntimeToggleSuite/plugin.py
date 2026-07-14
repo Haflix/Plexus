@@ -370,6 +370,11 @@ class TestRuntimeToggleSuite(Plugin):
                 await self._drop_runtime_sub(uuid)
 
         async def body_emit_after_broadcast(c):
+            c.skip("nm.broadcast_local_sub_removed push-hook is DELETED by the netcore "
+                   "rewrite — a runtime sub enable/disable now propagates via the pull/hash "
+                   "SLA (the toggle flips the export filter -> content_hash changes -> the "
+                   "peer refetches within a heartbeat), covered by the directory export-"
+                   "filter self-test (disable-changes-hash) + wave-2 TP-34")
             """Test #54 (tightened after review): the emit must
             fire AFTER the broadcast call has returned. The original
             assertion only compared timestamps against the call window,

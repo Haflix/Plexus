@@ -217,7 +217,7 @@ class Plexus(EventMixin):
         self.tasks_completed_total: int = 0
 
         # Strong-ref pool for short fire-and-forget tasks (per-peer
-        # publish dereg, NM accounting cleanup, advert acks). Separate
+        # publish dereg, NM accounting cleanup). Separate
         # from task_list — these are best-effort cleanup work that
         # races shutdown and is NOT covered by the 30s in-flight
         # drain. See _spawn_fire_and_forget for the contract.
@@ -704,7 +704,7 @@ class Plexus(EventMixin):
         self.task_list.clear()
 
         # 1b. Tail-drain fire-and-forget tasks (per-peer publish
-        # dereg, advert acks, etc.). Separate pool from task_list —
+        # dereg, etc.). Separate pool from task_list —
         # short cleanup work spawned by done-callbacks AFTER the
         # task_list snapshot above. 5s budget then cancel; these are
         # best-effort and the NM is going away anyway.
@@ -1172,16 +1172,16 @@ class Plexus(EventMixin):
           Request object → no ``_is_remote`` stamp + no
           ``self.requests`` registration). Caller may see
           ``ConnectionResetError`` mid-rebuild; retry on caller side.
-        * Drain races against ``_drop_peer_advert_state`` cleanup —
-          if a peer disconnect fires concurrent with rebuild, drain
-          may miss tasks already cancelled by disconnect. Same
-          retry-on-caller acceptable.
-        * ``peer_stats`` counters reset (fresh NM = fresh dict).
-          Per O7 acceptable.
+        * Drain races against peer-link teardown — if a peer disconnect
+          fires concurrent with rebuild, drain may miss tasks already
+          cancelled by the teardown. Same retry-on-caller acceptable.
+        * Per-peer liveness / directory state resets (a fresh NM has a
+          fresh membership + directory; peers re-pull on the next
+          heartbeat). Per O7 acceptable.
         * Surviving tasks past the 10s drain timeout get cancelled
-          silently by ``old_nm.stop()`` via
-          ``_drop_peer_advert_state``. The drain warning fires first;
-          no second log when stop() does the cancellation.
+          silently by ``old_nm.stop()`` (which tears down membership +
+          transport). The drain warning fires first; no second log when
+          stop() does the cancellation.
         """
         # R4-UU-1: refuse to rebuild after close(). Without this, a
         # reload coroutine that was waiting on _network_rebuild_lock
@@ -1490,141 +1490,21 @@ class Plexus(EventMixin):
             )
 
     def _update_networking_in_place(self, yaml_config: dict) -> None:
-        """Update non-rebuild networking fields on the live NM in
-        place. Called from the rebuild orchestrator's else-branch
-        when ``_networking_config_changed`` returned False.
+        """Non-rebuild networking-config branch. Called from the rebuild
+        orchestrator's else-branch when ``_networking_config_changed`` returned
+        False.
 
-        Fields updated:
-
-        * ``heartbeat_interval`` / ``lookup_interval`` /
-          ``liveness_timeout`` — live effect: heartbeat / discovery /
-          liveness loops use the new value on next tick.
-        * ``discover_nodes`` — toggle live; lookup_loop checks attr
-          each tick.
-        * ``direct_discoverable`` / ``auto_discoverable`` — read by
-          the INFO handler; next inbound INFO observes new value.
-        * ``pool_size`` — best-effort: only affects pools created
-          AFTER this call. Existing pools keep their construction-
-          time ``maxsize``.
-        * ``connect_timeout`` / ``request_timeout`` /
-          ``inbound_idle_timeout`` — live effect: read fresh at each
-          use site, so the new value applies immediately (coerced via
-          ``_safe_float``, mirroring the timing knobs).
-        * ``max_outbound_connections`` — attr synced (coerced via
-          ``_safe_int``) but RESTART-ONLY in effect: the outbound
-          semaphore is minted once and ``asyncio.Semaphore`` has no
-          live resize, so the live cap changes only on a full rebuild.
-
-        (C-029 + C-030: ``secret`` / ``cert_file`` / ``key_file`` were
-        listed here as legacy attr-update fields; both the attrs and
-        this block have been removed. mTLS identity comes from
-        ``self.cert_path`` / ``self.key_path`` on disk; runtime
-        rotation requires a full rebuild.)
-
-        NO rebuild needed because these don't change wire identity
-        or server bind state. No-op when ``self.network`` is None
-        (networking disabled or boot incomplete).
+        A deliberate NO-OP. The netcore ``NetworkManager`` reads its config ONCE, at
+        construction, from its ``networking_config`` dict and never re-reads it at
+        runtime — so a non-rebuild config change has nothing to apply in place. Such
+        a change (a non-trigger knob: heartbeat / probe / liveness / discovery / the
+        timeout + cap knobs) is adopted on the next full rebuild (a peers / port /
+        enabled / hostname / keys_dir change) or on restart, NOT live. This method is
+        kept as the explicit reload-path seam but does nothing; the previous inert
+        ``nm.<attr>`` writes (which netcore's tolerant ``__setattr__`` swallowed
+        anyway) were removed in the Theme 3/4 cleanup.
         """
-        nm = self.network
-        if nm is None:
-            return
-
-        nw_cfg = yaml_config.get("networking") or {}
-        if not isinstance(nw_cfg, dict):
-            return
-
-        from .networking import (
-            DEFAULT_HEARTBEAT_INTERVAL as _DEF_HB,
-            DEFAULT_LOOKUP_INTERVAL as _DEF_LOOK,
-            DEFAULT_LIVENESS_TIMEOUT as _DEF_LIVE,
-            DEFAULT_RESYNC_INTERVAL as _DEF_RESYNC,
-            DEFAULT_CONNECT_TIMEOUT as _DEF_CONNECT,
-            DEFAULT_INBOUND_IDLE_TIMEOUT as _DEF_INBOUND,
-            DEFAULT_REQUEST_TIMEOUT as _DEF_REQUEST,
-            DEFAULT_MAX_OUTBOUND_CONNECTIONS as _DEF_MAXOUT,
-        )
-
-        def _safe_float(val, default):
-            try:
-                f = float(val)
-                return f if f > 0 else default
-            except (TypeError, ValueError):
-                return default
-
-        # HUNT-145: pool_size is an int (Queue maxsize / drain-loop bound), so
-        # it needs an int sibling to _safe_float. Same fail-silent contract:
-        # coerce, reject <=0 / bad type -> default. (NetworkManager.pool_size
-        # additionally clamps on assignment; this applies the default-5 config
-        # semantics consistently with the timing knobs above.)
-        def _safe_int(val, default):
-            try:
-                i = int(val)
-                return i if i > 0 else default
-            except (TypeError, ValueError):
-                return default
-
-        nm.heartbeat_interval = _safe_float(
-            nw_cfg.get("heartbeat_interval", _DEF_HB), _DEF_HB
-        )
-        nm.lookup_interval = _safe_float(
-            nw_cfg.get("lookup_interval", _DEF_LOOK), _DEF_LOOK
-        )
-        nm.liveness_timeout = _safe_float(
-            nw_cfg.get("liveness_timeout", _DEF_LIVE), _DEF_LIVE
-        )
-        # R2-LL-5: ``probe_timeout`` follows the same in-place update
-        # contract as the surrounding knobs — next heartbeat tick adopts
-        # the new value (via the snapshot at tick start). Absent or
-        # invalid → default to ``min(heartbeat_interval,
-        # liveness_timeout)`` so the heartbeat loop never blocks longer
-        # than its own cadence on a single probe.
-        raw_probe = nw_cfg.get("probe_timeout", None)
-        if raw_probe is None:
-            nm.probe_timeout = min(nm.heartbeat_interval, nm.liveness_timeout)
-        else:
-            nm.probe_timeout = _safe_float(
-                raw_probe, min(nm.heartbeat_interval, nm.liveness_timeout)
-            )
-        # C-109: resync_interval updates in place — next heartbeat tick
-        # picks up the new value via the time-comparison check.
-        nm.resync_interval = _safe_float(
-            nw_cfg.get("resync_interval", _DEF_RESYNC), _DEF_RESYNC
-        )
-        nm.discover_nodes = nw_cfg.get("discover_nodes", False)
-        nm.direct_discoverable = nw_cfg.get("direct_discoverable", False)
-        nm.auto_discoverable = nw_cfg.get("auto_discoverable", False)
-        if nm.auto_discoverable and not nm.direct_discoverable:
-            nm.direct_discoverable = True
-        nm.pool_size = _safe_int(nw_cfg.get("pool_size", 5), 5)
-        # HUNT-108/110/111/142 (R2/R6): the bounded-await timeouts are read
-        # fresh on each use, so updating them here makes them live on hot-reload
-        # (coerced fail-silent, same as the timing knobs above).
-        nm.connect_timeout = _safe_float(
-            nw_cfg.get("connect_timeout", _DEF_CONNECT), _DEF_CONNECT
-        )
-        nm.request_timeout = _safe_float(
-            nw_cfg.get("request_timeout", _DEF_REQUEST), _DEF_REQUEST
-        )
-        nm.inbound_idle_timeout = max(
-            _safe_float(nw_cfg.get("inbound_idle_timeout", _DEF_INBOUND), _DEF_INBOUND),
-            3.0 * nm.heartbeat_interval,
-        )
-        # HUNT-109: update the cap value, but the outbound semaphore is minted
-        # once (lazily) and asyncio.Semaphore has no live resize, so this new
-        # value only takes effect on a full NM rebuild/restart — the attr is
-        # kept in sync for correctness/observability but the live cap does not
-        # change here (documented restart-only).
-        nm._max_outbound_connections = _safe_int(
-            nw_cfg.get("max_outbound_connections", _DEF_MAXOUT), _DEF_MAXOUT
-        )
-        # C-029 + C-030 + C-143: legacy `secret` / `cert_file` /
-        # `key_file` in-place writes removed alongside the attrs
-        # themselves (the previous block silently wiped them to None
-        # if absent from the new config — see C-143). mTLS identity
-        # is loaded from disk at NM construction via
-        # `_load_or_generate_identity`; runtime rotation requires a
-        # full rebuild triggered by a `keys_dir` change in
-        # `_networking_config_changed`.
+        return
 
     def _build_network_manager(self, yaml_config: dict) -> NetworkManager:
         """Construct a fresh NetworkManager from a yaml_config dict.
@@ -1637,138 +1517,54 @@ class Plexus(EventMixin):
           2. If construct raises → no state mutation, abort cleanly
           3. _apply_yaml(new_yaml) — only after construction succeeds
 
-        Field source-of-truth (must NOT read
-        ``self.networking_*``):
-
-        * ``port`` / ``auto_discoverable`` / ``direct_discoverable`` —
-          read from ``yaml_config["networking"]``. ``apply_configvalues``
-          writes these back to the dict in place after parsing
-          (utils.py:1056-1092), so post-apply or fresh-parse gives
-          identical values.
-        * ``heartbeat_interval`` / ``lookup_interval`` /
-          ``liveness_timeout`` / ``connect_timeout`` /
-          ``inbound_idle_timeout`` / ``request_timeout`` — read from
-          yaml_config and parsed via ``_safe_float`` (matches
-          ``apply_configvalues``' parsing with identical ``<= 0``
-          rejection boundary, utils.py:1124-1166).
-        * ``pool_size`` / ``max_outbound_connections`` — read from
-          yaml_config and parsed via ``_safe_int`` (int sibling of
-          ``_safe_float``; ``<= 0`` / bad-type → default). ``pool_size``
-          is additionally clamped by the ``NetworkManager.pool_size``
-          property setter.
-        * ``secret`` / ``cert_file`` / ``key_file`` — read raw from
-          yaml_config. ``apply_configvalues`` currently passes these
-          through unchanged (utils.py:1098-1101), so behavior matches
-          the inline construction sites' ``getattr(self,
-          "networking_*")`` path.
-
-        ASSUMPTION: any future change to ``apply_configvalues`` that
-        transforms ``secret`` / ``cert_file`` / ``key_file`` /
-        ``pool_size`` MUST either mirror that transformation here too,
-        or move the storage to a write-back-into-yaml_config style so
-        this helper continues to read the resolved value.
-
-        Mirrors the auto/direct_discoverable forcing rule from
-        ``ConfigUtil.apply_configvalues`` (auto=True → direct=True).
-        All numeric fields fall back to defaults on bad-type input,
-        matching ``apply_configvalues``' defensive parsing.
+        The netcore ``NetworkManager`` reads ALL of its config by canonical key
+        from the ``networking_config`` dict it is handed — its ctor signature
+        routes every other kwarg to an ignored ``**_legacy`` sink. So this builder
+        passes the raw ``networking`` section as ``networking_config`` and does
+        only the legacy→canonical translation netcore does not know about
+        (``auto_discoverable``/``direct_discoverable`` → ``discoverable``;
+        ``inbound_idle_timeout`` → ``idle_read_deadline``; ``request_timeout`` →
+        ``stream_idle_deadline``), injected into a COPY so the shared live yaml is
+        not polluted with derived keys. Every timing/cap knob (heartbeat, probe,
+        liveness, idle_read, reassembly caps, the per-peer/stream/connect knobs,
+        discoverable, voucher cap) is read + bad-value-guarded by the netcore ctor
+        from that dict. Mirrors the auto→direct forcing rule from
+        ``apply_configvalues`` (auto=True → direct=True).
         """
         from pathlib import Path as _Path
-        from .networking import (
-            DEFAULT_HEARTBEAT_INTERVAL as _DEF_HB,
-            DEFAULT_LOOKUP_INTERVAL as _DEF_LOOK,
-            DEFAULT_LIVENESS_TIMEOUT as _DEF_LIVE,
-            DEFAULT_RESYNC_INTERVAL as _DEF_RESYNC,
-            DEFAULT_CONNECT_TIMEOUT as _DEF_CONNECT,
-            DEFAULT_INBOUND_IDLE_TIMEOUT as _DEF_INBOUND,
-            DEFAULT_REQUEST_TIMEOUT as _DEF_REQUEST,
-            DEFAULT_MAX_OUTBOUND_CONNECTIONS as _DEF_MAXOUT,
-        )
 
         nw_cfg = yaml_config.get("networking") or {}
-
-        def _safe_float(val, default):
-            try:
-                f = float(val)
-                return f if f > 0 else default
-            except (TypeError, ValueError):
-                return default
-
-        # HUNT-070: int sibling to _safe_float for pool_size (Queue maxsize /
-        # drain-loop bound). Same fail-silent contract; NetworkManager.pool_size
-        # also clamps on assignment.
-        def _safe_int(val, default):
-            try:
-                i = int(val)
-                return i if i > 0 else default
-            except (TypeError, ValueError):
-                return default
 
         auto_disc = nw_cfg.get("auto_discoverable", False)
         direct_disc = nw_cfg.get("direct_discoverable", False)
         if auto_disc and not direct_disc:
             direct_disc = True
 
+        # Legacy -> canonical translation for netcore, which reads config ONLY by
+        # its canonical keys from the networking_config dict. Inject into a COPY so
+        # the shared live yaml (self.yaml_config on the boot path) is never polluted
+        # with derived keys. An explicit canonical key the operator set always wins.
+        #   discoverable            <- auto_discoverable / direct_discoverable (§4.7)
+        #   idle_read_deadline      <- inbound_idle_timeout (legacy alias)
+        #   stream_idle_deadline    <- request_timeout (legacy alias)
+        nw_cfg = dict(nw_cfg)
+        if "discoverable" not in nw_cfg:
+            nw_cfg["discoverable"] = bool(auto_disc or direct_disc)
+        if "idle_read_deadline" not in nw_cfg and "inbound_idle_timeout" in nw_cfg:
+            nw_cfg["idle_read_deadline"] = nw_cfg["inbound_idle_timeout"]
+        if "stream_idle_deadline" not in nw_cfg and "request_timeout" in nw_cfg:
+            nw_cfg["stream_idle_deadline"] = nw_cfg["request_timeout"]
+
         cfg_dir = _Path(self.config_path).parent
 
+        # netcore reads every knob from ``networking_config`` by canonical key; any
+        # other kwarg lands in its ignored ``**_legacy`` sink. So pass ONLY the
+        # (legacy→canonical-translated) config dict + the config dir.
         return NetworkManager(
             self,
             self._logger.getChild("networking"),
-            node_ips=nw_cfg.get("node_ips", []),
-            discover_nodes=nw_cfg.get("discover_nodes", False),
-            direct_discoverable=direct_disc,
-            auto_discoverable=auto_disc,
-            port=nw_cfg.get("port", 2510),
-            # C-029 + C-030: legacy secret / cert_file / key_file kwargs
-            # removed. mTLS auth derives identity from the `peers:`
-            # schema; `cert_file`/`key_file` in nw_cfg are now ignored
-            # silently. Future enhancement: warn at config-load time if
-            # legacy keys are present (operator hint).
-            pool_size=_safe_int(nw_cfg.get("pool_size", 5), 5),
-            # HUNT-108/109/110/111/142 (R6): coerce the bounded-await + cap
-            # knobs at the config boundary, same fail-silent contract as the
-            # timing knobs, so a bad value defaults instead of crashing NM
-            # construction. inbound_idle_timeout is floored 3x heartbeat inside
-            # NetworkManager.__init__.
-            connect_timeout=_safe_float(
-                nw_cfg.get("connect_timeout", _DEF_CONNECT), _DEF_CONNECT
-            ),
-            inbound_idle_timeout=_safe_float(
-                nw_cfg.get("inbound_idle_timeout", _DEF_INBOUND), _DEF_INBOUND
-            ),
-            request_timeout=_safe_float(
-                nw_cfg.get("request_timeout", _DEF_REQUEST), _DEF_REQUEST
-            ),
-            max_outbound_connections=_safe_int(
-                nw_cfg.get("max_outbound_connections", _DEF_MAXOUT), _DEF_MAXOUT
-            ),
             networking_config=nw_cfg,
             config_dir=cfg_dir,
-            heartbeat_interval=_safe_float(
-                nw_cfg.get("heartbeat_interval", _DEF_HB), _DEF_HB
-            ),
-            lookup_interval=_safe_float(
-                nw_cfg.get("lookup_interval", _DEF_LOOK), _DEF_LOOK
-            ),
-            liveness_timeout=_safe_float(
-                nw_cfg.get("liveness_timeout", _DEF_LIVE), _DEF_LIVE
-            ),
-            # C-109: periodic full-snapshot resync interval (5min default).
-            # 0 disables the resync sweep entirely (tests can opt out).
-            resync_interval=_safe_float(
-                nw_cfg.get("resync_interval", _DEF_RESYNC), _DEF_RESYNC
-            ),
-            # R2-LL-5: per-probe heartbeat budget. ``None`` (the default)
-            # lets the NM constructor compute ``min(heartbeat_interval,
-            # liveness_timeout)``; operators can pin a tighter value via
-            # ``networking.probe_timeout`` in config.yml. Bad-type input
-            # falls through to ``None`` so the constructor's default
-            # math still applies.
-            probe_timeout=(
-                _safe_float(nw_cfg["probe_timeout"], None)
-                if isinstance(nw_cfg.get("probe_timeout"), (int, float, str))
-                else None
-            ),
         )
 
     def _normalize_networking_for_diff(self, yaml_dict: dict) -> dict:
@@ -1785,15 +1581,16 @@ class Plexus(EventMixin):
         * ``networking.enabled`` / ``networking.port`` /
           ``networking.auto_discoverable`` /
           ``networking.direct_discoverable`` — written back by
-          ``apply_configvalues`` (utils.py:1056-1092). Defaults match
-          ``apply_configvalues``'.
-        * ``networking.keys_dir`` — read by ``NetworkManager.__init__``
-          with default ``"_keys"`` (networking.py:176). Not written back
-          by ``apply_configvalues`` but a rebuild trigger, so an
-          implicit ``"_keys"`` candidate must compare equal to an
-          explicit ``"_keys"`` live yaml.
+          ``apply_configvalues``. Defaults match ``apply_configvalues``'.
+        * ``networking.keys_dir`` — a rebuild trigger, not written back by
+          ``apply_configvalues``. This diff normalizer fills a ``"_keys"``
+          default so an implicit candidate compares equal to an explicit
+          ``"_keys"`` live yaml (self-consistent old-vs-new). NOTE: the
+          netcore NM's actual runtime default is ``"keys"``
+          (``manager._resolve_keys_dir``); the normalizer's ``"_keys"``
+          never locates keys, so this cosmetic divergence is harmless.
         * ``general.hostname`` — written back by ``apply_configvalues``
-          with ``socket.gethostname()`` fallback (utils.py:970-973).
+          with ``socket.gethostname()`` fallback.
           Also a rebuild trigger (lives under ``general``, not
           ``networking``).
         * Auto-forces-direct rule mirrored (auto=True → direct=True)
@@ -1861,13 +1658,12 @@ class Plexus(EventMixin):
         short-circuits with no validation — nothing to validate when
         the rebuild target is "stop networking".
 
-        Empty-peers-when-enabled is NOT caught here — it propagates to
-        the construction-failure path in Step 7 (``NetworkManager.start()``
-        already raises with an actionable message at networking.py:1072+
-        when peers is empty). The pre-validation gate covers per-peer
-        parse / fingerprint / endpoint-uniqueness errors that would
-        otherwise tear down the live network just to surface a config
-        typo.
+        Empty-peers-when-enabled is NOT caught here, and netcore TOLERATES
+        it: the NM binds an empty-cadata acceptor and simply has no peers
+        to talk to until one is added (via config or a vouch) — it does not
+        raise. The pre-validation gate covers per-peer parse / fingerprint /
+        endpoint-uniqueness errors that would otherwise tear down the live
+        network just to surface a config typo.
         """
         nw_cfg = yaml_config.get("networking") or {}
         if not isinstance(nw_cfg, dict):
@@ -1905,34 +1701,32 @@ class Plexus(EventMixin):
         (where ``apply_configvalues`` has written resolved defaults
         back in place).
 
-        Hostname has TWO source paths:
+        Hostname sourcing (netcore):
 
-        * ``networking.hostname`` — read by ``NetworkManager.__init__``
-          at networking.py:175 for ``self.hostname`` (the value the
-          network layer uses on the wire).
-        * ``general.hostname`` — read by ``apply_configvalues`` at
-          utils.py:970-973 for ``plexus.hostname`` (the value the
-          framework uses for topic-dispatch / sub author-id / etc.).
-
-        ``apply_configvalues`` writes ONLY to ``general.hostname``
-        (with ``socket.gethostname()`` fallback when absent/empty); it
-        does NOT write to ``networking.hostname``. ``NetworkManager``
-        falls back to ``socket.gethostname()`` independently for its
-        own ``self.hostname`` if ``networking.hostname`` is absent.
+        * ``general.hostname`` — read by ``apply_configvalues`` into
+          ``plexus.hostname`` (the value the framework uses for topic-
+          dispatch / sub author-id / etc.), with a ``socket.gethostname()``
+          fallback when absent/empty. The netcore ``NetworkManager`` takes
+          ITS wire hostname from ``core.hostname`` — i.e. this same value.
+        * ``networking.hostname`` — retained as a rebuild-trigger field for
+          back-compat, but the netcore NM no longer reads it (and has no
+          independent ``gethostname`` fallback of its own). The
+          ``general.hostname`` path above is the effective source.
 
         Both source paths must trigger rebuild on change so the live
         ``NetworkManager`` instance picks up a new hostname for either
         purpose. The diff compares both.
 
-        Other networking fields (``heartbeat_interval`` /
-        ``lookup_interval`` / ``liveness_timeout`` / ``pool_size`` /
-        ``discover_nodes`` / ``direct_discoverable`` /
-        ``auto_discoverable``) update the live NetworkManager attrs
-        in place via ``_update_networking_in_place`` (Step 7) — NOT
-        rebuild triggers. (C-029 + C-030: legacy ``secret`` /
-        ``cert_file`` / ``key_file`` removed; mTLS identity is loaded
-        from ``keys_dir`` on disk and rotation needs a full rebuild
-        triggered by the ``keys_dir`` change above.)
+        Other networking fields (``heartbeat_interval`` / ``probe_timeout`` /
+        ``liveness_timeout`` / discovery / the timeout + cap knobs) are NOT
+        rebuild triggers, so a change to only those routes to
+        ``_update_networking_in_place``. NOTE: netcore snapshots its config at
+        construction, so those in-place writes are INERT — such a change is
+        adopted on the next full rebuild (a peers / port / hostname / keys_dir
+        change) or on restart, NOT live. (C-029 + C-030: legacy ``secret`` /
+        ``cert_file`` / ``key_file`` removed; mTLS identity is loaded from
+        ``keys_dir`` on disk and rotation needs a full rebuild triggered by the
+        ``keys_dir`` change above.)
 
         Caller contract: ``old_yaml`` and ``new_yaml`` MUST be non-None
         dicts. The Step 7 orchestrator short-circuits the
@@ -3704,26 +3498,23 @@ class Plexus(EventMixin):
     #   4. topic_registry._lock — internal to TopicRegistry; acquired
     #      inside subscribe / unsubscribe. Re-acquired by
     #      ``unsubscribe_plugin`` during bulk-pop on plugin teardown.
-    #   5. _adverts_struct_lock — internal to NetworkManager; acquired
-    #      by advertise_subs_remote / send_sub_delta_remote / advert-
-    #      ack and timeout scans / _drop_peer_advert_state. Always
-    #      acquired AFTER topic_registry._lock when both are needed
-    #      (the broadcast hooks in Plexus subscribe/unsubscribe paths
-    #      release topic_registry._lock before reaching the NM).
-    #   6. _advert_locks[peer_hostname] — per-peer (per
-    #      NetworkManager); wraps the FULL outbound advert lifecycle
-    #      (build + send) so snapshot vs delta serialise per peer.
-    #      Always acquired INSIDE _adverts_struct_lock when both are
-    #      held simultaneously (the snapshot path does this).
-    #   7. connection_pool entry-lock (implicit via asyncio.Queue
-    #      single-owner ownership). The pool is keyed by (IP, port);
-    #      checkout-then-use-then-return is the serialised primitive.
+    #   5. _adverts_struct_lock — a CORE-OWNED lock on the NetworkManager
+    #      object; guards the ``_inflight_publishes`` per-peer task set so
+    #      the publish_event remote-fanout path (events.py) and the rebuild
+    #      drain (core.py:_drain_for_rebuild) mutate it atomically. Always
+    #      acquired AFTER topic_registry._lock when both are needed (the
+    #      publish path releases topic_registry._lock before reaching the
+    #      NM). NOTE: the netcore rewrite retired the old push-advert
+    #      machinery, so despite its name this lock no longer guards any
+    #      advert snapshot/delta send — only the inflight-publish tracking.
+    #      (There is no per-peer advert-lock tier and no connection-pool
+    #      tier in netcore: one link per peer, no pooled checkout.)
     #
     # Network I/O note: _register_yaml_subscriptions returns the list of
-    # newly-registered sub_uuids without broadcasting them; broadcast
-    # happens AFTER plugin_lock is released (avoiding network I/O while
-    # holding the global dict lock). Same for unregister: broadcast
-    # remove-deltas happen outside plugin_lock too.
+    # newly-registered sub_uuids; netcore does NOT push them to peers (the
+    # old post-lock delta broadcast was removed in the A4 cleanup — a
+    # sub-set change now propagates via this node's PULLED content-hash
+    # directory snapshot). Same for unregister.
     def _get_lifecycle_lock(self, plugin_name: str) -> asyncio.Lock:
         """Return the per-plugin lifecycle lock, creating it on demand.
 
@@ -3819,10 +3610,8 @@ class Plexus(EventMixin):
                 return
             # Register YAML subs FIRST. Disabled subs (Q13 `enabled:
             # false`) ARE registered, but with the Subscription.enabled=
-            # False flag so find_all (and _find_first) skip them. Broadcast of
-            # add-deltas happens AFTER plugin_lock release (below) — see
-            # the Network I/O note in the lock-ordering rule.
-            new_sub_uuids = await self._register_yaml_subscriptions(plugin)
+            # False flag so find_all (and _find_first) skip them.
+            await self._register_yaml_subscriptions(plugin)
             # Transition INACTIVE → ENABLING per Q23 + Q11 so handlers
             # are callable for self-publish-from-on_enable. Rollback to
             # INACTIVE on raise. POSS-W-D1-002 / W-A1-001: state flip
@@ -3838,20 +3627,17 @@ class Plexus(EventMixin):
 
         # plugin_lock RELEASED. lifecycle_lock still held. Emit the
         # deferred state-change now that observers can safely use
-        # async APIs that acquire plugin_lock. The broadcast
-        # loop and on_enable call run together under one cancellation-
-        # aware try/except/finally so a CancelledError mid-flight (which
-        # is a BaseException, NOT Exception, so a plain `except Exception:`
+        # async APIs that acquire plugin_lock. The on_enable call runs under
+        # one cancellation-aware try/except/finally so a CancelledError mid-flight
+        # (which is a BaseException, NOT Exception, so a plain `except Exception:`
         # would skip cleanup) still triggers full rollback.
         self._emit_plugin_state_change(plugin_name, *enable_state_change)
         ok = False
         try:
-            # Broadcast add-deltas to peers OUTSIDE plugin_lock so a
-            # slow/multi-peer broadcast doesn't block other dict ops
-            # cluster-wide. _broadcast_yaml_sub_added is a no-op when
-            # networking is disabled / not ready.
-            for sub_uuid in new_sub_uuids:
-                await self._broadcast_yaml_sub_added(sub_uuid)
+            # (A4 cleanup: the old per-sub instant push-to-peers hook was removed —
+            # netcore propagates local sub adds/removes via the pull-based
+            # content-hash directory snapshot at heartbeat cadence, not an instant
+            # push.)
 
             # C-017: wrap user on_enable in asyncio.wait_for with a
             # configurable timeout (plugin_enable_timeout, default 30s)
@@ -4729,32 +4515,6 @@ class Plexus(EventMixin):
             "declared_subscriptions": list((cfg.get("subscriptions") or {}).keys()),
         }
 
-    async def _broadcast_yaml_sub_added(self, sub_uuid: str) -> None:
-        """Helper used by YAML-registration sites to push add-delta to
-        peers. Wraps the get_subscription + ready-flag check in one place
-        so the YAML loop stays clean."""
-        # Snapshot nm. A mid-block
-        # hot-reload could otherwise leak the broadcast call onto a
-        # stopped NM. Single-call site so the practical race window is
-        # tiny, but snapshotting matches the pattern used by the loop
-        # sites (publish_event / request_event / etc.) for consistency.
-        nm = self.network
-        if not (
-            getattr(self, "networking_enabled", False)
-            and nm is not None
-            and getattr(nm, "is_ready", False)
-        ):
-            return
-        sub = await self.topic_registry.get_subscription(sub_uuid)
-        if sub is None:
-            return
-        try:
-            await nm.broadcast_local_sub_added(sub)
-        except Exception:
-            self._logger.debug(
-                "_broadcast_yaml_sub_added: broadcast failed", exc_info=True
-            )
-
     async def _unregister_plugin_subscriptions(self, plugin: Plugin) -> None:
         """Unregister every sub (YAML + runtime) for ``plugin`` at
         on_disable end (C15). Uses unsubscribe_plugin which removes by
@@ -4765,31 +4525,9 @@ class Plexus(EventMixin):
         # C-153: Plugin.__init__ guarantees plugin_uuid.
         plugin_uuid = plugin.plugin_uuid
         if plugin_uuid:
-            # PR3 Stage C remove-delta loop (locked #18 item 5). Snapshot
-            # subs BEFORE the bulk-unsubscribe, then per-sub broadcast.
-            # Snapshot nm: the per-sub broadcast
-            # loop below would otherwise leak calls onto a stopped NM if
-            # a hot-reload swaps self.network mid-loop.
-            nm = self.network
-            if (
-                getattr(self, "networking_enabled", False)
-                and nm is not None
-                and getattr(nm, "is_ready", False)
-            ):
-                try:
-                    subs_to_remove = await self.topic_registry.get_plugin_subscriptions(
-                        plugin_uuid
-                    )
-                except Exception:
-                    subs_to_remove = []
-                for sub in subs_to_remove:
-                    try:
-                        await nm.broadcast_local_sub_removed(sub)
-                    except Exception:
-                        self._logger.debug(
-                            "_unregister_plugin_subscriptions: broadcast failed",
-                            exc_info=True,
-                        )
+            # (A4 cleanup: the per-sub instant remove-delta push to peers was
+            # removed — netcore propagates sub removals via the pull-based
+            # content-hash directory snapshot at heartbeat cadence.)
             # Rate limiter (Step 3): drop each sub's Sub-IN bucket BEFORE the
             # bulk unsubscribe (sub_uuids are unique, so unremoved buckets would
             # accumulate across resubscribes). No-op when rate limiting is off.
@@ -5006,8 +4744,9 @@ class Plexus(EventMixin):
                 # type) so callers can `except RequestException` to catch
                 # request failures. Previously raised bare Exception
                 # which forced callers to use `except Exception` and
-                # accidentally swallowed unrelated errors too.
-                raise RequestException(f"Request {request.id} failed: {result}")
+                # accidentally swallowed unrelated errors too. Preserve a
+                # RequestException SUBTYPE by re-raising the OBJECT.
+                raise result if isinstance(result, RequestException) else RequestException(f"Request {request.id} failed: {result}")
             yield result
         finally:
             self.requests.pop(request.id, None)
@@ -5027,8 +4766,9 @@ class Plexus(EventMixin):
             result = request.get_result_sync()
             if request.error:
                 # C-055: see request_context_async — same RequestException
-                # canonical type so callers can catch by type.
-                raise RequestException(f"Request {request.id} failed: {result}")
+                # canonical type so callers can catch by type. Preserve a
+                # RequestException SUBTYPE by re-raising the OBJECT.
+                raise result if isinstance(result, RequestException) else RequestException(f"Request {request.id} failed: {result}")
             yield result
         finally:
             self.requests.pop(request.id, None)
@@ -5319,44 +5059,29 @@ class Plexus(EventMixin):
             and nm is not None
             and getattr(nm, "is_ready", False)
         ):
-            for node in nm.nodes:
-                node: Node
-                if node.enabled:
-                    result = await nm.node_get_tagged_endpoints(node.IP, tag)
-                    if result:
-                        for entry in result:
-                            access_name = entry.get("access_name")
-                            plugin_name = entry.get("plugin_name")
-                            plugin_uuid = entry.get("plugin_uuid")
-                            ep = entry.get("endpoint")
-                            # An old node predating the access_name wire field,
-                            # or any malformed entry missing a required field,
-                            # cannot be keyed safely -> skip+warn rather than
-                            # guess (a wrong name would misroute) or KeyError
-                            # (which would abort the whole call, losing every
-                            # result collected so far).
-                            if not access_name or not plugin_name or (
-                                not plugin_uuid
-                            ) or ep is None:
-                                self._logger.warning(
-                                    "[TAG_SEARCH] remote endpoint from %s "
-                                    "missing a required field (old/malformed "
-                                    "node?); skipping",
-                                    entry.get("host") or node.IP,
-                                )
-                                continue
-                            raw.append(
-                                {
-                                    "access_name": access_name,
-                                    "plugin_name": plugin_name,
-                                    "plugin_uuid": plugin_uuid,
-                                    "plugin_version": _ver(
-                                        entry.get("plugin_version", "unknown")
-                                    ),
-                                    "endpoint": dict(ep),
-                                    "host": entry.get("host") or node.IP,
-                                }
-                            )
+            # SPEC §4.5 (c)-seam: collect tagged endpoints from the routing directory's
+            # `route_tagged` cache (reachable+in-roster remote peers, REMOTE only) — the
+            # live wire probe (node_get_tagged_endpoints) is gone. Yields (hostname, entry).
+            for hostname, entry in nm.route_tagged(tag):
+                if not entry.access_name or not entry.plugin_name or not entry.plugin_uuid:
+                    continue
+                ep = {
+                    "remote": entry.remote,
+                    "accessible_by_other_plugins": entry.accessible_by_other_plugins,
+                    "arguments": entry.arguments,
+                    "tags": list(entry.tags),
+                    "description": entry.description,
+                }
+                raw.append(
+                    {
+                        "access_name": entry.access_name,
+                        "plugin_name": entry.plugin_name,
+                        "plugin_uuid": entry.plugin_uuid,
+                        "plugin_version": _ver(entry.plugin_version),
+                        "endpoint": ep,
+                        "host": hostname,
+                    }
+                )
 
         # Merge by (plugin_name, access_name, plugin_version). Local-preferred
         # canonical spec; instances deduped by plugin_uuid; any host equal to
@@ -5568,41 +5293,35 @@ class Plexus(EventMixin):
             and getattr(nm, "is_ready", False)
         ):
 
-            for node in nm.nodes:
-                if not (node.enabled and await node.is_alive(timeout=nm.liveness_timeout)):
+            # SPEC §4.5 (c)-seam: resolve the remote endpoint from the routing directory's
+            # `route_execute` (reachable+in-roster remote peers exporting (plugin, endpoint),
+            # hostname-lex) — the live wire probe (node_has_endpoint) is gone, Node is gone
+            # from the seam. Returns the peer HOSTNAME as the third element. First candidate
+            # wins — execute dispatches to that single resolved peer; there is no
+            # at-least-once fall-through loop here (that behavior is request_event-only).
+            for hostname, entry in nm.route_execute(target_plugin or "", access_name):
+                if not _matches_remote_node(hostname) or _is_remote_node_blocked(hostname):
                     continue
-
-                if not _matches_remote_node(node.hostname) or _is_remote_node_blocked(
-                    node.hostname
-                ):
+                if plugin_uuid and plugin_uuid != "remote" and entry.plugin_uuid != plugin_uuid:
                     continue
-
-                # Check remote node for endpoint
-                result = await nm.node_has_endpoint(
-                    node.IP,
-                    access_name,
-                    plugin_uuid if plugin_uuid != "remote" else None,
-                    requester_id,
-                    target_plugin,
+                remote_plugin = RemotePlugin(
+                    name=entry.plugin_name,
+                    version=entry.plugin_version,
+                    uuid=entry.plugin_uuid,
+                    enabled=True,
+                    remote=True,
+                    description=entry.description,
+                    arguments=entry.arguments if isinstance(entry.arguments, list) else [],
+                    hostname=hostname,
                 )
-
-                if result and result.get("available", False):
-                    # Create RemotePlugin from response data
-                    plugin_info = result.get("plugin_info", {})
-                    endpoint_info = result.get("endpoint", {})
-
-                    remote_plugin = RemotePlugin(
-                        name=plugin_info.get("name", "unknown"),
-                        version=plugin_info.get("version", "unknown"),
-                        uuid=plugin_info.get("uuid"),
-                        enabled=True,
-                        remote=True,
-                        description=plugin_info.get("description", "Remote plugin"),
-                        arguments=[],
-                        hostname=result.get("hostname", node.hostname),
-                    )
-
-                    return remote_plugin, endpoint_info, node
+                endpoint_info = {
+                    "remote": True,
+                    "accessible_by_other_plugins": entry.accessible_by_other_plugins,
+                    "arguments": entry.arguments,
+                    "tags": list(entry.tags),
+                    "description": entry.description,
+                }
+                return remote_plugin, endpoint_info, hostname
 
         return None, None, None
 
@@ -5708,7 +5427,7 @@ class Plexus(EventMixin):
             host_label = (
                 f"(local) {self.hostname}"
                 if isinstance(plugin, Plugin)
-                else f"{node.IP}#{node.hostname}"
+                else f"remote#{node}"
             )
             self._logger.debug(
                 f"Found {plugin_name} (ID: {plugin.plugin_uuid}) for Request with ID {request.id} on host {host_label}"
@@ -5724,14 +5443,6 @@ class Plexus(EventMixin):
                 # this attribute to distinguish remote-bound requests
                 # from local execute path requests.
                 request._is_remote = True
-                # C-092: stamp the routed peer hostname so
-                # NetworkManager._mark_node_dead can fast-fail all
-                # in-flight remote Requests bound for that peer (vs.
-                # waiting for TCP socket timeout). target_hosts is the
-                # caller-side routing filter (list of allowed hosts);
-                # target_host is the single concrete peer this Request
-                # was actually dispatched to after routing resolved.
-                request.target_host = node.hostname
                 # Snapshot nm: during a
                 # hot-reload rebuild, self.network is None for the
                 # entire rebuild duration. This path needs a
@@ -5749,23 +5460,24 @@ class Plexus(EventMixin):
                         True,
                     )
                     return
+                # SPEC §4.5 (c)-seam: hostname-addressed sender; selector = (plugin, endpoint,
+                # plugin_uuid) (uuid-targeted instance, D2); caller = the CLEAN split
+                # (author/author_id/author_host/request_uuid), not the legacy composite;
+                # handler_timeout + deadline anchored on the receiver's monotonic clock.
+                from .netcore.types import CallerCtx as _CallerCtx
                 result = await nm.execute_remote(
-                    IP=node.IP,
-                    plugin=plugin_name,
-                    method=function_name,
-                    args=request.args,
-                    plugin_uuid=request.target_plugin_uuid,
-                    author=f"{self.hostname} - {request.author}#{request.author_id}",
-                    author_id=request.author_id,
-                    # R2-LL-2: send the timeout DURATION only — never the
-                    # sender's wall-clock created_at. Peer clock skew used
-                    # to corrupt the remote deadline by however many seconds
-                    # the two clocks disagreed; anchoring on the receiver's
-                    # own monotonic clock at construction removes the skew.
-                    # Old peers still accepted via the tuple branch in
-                    # Request.__init__ (its second element is ignored).
-                    timeout=request.timeout_duration,
-                    request_id=request.id,
+                    node,
+                    {
+                        "plugin": plugin_name,
+                        "endpoint": function_name,
+                        "plugin_uuid": request.target_plugin_uuid,
+                    },
+                    request.args,
+                    _CallerCtx(
+                        request.author, request.author_id, self.hostname, request.id
+                    ),
+                    request.timeout_duration,
+                    deadline=request.timeout_duration,
                 )
 
             else:
@@ -5804,14 +5516,18 @@ class Plexus(EventMixin):
                     # catches RequestException by contract, so a
                     # "RequestException: ..." prefix would be redundant noise.
                     # Mirrors the request_event stream server's two error
-                    # branches in networking.py (raw RequestException vs
-                    # type-prefixed wrap for everything else).
-                    msg = (
-                        str(e)
+                    # branches in netcore/dispatch.py (_map_error: raw
+                    # RequestException vs type-prefixed wrap for everything else).
+                    # Preserve a RequestException SUBTYPE as the OBJECT so the
+                    # caller-facing re-raise (request_context / get_result_sync)
+                    # can propagate it BY TYPE (`except RateLimitException`); wrap
+                    # anything else as a type-prefixed string as before.
+                    err = (
+                        e
                         if isinstance(e, RequestException)
                         else f"{type(e).__name__}: {e}"
                     )
-                    await self._set_request_result(request, msg, True)
+                    await self._set_request_result(request, err, True)
                     return
 
             await self._set_request_result(request, result)
@@ -5825,12 +5541,18 @@ class Plexus(EventMixin):
             # Mirrors the C-048 pattern already in _process_request_stream.
             if not request._future.done():
                 try:
-                    await self._set_request_result(
-                        request,
-                        f"Request {request.id} aborted: "
-                        f"{type(e).__name__}: {e}",
-                        True,
+                    # A remote execute error surfaces here as the TYPED exception
+                    # raised by dispatch._map_error (RateLimitException etc., all
+                    # RequestException subtypes). Preserve the OBJECT so the
+                    # caller-facing re-raise propagates it by type; stringify any
+                    # other abort (incl. CancelledError) as before.
+                    err = (
+                        e
+                        if isinstance(e, RequestException)
+                        else f"Request {request.id} aborted: "
+                        f"{type(e).__name__}: {e}"
                     )
+                    await self._set_request_result(request, err, True)
                 except Exception:
                     # Best-effort: we're already mid-cancellation /
                     # mid-shutdown. The finally below still pops the
@@ -6772,7 +6494,7 @@ class Plexus(EventMixin):
             host_label = (
                 f"(local) {self.hostname}"
                 if isinstance(plugin, Plugin)
-                else f"{node.IP}#{node.hostname}"
+                else f"remote#{node}"
             )
             self._logger.debug(
                 f"Found {plugin_name} (ID: {plugin.plugin_uuid}) for Request with ID {request.id} on host {host_label}"
@@ -6784,10 +6506,6 @@ class Plexus(EventMixin):
                 # streaming-remote requests via the filter. Symmetry
                 # with the non-stream path's stamp.
                 request._is_remote = True
-                # C-092: symmetry with the non-stream path —
-                # _mark_node_dead's fast-fail filter compares this
-                # against the dead-peer hostname.
-                request.target_host = node.hostname
                 # Snapshot nm:
                 # mid-rebuild self.network is None; resolve the
                 # generator request with an error so the consumer sees
@@ -6805,19 +6523,19 @@ class Plexus(EventMixin):
                         True,
                     )
                     return
+                from .netcore.types import CallerCtx as _CallerCtx
                 async for result in nm.execute_remote_stream(
-                    IP=node.IP,
-                    plugin=plugin_name,
-                    method=function_name,
-                    args=request.args,
-                    plugin_uuid=request.target_plugin_uuid,
-                    author=f"{self.hostname} - {request.author}#{request.author_id}",
-                    author_id=request.author_id,
-                    # R2-LL-2: send the timeout DURATION only — see the
-                    # matching note on the non-stream execute_remote call
-                    # above for the peer-clock-skew rationale.
-                    timeout=request.timeout_duration,
-                    request_id=request.id,
+                    node,
+                    {
+                        "plugin": plugin_name,
+                        "endpoint": function_name,
+                        "plugin_uuid": request.target_plugin_uuid,
+                    },
+                    request.args,
+                    _CallerCtx(
+                        request.author, request.author_id, self.hostname, request.id
+                    ),
+                    deadline=request.timeout_duration,
                 ):
                     await request.queue.put((result, False, False))
 
@@ -6898,8 +6616,13 @@ class Plexus(EventMixin):
                         time.monotonic(),
                     )
                     if _dry is not None:
+                        # Type parity with the non-stream IN reject (_rl_reject):
+                        # resolve with a RateLimitException OBJECT so the stream
+                        # consumer re-raises it by type (`except RateLimitException`).
                         await self._set_gen_request_result(
-                            request, self._rl_reject_message(_dry, _cost), True
+                            request,
+                            RateLimitException(self._rl_reject_message(_dry, _cost)),
+                            True,
                         )
                         return
 
@@ -6966,9 +6689,9 @@ class Plexus(EventMixin):
                     sentinel = object()
                     while True:
                         # W2-F5: honour the per-call timeout on the
-                        # sync-gen branch. Sibling block in
-                        # ``request_event_stream`` (core.py ~5691-5709)
-                        # already wraps ``run_in_executor`` with
+                        # sync-gen branch. The sibling block in
+                        # ``request_event_stream``'s async path already
+                        # wraps ``run_in_executor`` with
                         # ``asyncio.wait_for``; sync-gen was the outlier.
                         # Without this wrap a slow sync producer can hang
                         # the asyncio task indefinitely.
@@ -7024,12 +6747,18 @@ class Plexus(EventMixin):
             # paper over the symptom for non-Cancel errors only).
             if not request._future.done():
                 try:
-                    await self._set_gen_request_result(
-                        request,
-                        f"Stream request {request.id} aborted: "
-                        f"{type(e).__name__}: {e}",
-                        True,
+                    # Preserve a RequestException SUBTYPE (handler-raised or a
+                    # remote-stream error mapped by dispatch._map_error) as the
+                    # OBJECT so the stream consumer's re-raise
+                    # propagates it by type; stringify any other abort (incl.
+                    # CancelledError) as before.
+                    err = (
+                        e
+                        if isinstance(e, RequestException)
+                        else f"Stream request {request.id} aborted: "
+                        f"{type(e).__name__}: {e}"
                     )
+                    await self._set_gen_request_result(request, err, True)
                 except Exception:
                     # Best-effort: we're already mid-cancellation /
                     # mid-shutdown. The finally below still pops the
@@ -7128,8 +6857,13 @@ class Plexus(EventMixin):
                 time.monotonic(),
             )
             if _dry is not None:
+                # Type parity with the non-stream IN reject (_rl_reject): resolve
+                # with a RateLimitException OBJECT so the stream consumer re-raises
+                # it by type (`except RateLimitException`).
                 await self._set_gen_request_result(
-                    request, self._rl_reject_message(_dry, _cost), True
+                    request,
+                    RateLimitException(self._rl_reject_message(_dry, _cost)),
+                    True,
                 )
                 return
 
@@ -7234,9 +6968,9 @@ class Plexus(EventMixin):
                 # SyncDispatcher instances managed by Plexus.
                 sentinel = object()
                 gen = func(event_meta)
-                # Mirrors current inline code (core.py:4780-4784):
+                # Mirrors the inline code below:
                 # request_event_stream_sync passes non-None caller_chain;
-                # Plugin.request_event_stream (utils.py:1572) does NOT,
+                # Plugin.request_event_stream does NOT,
                 # so async callers leave it as None — fallback reads
                 # the loop thread's threadlocal (always () in current
                 # code, kept defensively for forward-compat).
@@ -7321,7 +7055,10 @@ class Plexus(EventMixin):
             await self._set_gen_request_result(request)
         except RequestException as e:
             if not request._future.done():
-                await self._set_gen_request_result(request, str(e), True)
+                # Store the RequestException OBJECT (this arm only catches
+                # RequestException subtypes) so the stream consumer's re-raise
+                # propagates it by type.
+                await self._set_gen_request_result(request, e, True)
         except BaseException as e:
             # R2-AA-1: mirror the C-048 fix in _process_request_stream.
             # Catch BaseException (not just Exception) so a CancelledError
@@ -7370,8 +7107,11 @@ class Plexus(EventMixin):
                 # still resolve the request — otherwise @async_handle_errors
                 # swallows here and the caller hangs on request._future.
                 # CancelledError (BaseException) propagates uncaught so
-                # task cancellation tears down cleanly.
-                await request.set_result(f"{type(e).__name__}: {e}", True)
+                # task cancellation tears down cleanly. Preserve a
+                # RequestException SUBTYPE as the OBJECT so the caller-facing
+                # re-raise propagates it by type.
+                err = e if isinstance(e, RequestException) else f"{type(e).__name__}: {e}"
+                await request.set_result(err, True)
                 return
         await request.set_result(result, error)
 
@@ -7517,7 +7257,7 @@ class Plexus(EventMixin):
         timeout.
 
         Use for short cleanup work (per-peer publish dereg, NM
-        accounting cleanup, advert acks). NOT for fan-out dispatch —
+        accounting cleanup). NOT for fan-out dispatch —
         those go through ``_spawn_tracked``.
 
         C-062: matches the _EMIT_DEPTH isolation pattern used by
@@ -7878,7 +7618,9 @@ class Plexus(EventMixin):
                         request.id,
                         result,
                     )
-                    raise RequestException(result)
+                    # Preserve a RequestException SUBTYPE by re-raising the OBJECT;
+                    # wrap a string/other result in the canonical RequestException.
+                    raise result if isinstance(result, RequestException) else RequestException(result)
                 return result
             finally:
                 # B-073: done-callback eviction. Runs on
@@ -8034,7 +7776,9 @@ class Plexus(EventMixin):
                         request.id,
                         result,
                     )
-                    raise RequestException(result)
+                    # Preserve a RequestException SUBTYPE by re-raising the OBJECT;
+                    # wrap a string/other result in the canonical RequestException.
+                    raise result if isinstance(result, RequestException) else RequestException(result)
                 yield result
         finally:
             # Mark for cleanup. Runs on normal completion, RequestException,
@@ -8199,7 +7943,9 @@ class Plexus(EventMixin):
                         request.id,
                         result,
                     )
-                    raise RequestException(result)
+                    # Preserve a RequestException SUBTYPE by re-raising the OBJECT;
+                    # wrap a string/other result in the canonical RequestException.
+                    raise result if isinstance(result, RequestException) else RequestException(result)
                 yield result
         finally:
             # R2-EE-8: actually wait for set_collected() to complete on
@@ -8256,14 +8002,12 @@ class Plexus(EventMixin):
 
         C-076: the previous implementation called
         ``topic_registry.subscribe`` directly, bypassing the
-        ``broadcast_local_sub_added`` peer-advert hook and the
         ``_sub_uuids`` per-plugin tracking that ``subscribe_event``
         provides. Test plugins still call ``self._plexus.subscribe``
         (e.g. TestLifecycleSuite, TestRemoteTarget) so the method stays
         as a deprecation-aliased shim that routes through the canonical
-        path. The ``declared_id`` and ``enabled`` kwargs are dropped on
-        the alias path; both default to the same values that
-        ``subscribe_event`` produces internally.
+        path. The ``declared_id`` and ``enabled`` kwargs are FORWARDED to
+        ``subscribe_event`` (W5-Q1); they are not dropped.
         """
         self._logger.warning(
             "Plexus.subscribe is a legacy alias for Plexus.subscribe_event "
@@ -8289,10 +8033,9 @@ class Plexus(EventMixin):
         """Legacy unsubscribe alias — delegates to :meth:`unsubscribe_event`.
 
         C-076: the previous implementation called
-        ``topic_registry.unsubscribe`` directly, bypassing the
-        ``broadcast_local_sub_removed`` peer-advert hook. Kept as a
-        deprecation-aliased shim for the same reason as
-        :meth:`subscribe`.
+        ``topic_registry.unsubscribe`` directly, bypassing the canonical
+        ``unsubscribe_event`` path. Kept as a deprecation-aliased shim for the
+        same reason as :meth:`subscribe`.
         """
         self._logger.warning(
             "Plexus.unsubscribe is a legacy alias for Plexus.unsubscribe_event "

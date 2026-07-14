@@ -1,0 +1,53 @@
+description: Wave-2 observability recorder — records all _core/* observability events + polls network.snapshot() VERBATIM, for the networking-rewrite socket cells (runs on the asker/puller node)
+version: 0.1.0
+remote: True
+arguments:
+subscriptions:
+endpoints:
+  obs_events:
+    internal_name: obs_events
+    tags:
+      - netobs
+    remote: True
+    accessible_by_other_plugins: True
+    description: Return recorded _core/* events (optionally filtered by topic; optionally clearing after read)
+    arguments:
+      - name: topic
+      - name: clear
+
+  obs_snapshot:
+    internal_name: obs_snapshot
+    tags:
+      - netobs
+    remote: True
+    accessible_by_other_plugins: True
+    description: Current network.snapshot() verbatim
+    arguments:
+
+  obs_snapshot_history:
+    internal_name: obs_snapshot_history
+    tags:
+      - netobs
+    remote: True
+    accessible_by_other_plugins: True
+    description: Bounded ring of (ts, snapshot) for transition asserts
+    arguments:
+
+  obs_clear:
+    internal_name: obs_clear
+    tags:
+      - netobs
+    remote: True
+    accessible_by_other_plugins: True
+    description: Reset the recorded events + snapshot history
+    arguments:
+
+  obs_dump:
+    internal_name: obs_dump
+    tags:
+      - netobs
+    remote: True
+    accessible_by_other_plugins: True
+    description: Write events + snapshot + history to a result file (or NETOBS_RESULT_FILE env)
+    arguments:
+      - name: result_file

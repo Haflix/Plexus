@@ -1,6 +1,6 @@
 # Rate Limiting
 
-*Last updated for Plexus 0.66.0*
+*Last updated for Plexus 0.74.0*
 
 Plexus has a built-in, multi-dimensional token-bucket rate limiter. It is
 **opt-in and off by default**: a node with no `rate_limits:` configured pays
@@ -201,9 +201,9 @@ on where the bucket ran dry:
   binding dimension and the remaining tokens, for example
   `rate limit exceeded on plugin_out:SomeOrchestrator (0.000/50 tokens available, need 1.0)`.
 - **IN reject on a 1:1 call (`execute` / `request_event`).** Raised at the
-  delivery site and surfaced to the caller through the normal request-error path,
-  so the caller sees a `RequestException` whose message carries the rate-limit
-  reason.
+  delivery site and surfaced to the caller through the normal request-error path as
+  `RateLimitException` (the exception type is preserved end-to-end, on the sync and
+  async paths and for streaming calls, so `except RateLimitException` catches it).
 - **IN reject on a 1:N fan-out (`publish_event`).** Fire-and-forget: the throttled
   per-subscriber delivery is dropped (the handler is not invoked); `publish_event`
   still returns its scheduled count. The reject is not raised to the publisher.

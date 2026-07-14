@@ -124,16 +124,15 @@ class Subscription:
     target_plugin_uuid: Optional[str] = None
 
     # Filter chain (per LOCKED A subscriptions: shape).
-    # C-114: these four fields are frozen after __post_init__. Mutating
-    # them post-construction would desync the wire-cached copy that
-    # peers hold in their _inbound_adverts table (since the filter
-    # chain is now sent on the wire — see C-112 +
-    # _serialize_local_sub_for_peer). Callers that need to change a
-    # filter must unsubscribe + subscribe again so the
-    # subscribe/unsubscribe broadcast hooks deliver the corrected
-    # AdvertSub to peers. ``enabled`` and the identity / target fields
-    # remain mutable: ``enabled`` is toggled via
-    # set_subscription_enabled (which broadcasts add/remove deltas).
+    # C-114: these four fields are frozen after __post_init__. They are
+    # EXPORTED in this node's content-hash directory snapshot, which peers
+    # PULL on the heartbeat; mutating them in place would let the exported
+    # copy drift from a peer's cached copy WITHOUT changing the content hash
+    # (netcore is pull-based, not push — there is no delta broadcast). Callers
+    # that need to change a filter must unsubscribe + subscribe again so the
+    # change re-exports cleanly. ``enabled`` and the identity / target fields
+    # remain mutable: toggling ``enabled`` changes what this node exports, so
+    # peers pick it up on their next directory pull.
     hosts: Union[str, list, None] = "any"
     blocked_hosts: Union[str, list, None] = None
     authors: Union[str, list, None] = None
@@ -158,9 +157,9 @@ class Subscription:
         ):
             raise AttributeError(
                 f"Subscription.{name} is frozen post-construction "
-                f"(C-114). The filter chain is wire-cached on peer "
-                f"_inbound_adverts; direct mutation would desync. "
-                f"Unsubscribe + resubscribe to change a filter."
+                f"(C-114). The filter chain is exported in this node's "
+                f"pulled directory snapshot; mutating it in place would "
+                f"desync peers. Unsubscribe + resubscribe to change a filter."
             )
         object.__setattr__(self, name, value)
 
@@ -426,8 +425,8 @@ class TopicRegistry:
 
         Iterates the single ordered store (LOCKED C tie-break). Disabled
         subs (``enabled is False``) are skipped — they stay in the
-        registry for advertisement-protocol introspection but are
-        never dispatched.
+        registry for introspection but are excluded from the exported
+        directory snapshot and are never dispatched.
 
         Matches on topic + ``enabled`` ONLY. It does NOT apply the
         host / author / blocked filter chain — that is the dispatcher's
@@ -552,25 +551,23 @@ class TopicRegistry:
         * ``changed=False`` when current state already matched (no-op)
         * ``changed=True`` when the flag was flipped
 
-        Caller is responsible for any post-mutation broadcast / emit; this
-        method does NOT release the lock to call network code (per the
-        framework's lock-ordering rule that disallows network I/O inside
-        registry locks — see ``_get_lifecycle_lock`` in Plexus).
+        Caller is responsible for any post-mutation emit; this method does
+        NOT release the lock to call network code (per the framework's
+        lock-ordering rule that disallows network I/O inside registry locks
+        — see ``_get_lifecycle_lock`` in Plexus).
 
-        The returned ``Subscription`` reference is the live registry entry;
-        callers that need to broadcast to peers can read its fields after
-        the lock has released — the dataclass is mutable, but field reads
-        are atomic at the Python attribute level, so a concurrent
-        unsubscribe between this return and the broadcast call leaves the
-        reference valid (peer just learns about an enabled state for a
-        sub that no longer exists locally; eventual consistency via
-        peer heartbeat resolves it).
+        There is no per-toggle push to peers (netcore is pull-based): the
+        flag change alters what this node exports in its content-hash
+        directory snapshot, and peers converge on their next heartbeat pull.
+        The returned ``Subscription`` reference is the live registry entry
+        (the dataclass is mutable; field reads are atomic at the Python
+        attribute level).
         """
         # Coerce to bool so callers passing truthy/falsy non-bool values
         # (e.g. 1 from a JSON deserializer) don't silently corrupt
         # ``Subscription.enabled`` to a non-bool type. find_all's
         # ``if not sub.enabled`` check tolerates truthy/falsy values, but
-        # downstream readers (advert protocol, TUI rendering) expect bool.
+        # downstream readers (the directory export, TUI rendering) expect bool.
         coerced = bool(enabled)
         async with self._lock:
             sub = self._subs.get(sub_uuid)
@@ -582,7 +579,9 @@ class TopicRegistry:
             return sub, True
 
     async def list_local_subs(self) -> List[Subscription]:
-        """Snapshot all local subs in insertion order. Used by Stage C
-        advert protocol for outbound snapshot build (locked #14)."""
+        """Snapshot all local subs in insertion order. Introspection / test
+        helper only: the netcore directory export builds its snapshot by
+        reading the ``_subs`` store directly (NetworkManager._enumerate_local_subs),
+        NOT via this async method."""
         async with self._lock:
             return list(self._subs.values())

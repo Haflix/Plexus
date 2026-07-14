@@ -1,0 +1,28 @@
+# Wave-2 cooperative harness — PEER node (hostname w2b-peer). Serves NetFixTarget
+# endpoints/subs over the wire + carries NetObsProbe (for callee-side _core/net/
+# inbound asserts) + NetCtl (so the driver can mutate this peer's exported subs /
+# rate config over the wire). port/keys/peers/knobs injected by wave2_node.py.
+plugins:
+  - name: NetFixTarget
+    enabled: true
+    path: ./plugins_test/NetFixTarget
+  - name: NetObsProbe
+    enabled: true
+    path: ./plugins_test/NetObsProbe
+  - name: NetCtl
+    enabled: true
+    path: ./plugins_test/NetCtl
+
+general:
+    hostname: "w2b-peer"
+    plugin_package: plugins_test
+    console_log_level: "WARNING"
+    file_log_level: "DEBUG"
+    asyncio_debug: false
+    logger_levels:
+        asyncio: "MUTE"
+        urllib3: "MUTE"
+
+networking:
+    enabled: true
+    port: 0

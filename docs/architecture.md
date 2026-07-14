@@ -1,6 +1,6 @@
 # Architecture
 
-*Last updated for Plexus 0.66.0*
+*Last updated for Plexus 0.74.0*
 
 This document describes the runtime shape of a Plexus process: how Plexus loads plugins, how the lifecycle hooks fire, what guarantees the framework gives during hot-swap and shutdown, and how the three-tier discipline organises the plugins themselves.
 
@@ -102,7 +102,7 @@ Order of operations inside `_enable_plugin_under_lock`:
 1. The plugin's per-name lifecycle lock is acquired.
 2. The YAML `subscriptions:` block is registered with the `TopicRegistry` BEFORE `on_enable` runs. This means published events can already match the plugin's subscriptions while it is still mid-startup — the readiness gate (see below) is what blocks dispatch from completing.
 3. The framework transitions the plugin's state from `INACTIVE` to `ENABLING` (emits `_core/plugin/state_changed`).
-4. Subscription add-deltas are broadcast to peers (no-op when networking is disabled or the manager is not ready).
+4. Because the `subscriptions:` registered in step 2 change what this node exports, its directory snapshot (and content hash) now differ; peers pick the change up on their next heartbeat pull. There is no per-subscription push to peers (the old instant add-delta broadcast was removed in the netcore rewrite).
 5. `on_enable` is called, wrapped in `asyncio.wait_for(timeout=plugin_enable_timeout)` (default 30s; configurable via `general.plugin_enable_timeout`). On timeout the enable is treated as a failure and the rollback in step 7 runs, so a hung `on_enable` cannot pin the lifecycle lock indefinitely.
 6. On success: the framework sets `_lifecycle_ready` and transitions `ENABLING` → `ENABLED`. Cross-plugin callers waiting on the readiness gate proceed.
 7. On failure (raise or cancel): `_lifecycle_ready` stays cleared, `ready` is reset, `on_disable` is called defensively, subscriptions are unregistered, and the state transitions `ENABLING` → `INACTIVE`. `last_errors[Phase.ENABLE]` is populated for non-cancellation exceptions.
@@ -172,7 +172,7 @@ If both events are not set within the budget, the caller's `execute()` raises `R
                                                             (1) acquire lifecycle_lock
                                                             (2) register YAML subscriptions
                                                             (3) INACTIVE -> ENABLING
-                                                            (4) broadcast sub-add deltas
+                                                            (4) exported directory changes
                                                             (5) call on_enable
                                                                     |
                                           +-------------------------+-------------------------+
@@ -257,7 +257,7 @@ Nothing leaks across the swap. The instance attributes a plugin set in its previ
 `Plexus.close()` walks a deterministic sequence so dependents wind down before their dependencies:
 
 1. Wait up to 30 seconds for in-flight tracked tasks; cancel survivors.
-2. Drain the fire-and-forget task pool (per-peer publish dereg, advert acks, and other short cleanup work spawned by done-callbacks after the step 1 snapshot) for up to 5 seconds, then cancel survivors. This is a separate pool from the tracked tasks in step 1.
+2. Drain the fire-and-forget task pool (per-peer publish dereg and other short cleanup work spawned by done-callbacks after the step 1 snapshot) for up to 5 seconds, then cancel survivors. This is a separate pool from the tracked tasks in step 1.
 3. **Disable plugins in REVERSE dependency order** (the reverse of `_dep_topo_order`, so dependents wind down before their dependencies). Each `on_disable` gets a 30-second cap (hardcoded for shutdown). Different plugins do not block each other — their per-plugin lifecycle locks are independent.
 4. Sweep stranded plugin-source per-logger thresholds.
 5. Shut down BOTH sync dispatchers (the event-handler pool, then the streaming pool) with `wait=True` and a 30-second budget each; on timeout the in-flight shutdown is left running and `close()` continues. They drain AFTER the disable loop so a sync `on_disable` that publishes an event still has a pool to run on.

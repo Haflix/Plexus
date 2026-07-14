@@ -1,6 +1,6 @@
 # Capabilities and Caller Identity
 
-*Last updated for Plexus 0.66.0*
+*Last updated for Plexus 0.74.0*
 
 Every call in Plexus carries a **caller identity**: the framework knows which
 plugin initiated each operation and the chain of plugins it passed through.
@@ -115,6 +115,16 @@ the sync bridge).
   led to this operation, which the framework stamps at every plugin-to-plugin
   dispatch. A plugin cannot fabricate an ancestor it was not actually called
   through.
+- **Cross-node identity is filtering-only.** For a peer-originated call, the
+  wire `author` / `author_id` are labels the receiver uses only for author/host
+  subscription filtering; they confer no capability. The right to act as
+  `author="system"` is granted SOLELY from the callee's own authenticated
+  `system_caller` record for that SPKI-pinned peer, never from the wire (a
+  spoofed `system` claim is downgraded before the registry sees it, in
+  `Dispatch._effective_caller`). Cross-node impersonation is a non-goal: the
+  impersonation ancestry chain is empty for peer-originated calls (impersonation
+  is a same-node grant, not transitive across nodes), and a vouched (discovered)
+  peer is always `system_caller=false`. See [networking](./networking.md).
 
 The pure decision logic is small and deterministic; the framework wiring stamps
 the caller chain, reads the real caller, applies the grant, and either scopes the

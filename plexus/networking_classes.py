@@ -1,10 +1,11 @@
 """Networking-side data classes — RemotePlugin and Node.
 
 Note: the Plugin state machine added in v0.26.0 applies to
-LOCAL plugins only. ``RemotePlugin.enabled`` is the snapshot of a remote
-plugin's enabled state at advertisement time — a distinct concept from
-the local state machine. ``RemotePlugin.enabled`` and ``Node.enabled``
-remain mutable attributes.
+LOCAL plugins only. ``RemotePlugin.enabled`` reflects a remote plugin's
+reachability as resolved from the pulled routing directory (the core seam
+constructs it with ``enabled=True``) — a distinct concept from the local
+state machine. ``RemotePlugin.enabled`` and ``Node.enabled`` remain mutable
+attributes.
 """
 
 import time

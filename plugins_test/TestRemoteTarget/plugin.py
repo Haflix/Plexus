@@ -176,14 +176,14 @@ class TestRemoteTarget(Plugin):
 
     @async_gen_log_errors
     async def r_topic_huge_stream(self, event=None):
-        # B-024 driver. _handle_request_event_stream emits ONE
-        # MSG_STREAM_CHUNK per yielded item with chunk_length = pickled-size + 1.
-        # If chunk_length exceeds MAX_MESSAGE_SIZE (100 MB on the receiver),
-        # the receiver raises NetworkRequestException and the entire stream
-        # is killed. _handle_execute_stream splits;
-        # _handle_request_event_stream does NOT — that's the bug.
-        # 101 MB triggers the rejection.
-        yield {"data": b"\xab" * (101 * 1024 * 1024)}
+        # B-024 driver (positive round-trip guard). A single stream item larger
+        # than one CHUNK is SPLIT across CHUNK frames and reassembled at the
+        # ITEM_END boundary (parity with execute_stream) — B-024 was that the
+        # request_event_stream path did NOT split, killing the stream. This item
+        # is 6 MB (96 chunks): a genuine multi-chunk value UNDER the 8 MB per-cid
+        # reassembly bound, so it must arrive intact. (The OVER-bound rejection
+        # is covered separately by TP-73/TG-24 + the netcore self-tests.)
+        yield {"data": b"\xab" * (6 * 1024 * 1024)}
 
     @async_log_errors
     async def r_hang_topic_handler(self, event=None):
@@ -244,11 +244,12 @@ class TestRemoteTarget(Plugin):
 
     @async_log_errors
     async def r_huge_result(self) -> dict:
-        """TP-13: a >100MB UNARY execute result (101MB). The unary return path
-        sends the pickled result via _send_stream_chunk (split across
-        MSG_STREAM_CHUNK frames), so the bytes must arrive byte-exact despite
-        exceeding MAX_MESSAGE_SIZE (parity with execute_stream)."""
-        return {"data": b"\xab" * (101 * 1024 * 1024)}
+        """TP-13: a large UNARY execute result (6 MB). The unary return path
+        splits the serialized result across CHUNK frames and reassembles it, so
+        the bytes must arrive byte-exact. 6 MB (96 chunks) is a genuine
+        multi-chunk value UNDER the 8 MB per-cid reassembly bound; the OVER-bound
+        rejection is covered separately by TP-73/TG-24 + the netcore self-tests."""
+        return {"data": b"\xab" * (6 * 1024 * 1024)}
 
     @async_log_errors
     async def r_order_handler(self, event=None):

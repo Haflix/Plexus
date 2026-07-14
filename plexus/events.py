@@ -383,10 +383,10 @@ class EventMixin:
     async def _register_yaml_subscriptions(self, plugin: Plugin) -> List[str]:
         """Register every YAML-declared subscription for ``plugin`` per
         Q23 + C15 + LOCKED A subscriptions: shape. Returns the list of
-        newly-registered sub_uuids — caller is responsible for invoking
-        ``_broadcast_yaml_sub_added`` on each AFTER releasing
-        ``plugin_lock``. This keeps network I/O out of the global lock
-        per the lock-ordering rule documented at _get_lifecycle_lock.
+        newly-registered sub_uuids. (The old post-lock per-sub broadcast to peers
+        was removed in the A4 cleanup — netcore propagates local sub adds via the
+        pull-based content-hash directory snapshot at heartbeat cadence, so the
+        caller no longer broadcasts.)
 
         Subscription registration runs at on_enable-time (not load-time)
         so that disable -> re-enable cycles re-register subs naturally.
@@ -1023,53 +1023,41 @@ class EventMixin:
         ):
             try:
                 from uuid import uuid4 as _uuid4
+                from .notifier import TopicRegistry as _TR
+                from .netcore.types import CallerCtx as _CallerCtx
 
                 request_uuid = _uuid4().hex
-                per_peer = await nm._build_remote_dispatch(
-                    topic=resolved_topic,
-                    payload=payload,
-                    author=publisher.plugin_name,
-                    author_id=publisher.plugin_uuid,
-                    author_host=self.hostname,
-                    timestamp=now_ts,
-                    request_uuid=request_uuid,
-                    eff_hosts=eff_hosts,
-                    eff_blocked_hosts=eff_blocked,
+                caller = _CallerCtx(
+                    publisher.plugin_name,
+                    publisher.plugin_uuid,
+                    self.hostname,
+                    request_uuid,
                 )
-                remote_count = 0  # BUG-019: count only peers actually dispatched
+                remote_count = 0  # BUG-019: count matching remote SUBS, not frames
 
                 tasks = []
-                for peer_hostname, advs in per_peer.items():
-                    node = next(
-                        (n for n in list(nm.nodes) if n.hostname == peer_hostname),
-                        None,
-                    )
-                    if node is None:
+                # SPEC §4.5 (c)-seam: candidate source is `route_publish` (grouped per
+                # peer), read lock-free (atomic rebind). Core applies the 4 remote-relevant
+                # predicates PER SUB for the scheduled COUNT, then one FANOUT frame per peer.
+                for peer_hostname, advs in nm.route_publish(resolved_topic):
+                    matching = [
+                        a for a in advs
+                        if nm._hosts_match(eff_hosts, eff_blocked, peer_hostname)
+                        and self._sub_accepts_remote_publisher(a, self.hostname, publisher.plugin_name)
+                        and self._sub_accepts_author(a, publisher.plugin_name)
+                        and _TR._topic_matches(a.topic_pattern, resolved_topic)
+                    ]
+                    if not matching:
                         continue
-                    # locked #16: caller-acquires-_struct_lock-once;
-                    # enabled recheck atomic with task creation.
+                    # locked #16: _inflight_publishes tracking stays atomic with task
+                    # creation (the CANDIDATE read above is now the lock-free route_publish).
                     async with nm._adverts_struct_lock:
-                        if not node.enabled:
-                            continue
-                        remote_count += len(advs)  # BUG-019
+                        remote_count += len(matching)  # BUG-019 (subs, not frames)
                         t = asyncio.create_task(
                             nm.publish_event_remote(
-                                node.IP,
-                                resolved_topic,
-                                payload,
-                                publisher.plugin_name,
-                                publisher.plugin_uuid,
-                                self.hostname,
-                                now_ts,
-                                request_uuid,
+                                peer_hostname, resolved_topic, payload, caller
                             )
                         )
-                        # Append BEFORE the dict op so a raise in
-                        # setdefault/add can't orphan `t` inside this
-                        # lock window. Sub-lock-window protection only:
-                        # once this function returns, ``tasks`` is
-                        # GC'd. ``_inflight_publishes`` is the durable
-                        # strong ref (consulted by _drain_for_rebuild).
                         tasks.append(t)
                         nm._inflight_publishes.setdefault(peer_hostname, set()).add(t)
 
@@ -1466,9 +1454,9 @@ class EventMixin:
                     f"(eff_hosts='local' — remote peers not searched)"
                 )
 
-            # PR3 Stage C step 19 — remote dispatch fall-through (locked
-            # #6 + #13). Iterate _inbound_global_order in C11 insertion
-            # order, apply ALL filters, try each surviving candidate.
+            # SPEC §4.5 (c)-seam — remote dispatch fall-through (locked #6 + #13).
+            # Iterate the routing directory's `route_request` candidates (hostname-lex +
+            # declaration order), apply ALL filters, try each surviving candidate.
             # Snapshot ``nm = self.network`` once: mid-block
             # hot-reload would otherwise leak calls
             # onto a stopped NM. None falls through to the bottom
@@ -1491,21 +1479,11 @@ class EventMixin:
                 and nm is not None
                 and getattr(nm, "is_ready", False)
             ):
-                async with nm._adverts_struct_lock:
-                    cands_raw = list(nm._inbound_global_order.items())
-
-                for (peer_hostname, _sub_uuid), advert in cands_raw:
-                    node = next(
-                        (n for n in list(nm.nodes) if n.hostname == peer_hostname),
-                        None,
-                    )
-                    if node is None:
-                        continue
-                    try:
-                        if not (node.enabled and await node.is_alive(timeout=nm.liveness_timeout)):
-                            continue
-                    except Exception:
-                        continue
+                # SPEC §4.5 (c)-seam: candidate source is the routing directory's
+                # `route_request` (reachable+in-roster remote peers whose cached subs
+                # topic-match, hostname-lex + declaration order). Core keeps the UNCHANGED
+                # 4 remote-relevant filter predicates over the candidates.
+                for peer_hostname, advert in nm.route_request(resolved_topic):
                     if not nm._hosts_match(eff_hosts, eff_blocked, peer_hostname):
                         continue
                     if not self._sub_accepts_remote_publisher(
@@ -1516,7 +1494,7 @@ class EventMixin:
                         continue
                     if not _TR._topic_matches(advert.topic_pattern, resolved_topic):
                         continue
-                    candidates.append((peer_hostname, advert, node))
+                    candidates.append((peer_hostname, advert))
 
             # B-073 Step 8 emit: event_requested on no-local-match path.
             # target_count covers all 3 sub-paths (networking disabled
@@ -1545,19 +1523,22 @@ class EventMixin:
                 and nm is not None
                 and getattr(nm, "is_ready", False)
             ):
+                from .netcore.types import CallerCtx as _CallerCtx
                 last_exc: Optional[BaseException] = None
-                for peer_hostname, advert, node in candidates:
+                for peer_hostname, advert in candidates:
                     try:
                         return await nm.request_event_remote(
-                            node.IP,
-                            resolved_topic,
+                            peer_hostname,
+                            {"topic": resolved_topic},
                             payload,
-                            publisher.plugin_name,
-                            publisher.plugin_uuid,
-                            self.hostname,
-                            now_ts,
-                            request_uuid,
-                            timeout=timeout,
+                            _CallerCtx(
+                                publisher.plugin_name,
+                                publisher.plugin_uuid,
+                                self.hostname,
+                                request_uuid,
+                            ),
+                            timeout,
+                            deadline=timeout,
                         )
                     except (NetworkRequestException, NoLocalSubException) as exc:
                         last_exc = exc
@@ -1609,7 +1590,9 @@ class EventMixin:
         try:
             result, error, _ = await request.wait_for_result_async()
             if error:
-                raise RequestException(result)
+                # Preserve a RequestException SUBTYPE by re-raising the OBJECT;
+                # wrap a string/other result in the canonical RequestException.
+                raise result if isinstance(result, RequestException) else RequestException(result)
             return result
         finally:
             # B-073: done-callback eviction. Was
@@ -1823,22 +1806,13 @@ class EventMixin:
 
                     request_uuid = _uuid4().hex
 
-                    async with nm._adverts_struct_lock:
-                        cands_raw = list(nm._inbound_global_order.items())
+                    # SPEC §4.5 (c)-seam: request_event_STREAM fall-through — same
+                    # route_request candidate source + UNCHANGED 4 predicates as the
+                    # unary/FIRST path above.
+                    from .netcore.types import CallerCtx as _CallerCtx
 
                     candidates = []
-                    for (peer_hostname, _sub_uuid), advert in cands_raw:
-                        node = next(
-                            (n for n in list(nm.nodes) if n.hostname == peer_hostname),
-                            None,
-                        )
-                        if node is None:
-                            continue
-                        try:
-                            if not (node.enabled and await node.is_alive(timeout=nm.liveness_timeout)):
-                                continue
-                        except Exception:
-                            continue
+                    for peer_hostname, advert in nm.route_request(resolved_topic):
                         if not nm._hosts_match(eff_hosts, eff_blocked, peer_hostname):
                             continue
                         if not self._sub_accepts_remote_publisher(
@@ -1849,20 +1823,22 @@ class EventMixin:
                             continue
                         if not _TR._topic_matches(advert.topic_pattern, resolved_topic):
                             continue
-                        candidates.append((peer_hostname, advert, node))
+                        candidates.append((peer_hostname, advert))
 
                     last_exc: Optional[BaseException] = None
-                    for peer_hostname, advert, node in candidates:
+                    for peer_hostname, advert in candidates:
                         agen = nm.request_event_stream_remote(
-                            node.IP,
-                            resolved_topic,
+                            peer_hostname,
+                            {"topic": resolved_topic},
                             payload,
-                            publisher.plugin_name,
-                            publisher.plugin_uuid,
-                            self.hostname,
-                            now_ts,
-                            request_uuid,
-                            timeout=timeout,
+                            _CallerCtx(
+                                publisher.plugin_name,
+                                publisher.plugin_uuid,
+                                self.hostname,
+                                request_uuid,
+                            ),
+                            timeout,
+                            deadline=timeout,
                         )
                         # Tee first chunk in an isolated try/except so that
                         # ONLY pre-first-chunk failures fall through (locked
@@ -2079,7 +2055,9 @@ class EventMixin:
                             f"check the logs for this Req-ID."
                         )
                         exit_reason = "exception"
-                        raise RequestException(result)
+                        # Preserve a RequestException SUBTYPE by re-raising the
+                        # OBJECT; wrap a string/other result as the canonical type.
+                        raise result if isinstance(result, RequestException) else RequestException(result)
                     chunk_count += 1
                     yield result
             except GeneratorExit:
@@ -2314,27 +2292,9 @@ class EventMixin:
         if owner is not None and hasattr(owner, "_sub_uuids"):
             owner._sub_uuids.append(sub_uuid)
 
-        # PR3 Stage C add-delta hook (locked #18 item 3). No-op when
-        # networking is disabled or not yet ready.
-        # Snapshot nm: single-call site;
-        # snapshotting matches the loop-site pattern for consistency
-        # and tightens the guard-vs-call window in case of mid-block
-        # hot-reload.
-        nm = self.network
-        if (
-            getattr(self, "networking_enabled", False)
-            and nm is not None
-            and getattr(nm, "is_ready", False)
-        ):
-            sub = await self.topic_registry.get_subscription(sub_uuid)
-            if sub is not None:
-                try:
-                    await nm.broadcast_local_sub_added(sub)
-                except Exception:
-                    self._logger.debug(
-                        "subscribe_event: broadcast add-delta failed",
-                        exc_info=True,
-                    )
+        # (A4 cleanup: the instant add-delta push to peers was removed — netcore
+        # propagates local sub adds via the pull-based content-hash directory
+        # snapshot at heartbeat cadence, not an instant push.)
 
         # Rate limiter (Step 3): build the new sub's IN-set charge-set so a
         # runtime subscribe (after the initial-load rebuild) is limited too.
@@ -2354,25 +2314,9 @@ class EventMixin:
         """
         sub = await self.topic_registry.get_subscription(sub_uuid)
 
-        # PR3 Stage C remove-delta hook (locked #18 item 4). Send BEFORE
-        # the registry drop so the broadcast still has access to the
-        # sub object and our peers see the remove cleanly.
-        # Snapshot nm: single-call site,
-        # snapshotting for consistency with the loop-site pattern.
-        nm = self.network
-        if (
-            sub is not None
-            and getattr(self, "networking_enabled", False)
-            and nm is not None
-            and getattr(nm, "is_ready", False)
-        ):
-            try:
-                await nm.broadcast_local_sub_removed(sub)
-            except Exception:
-                self._logger.debug(
-                    "unsubscribe_event: broadcast remove-delta failed",
-                    exc_info=True,
-                )
+        # (A4 cleanup: the instant remove-delta push to peers was removed — netcore
+        # propagates local sub removals via the pull-based content-hash directory
+        # snapshot at heartbeat cadence.)
 
         ok = await self.topic_registry.unsubscribe(sub_uuid)
         if ok and sub is not None:
@@ -2392,18 +2336,13 @@ class EventMixin:
 
         Mutation happens atomically inside ``topic_registry._lock`` via
         ``TopicRegistry.set_subscription_enabled`` (notifier.py) which
-        returns ``(sub_or_None, changed)``. When networking is enabled
-        and ready, this method then broadcasts an add-delta to peers
-        on a True transition (peer starts advertising the sub) or a
-        remove-delta on a False transition (peer stops). Broadcasts
-        happen OUTSIDE the registry lock, per the framework's
-        lock-ordering rule (mirrored from the
-        ``subscribe_event``/``unsubscribe_event`` patterns in this
-        module; see the lock-ordering comment block at
-        ``_get_lifecycle_lock`` for the
-        "no-network-I/O-under-registry-lock" invariant).
+        returns ``(sub_or_None, changed)``. The enable/disable is
+        propagated to peers via the pull-based content-hash directory
+        snapshot at heartbeat cadence (the old instant add/remove-delta
+        push to peers was removed in the A4 cleanup — netcore is
+        pull-based, not push).
 
-        After mutation + broadcast attempt, emits
+        After mutation, emits
         ``_core/subscription/state_changed`` so the Subscriptions
         browser + Live-stream can react. Emit fires ONLY when the flag
         actually changed (idempotent no-op call returns True without
@@ -2425,9 +2364,8 @@ class EventMixin:
             False if ``sub_uuid`` was not in the registry (pop_plugin
                 race or invalid uuid).
 
-        Broadcast failure is logged at DEBUG and NOT propagated; local
-        state mutated successfully, peer eventual-consistency via
-        heartbeat handles any peer-side drift. Mirrors existing
+        Peer eventual-consistency is handled by the heartbeat directory
+        pull; there is no per-toggle network I/O here. Mirrors existing
         ``subscribe_event`` / ``unsubscribe_event`` semantics.
         """
         sub, changed = await self.topic_registry.set_subscription_enabled(
@@ -2442,25 +2380,9 @@ class EventMixin:
             sub_uuid,
             enabled,
         )
-        # Snapshot nm once. Mid-call hot-reload would otherwise leak the
-        # broadcast onto a stopped NM; consistent with the pattern used
-        # by subscribe_event / unsubscribe_event for the same reason.
-        nm = self.network
-        if (
-            getattr(self, "networking_enabled", False)
-            and nm is not None
-            and getattr(nm, "is_ready", False)
-        ):
-            try:
-                if enabled:
-                    await nm.broadcast_local_sub_added(sub)
-                else:
-                    await nm.broadcast_local_sub_removed(sub)
-            except Exception:
-                self._logger.debug(
-                    "set_subscription_enabled: broadcast failed",
-                    exc_info=True,
-                )
+        # (A4 cleanup: the instant enable/disable delta push to peers was removed —
+        # netcore propagates the sub-set change via the pull-based content-hash
+        # directory snapshot at heartbeat cadence.)
         self._internal_emit(
             "_core/subscription/state_changed",
             sub_uuid=sub_uuid,

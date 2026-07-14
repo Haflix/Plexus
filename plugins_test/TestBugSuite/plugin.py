@@ -37,16 +37,21 @@ from plexus.utils import Plugin  # noqa: E402
 from plexus.decorators import async_log_errors, log_errors  # noqa: E402
 from plexus.exceptions import RequestException  # noqa: E402
 
-from plexus.networking import (  # noqa: E402
-    MSG_EXECUTE,
-    MSG_REQUEST_EVENT,
-    MSG_PING,
-    MSG_RESULT,
-    MSG_STREAM_CHUNK,
-    MSG_END_STREAM,
-    MSG_ERROR,
-    PeerSpec,
-)
+from plexus.networking import PeerSpec  # noqa: E402
+
+# The old MSG_* wire constants were DELETED with networking.py's god-class (the SPEC
+# networking rewrite replaces the [len][type][payload] protocol with netcore's framed
+# CHUNK protocol). The B-066 raw-wire cells below are guarded by `c.skip("networking not
+# enabled")` and only reach these when networking is on (i.e. the retired socket harness).
+# Kept as module-local constants (NOT re-added to the shim) so the module imports; the
+# raw-wire cells are being retired in favour of the netcore Type-X hostile-frame harness.
+MSG_EXECUTE = 1
+MSG_PING = 4
+MSG_RESULT = 10
+MSG_STREAM_CHUNK = 11
+MSG_ERROR = 12
+MSG_END_STREAM = 13
+MSG_REQUEST_EVENT = 16
 from plexus.serialization import generate_keypair, Serializable  # noqa: E402
 
 from _test_helpers import CaseRecorder  # noqa: E402
@@ -292,6 +297,8 @@ class TestBugSuite(Plugin):
 
         # ---- B-081 (audit BUG-028) -----------------------------------
         async def body_b_081_sync_gen_close_worker_thread(c):
+            c.skip("old-NM _drive_sync_gen_stream internals retired by netcore; the "
+                   "close-vs-next serialization is covered by netcore dispatch §F#20 + selftest")
             # BUG-028 / B-081: the sync-generator branch of
             # _handle_request_event_stream used to close the generator in a
             # finally on the event-loop thread; on a stream timeout that close
@@ -420,7 +427,15 @@ class TestBugSuite(Plugin):
         fake_port: Optional[int] = None,
         hostname: Optional[str] = None,
     ) -> Dict[str, Any]:
-        nm = self._plexus.network
+        # RETIRED (netcore rewrite): the B-066 raw-wire harness drives the deleted
+        # [len][type][payload] MSG_* protocol + old-NM peer maps (`register_in_maps`,
+        # trust-store pokes). Those behaviors are covered by the netcore self-tests
+        # (mTLS+SPKI, anti-spoof, framing) + the wave-2 hostile-frame harness. Raising
+        # the recorder's skip signal here neutralizes every B-066/B-018b wire cell that
+        # builds a test peer, without editing each one.
+        from _test_helpers import _SkipSignal as _SS
+        raise _SS()
+        nm = self._plexus.network  # noqa: E501  (unreachable — retained for diff clarity)
         # Every test peer uses a UNIQUE subject CN. If
         # two self-signed CA certs in the trust store share Subject DN,
         # OpenSSL's chain-builder picks the FIRST match by name and
@@ -2129,6 +2144,9 @@ class TestBugSuite(Plugin):
 
         # ---- Test 5 — client-side pin rejects unpinned server ----
         async def body_b_066_client_side_pin_rejects_unpinned_server(c):
+            c.skip("old-NM cert_path / raw client-context internals retired by the netcore "
+                   "rewrite; the SPKI-pin client-side rejection of an unpinned server is "
+                   "covered by the netcore transport/membership self-tests (S3b)")
             nm = self._plexus.network
             actual_keys_dir = tempfile.mkdtemp(prefix="b066_test5_actual_")
             expected_keys_dir = tempfile.mkdtemp(prefix="b066_test5_expected_")

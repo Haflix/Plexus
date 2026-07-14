@@ -1,6 +1,6 @@
 # Notifier and Events
 
-*Last updated for Plexus 0.66.0*
+*Last updated for Plexus 0.74.0*
 
 Deep dive on the topic-based event system. The user-facing Plugin
 methods are covered in [api_reference.md](./api_reference.md); this page
@@ -233,8 +233,9 @@ filters; if sub 1 were filtered out (it blocks the publisher, wrong host,
 etc.) request_event falls through to sub 2. If you want the exact match
 to win unconditionally, register it first.
 
-Disabled subs (`enabled: false`) are skipped at match time but stay in
-the registry for advert / introspection.
+Disabled subs (`enabled: false`) are skipped at match time and excluded
+from the directory snapshot this node exports to peers, but stay in the
+registry for introspection.
 
 ---
 
@@ -321,12 +322,13 @@ deployment without removing the YAML.
 
 **Disabled subs** (subscriber side):
 
-- Stay in the registry — visible to introspection and advertised to
-  peers.
+- Stay in the registry, visible to introspection, but EXCLUDED from the
+  directory snapshot this node exports to peers (the export filter drops a
+  disabled sub), so peers do not route to it.
 - Skipped by `find_all` at match time.
 
-Useful for feature flags and for advertising future bindings without
-activating them yet.
+Useful for feature flags: a disabled sub is local-only and invisible to
+peers until it is enabled.
 
 ### Toggling at runtime
 
@@ -343,11 +345,13 @@ Sync mirrors `set_subscription_enabled_sync` / `set_event_enabled_sync`
 exist for worker-thread callers. Returns `True` on success (including
 no-op when already at target value), `False` on unknown id.
 
-On a True transition for subscriptions, the framework broadcasts an
-add-delta to peers; on False, a remove-delta. Events are local-only
-(publishers never advertise). Both surfaces emit
-`_core/subscription/state_changed` or `_core/event/state_changed`
-on actual change — TUI and other observers can react.
+There is no delta broadcast to peers. Toggling a subscription's `enabled`
+flag changes what this node exports in its directory snapshot, hence its
+content hash, so peers pick the change up when they next PULL the directory
+on the heartbeat. Events are local-only (publishers are not exported in the
+directory). Both surfaces emit `_core/subscription/state_changed` or
+`_core/event/state_changed` on actual change — TUI and other observers can
+react.
 
 ---
 
@@ -430,8 +434,11 @@ route to a declared endpoint named via `target_access_name`.
 multiple matching subs, insertion order picks the winner.
 
 Local subs are tried first. On no local match, remote candidates are
-tried in advert insertion order — the order in which peers told us about
-their subs. The one exception: a request whose publisher resolves to
+tried in **hostname-lexicographic** order (then declaration order within
+a peer). Netcore has no advert push: each node PULLS its peers' exported
+subscription snapshots on the heartbeat, so the candidate order is by peer
+hostname, not by when a peer told us about a sub. The one exception: a
+request whose publisher resolves to
 `hosts="local"` does NOT fall through to remote. It short-circuits before
 the peer loop and raises `RequestException` on a no-local-match, since a
 local-only request was never meant to reach network peers. The same
@@ -508,13 +515,22 @@ production.
 
 ## Cross-node behaviour (preview)
 
-Each subscription registered locally is advertised to peers via the
-wire-protocol advert messages. When a publisher fires, the framework
-fans out to local subscribers AND schedules `MSG_PUBLISH_EVENT` to peers
-whose advertised subs match. For `request_event`, on no local match,
-the framework iterates advertised subs in insertion order (across
-peers) and tries each candidate over the wire. See
-[networking.md](./networking.md) for the full picture.
+Each node's remote-eligible subscriptions are exported in its directory
+snapshot, which peers PULL by content hash on every heartbeat (there is no
+advert push, delta, or ack). When a publisher fires, the framework fans out
+to local subscribers AND sends one `CALL{mode=FANOUT}` frame to each peer
+with a matching exported sub. For `request_event`, on no local match, the
+framework tries candidate peers in hostname-lexicographic order and sends a
+`CALL{mode=FIRST}` over the wire. See [networking.md](./networking.md) for
+the full picture.
+
+**`authors:` / `blocked_authors:` (and `hosts:`) are a routing and matching
+convenience, not a cross-node security boundary.** A peer-originated call is
+attributed from the authenticated SPKI-pinned identity, and `author="system"`
+is granted only from the callee's own `system_caller` record for that peer,
+never from the wire. The trust boundary is the pin plus the roster gate plus
+the anti-spoof check; the author/host filters only decide which subscription
+matches once a call has already been authenticated.
 
 ---
 

@@ -5,9 +5,9 @@ allowlist of safe stdlib types plus any plugin classes that opt in via
 the Serializable mixin (or SerializableException for exception classes).
 
 The pre-auth pickle.loads RCE surface (B-066) is closed by the mTLS
-fingerprint pinning layer in plexus.networking — this module addresses
-the post-auth defense-in-depth: a compromised pinned peer cannot RCE
-other peers via crafted pickle payloads either.
+SPKI-fingerprint pinning layer in plexus.netcore (transport / membership)
+— this module addresses the post-auth defense-in-depth: a compromised
+pinned peer cannot RCE other peers via crafted pickle payloads either.
 
 Plugin authors:
 - Custom data classes that traverse the wire: inherit `Serializable`.
@@ -32,8 +32,9 @@ from typing import Any, Dict, FrozenSet, Optional, Tuple, Type
 _logger = logging.getLogger(__name__)
 
 
-# Module-level constant for the CLI command — referenced by migration errors
-# elsewhere. If the CLI module name changes, update only this line.
+# Module-level constant for the CLI command (re-exported from plexus and the
+# plexus.networking shim for docs + tooling). If the CLI module name changes,
+# update only this line.
 FINGERPRINT_CLI_CMD: str = "python -m networking_cli show-fingerprint"
 
 
@@ -146,7 +147,7 @@ _EXCEPTION_REGISTRY: Dict[Tuple[str, str], Type] = {}
 
 # R3-SS-1 fix: process-terminating exception classes must never enter the
 # registry. A compromised pinned peer could otherwise pickle SystemExit(0)
-# (or KeyboardInterrupt / GeneratorExit) as an MSG_ERROR payload, and
+# (or KeyboardInterrupt / GeneratorExit) in an ERROR frame's exc payload, and
 # execute_remote / execute_remote_stream would raise it verbatim — SystemExit
 # would terminate the receiving process with no stack trace. These classes
 # are deliberately excluded from cross-node propagation; only ordinary
@@ -168,13 +169,13 @@ def _populate_exception_registry():
     C-046 fix: module import failures are logged at WARNING with the
     module name and exception. Previously the failure was silently
     swallowed, leaving the registry partial — cross-network
-    ``MSG_ERROR`` frames carrying exception types from a missing module
+    ``ERROR`` frames carrying exception types from a missing module
     would then be rejected with an opaque "not allowlisted" error and
     no diagnostic linking the failure back to the missing module.
 
     R3-SS-1 fix: process-terminating exception classes (SystemExit,
     KeyboardInterrupt, GeneratorExit) are explicitly excluded so a
-    compromised peer cannot send one as MSG_ERROR and terminate the
+    compromised peer cannot send one in an ERROR frame and terminate the
     receiving process.
     """
     for module_name in _TRUSTED_EXCEPTION_MODULES:
@@ -258,7 +259,7 @@ class SerializableException(Exception, Serializable):
     """Plugin-defined exceptions that need to traverse the network must
     inherit from this mixin. Plain Exception subclasses raised inside
     remote handlers will be replaced with NetworkRequestException on the
-    receive side (see plexus.networking MSG_ERROR receive path).
+    receive side (see the ERROR-frame receive path in plexus.netcore.dispatch).
 
     For exception subclasses with complex __init__ signatures, ensure
     the args passed to super().__init__() are pickle-friendly (strings,

@@ -77,7 +77,7 @@ from plexus.ratelimiter import (  # noqa: E402
 
 from _test_helpers import CaseRecorder  # noqa: E402
 
-SUITE_VERSION = "0.11.0"
+SUITE_VERSION = "0.12.0"
 SUITE = "TestRateLimitSuite"
 TARGET = "TestRateLimitTarget"
 
@@ -112,8 +112,9 @@ class TestRateLimitSuite(Plugin):
         at the OUT admit -- the plugin_out / self-call charge keys on the
         in-chain caller, which only exists one dispatch level deep. Catch the
         RateLimitException HERE (it is raised as its real type at the OUT site,
-        before the request is created) and report it; the outer dispatch would
-        otherwise re-wrap a handler error as a plain RequestException."""
+        before the request is created) and report it. (Since #2 unified typing the
+        outer dispatch also preserves the subtype, but this helper catches at the
+        inner OUT site regardless.)"""
         try:
             await self.execute(target, method)
             return {"rate_limited": False}
@@ -669,9 +670,9 @@ class TestRateLimitSuite(Plugin):
             # endpoint_in(TARGET:sink) only. A direct execute(TARGET, sink) charges
             # the IN-set at _call_endpoint (endpoint_in + plugin_in; plugin_in
             # unconfigured -> skipped). The IN reject is raised at _call_endpoint
-            # and caught by _process_request, which stringifies it into the
-            # request error -> the caller sees a plain RequestException, NOT
-            # RateLimitException (the documented IN-local degrade).
+            # as a RateLimitException; #2 unified exception typing PRESERVES that
+            # type end-to-end (the object is stored + re-raised, no longer
+            # stringified into a plain RequestException on the IN-local path).
             self._apply({
                 (DIM_ENDPOINT_IN, endpoint_key(TARGET, "sink")): {"max": 3, "window": 1000},
             })
@@ -682,16 +683,16 @@ class TestRateLimitSuite(Plugin):
                 try:
                     await self.execute(TARGET, "sink")
                     oks += 1
-                except RateLimitException:
-                    outcome = "ratelimit"  # must NOT happen on the IN-local path
+                except RateLimitException as e:
+                    outcome = "ratelimit" if "endpoint_in" in str(e) else f"rl?{e}"
                     break
                 except RequestException as e:
-                    outcome = "req" if "endpoint_in" in str(e) else f"req?{e}"
+                    outcome = f"req?{e}"  # #2: IN reject now surfaces as the subtype
                     break
-            if oks != 3 or outcome != "req":
+            if oks != 3 or outcome != "ratelimit":
                 raise AssertionError(
-                    f"endpoint_in must admit 3 then reject the 4th as a plain "
-                    f"RequestException naming endpoint_in; oks={oks} outcome={outcome!r}"
+                    f"endpoint_in must admit 3 then reject the 4th as a typed "
+                    f"RateLimitException naming endpoint_in; oks={oks} outcome={outcome!r}"
                 )
         await rec.run_case("ratelimit.in_endpoint_in", body, **kw)
 
@@ -804,16 +805,24 @@ class TestRateLimitSuite(Plugin):
             if chunks != ["s1", "s2"]:
                 raise AssertionError(f"first stream open should yield fully; got {chunks}")
             # second open: cost 2, bucket 0 -> reject before the first chunk.
+            # #2 stream type parity: the stream IN reject now surfaces as a typed
+            # RateLimitException (not a plain RequestException), matching the
+            # non-stream IN reject.
             named = False
+            typed = False
             try:
                 async for _ in self.execute_stream(SUITE, "ep_stream"):
                     pass
+            except RateLimitException as e:
+                typed = True
+                named = "endpoint_in" in str(e)
             except RequestException as e:
                 named = "endpoint_in" in str(e)
-            if not named:
+            if not (typed and named):
                 raise AssertionError(
                     "second stream open must reject (cost=stream_weight=2 vs 0 "
-                    "tokens) naming endpoint_in"
+                    "tokens) as a typed RateLimitException naming endpoint_in "
+                    f"(#2 stream type parity); typed={typed} named={named}"
                 )
         await rec.run_case("ratelimit.in_stream_weight", body, **kw)
 

@@ -1,6 +1,6 @@
 # Plugin Authoring Guide
 
-*Last updated for Plexus 0.66.0*
+*Last updated for Plexus 0.74.0*
 
 Write a plugin from scratch. This page walks through the moving parts in
 the order an author meets them; reference details live in
@@ -156,7 +156,7 @@ Top-level fields:
 | Field | Type | Required | Default | Notes |
 |---|---|---|---|---|
 | `description` | str | recommended | `"UNKNOWN"` | Human-readable. |
-| `version` | str | recommended | `"0.0.0 - not given"` | Bump on every change to the plugin. |
+| `version` | str | recommended | `"0.0.0"` | Bump on every change to the plugin. |
 | `remote` | bool | recommended | `false` | Plugin-level remote flag. Required *together with* the per-endpoint `remote` flag for a peer to reach an endpoint. |
 | `arguments` | dict / null | recommended | `null` | Forwarded to `on_load`. Must be dict-or-null at the YAML level. |
 | `endpoints` | dict keyed by access_name | recommended | `{}` | See below. List form is rejected. |
@@ -654,9 +654,9 @@ asyncio.create_task(self._plexus.disable_plugin(self.plugin_name))
 ### Observers of `_core/plugin/state_changed`
 
 Internal event-bus observers (registered via `plx.internal_observe(...)`)
-receive a synchronous callback for every state transition with payload
-`(name, from_state, to_state, ts)` (state strings are the enum
-`.value`). Observer contract:
+receive a synchronous callback `cb(topic, payload)` for every state transition.
+`payload` is a dict (not a positional tuple) with keys `name`, `from_state`,
+`to_state`, `ts` (the state strings are the enum `.value`). Observer contract:
 
 - Sync only — observers MUST return in `<1ms`. Heavy work goes to
   `asyncio.create_task(...)`.

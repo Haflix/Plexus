@@ -1,6 +1,6 @@
 # Configuration
 
-*Last updated for Plexus 0.66.0*
+*Last updated for Plexus 0.74.0*
 
 Reference for the top-level `config.yml` — the file Plexus reads on
 startup to find plugins, configure the runtime, and (when enabled) wire
@@ -233,7 +233,7 @@ general:
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `hostname` | str | `socket.gethostname()` if empty | This node's identity for `local` / `remote` host filtering and for the advert protocol. |
+| `hostname` | str | `socket.gethostname()` if empty | This node's identity for `local` / `remote` host filtering and the canonical routing key for cross-node dispatch. |
 | `plugin_package` | str | `"plugins"` | Default base directory for plugin entries that omit `path:`. |
 | `console_log_level` | str | `"DEBUG"` | Level for the stdout/stderr handler. One of `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`, `MUTE`. |
 | `file_log_level` | str | `"DEBUG"` | Level for the file handler. Same valid set. |
@@ -385,8 +385,8 @@ thresholds (config + plugin sources combined).
 ## `networking:` (dict)
 
 Cluster topology. See [networking](./networking.md) for the
-operational reference (trust model, peer setup, advert protocol). This
-section documents the YAML keys.
+operational reference (trust model, peer setup, the directory-pull
+routing model). This section documents the YAML keys.
 
 When `enabled: false`, the rest of this section is mostly inert —
 `NetworkManager` is never created, and only `enabled` is consulted.
@@ -396,11 +396,8 @@ networking:
   enabled: true
   port: 2510
   hostname: ""
-  keys_dir: "_keys"
-  pool_size: 5
-  discover_nodes: true
-  direct_discoverable: true
-  auto_discoverable: false
+  keys_dir: "keys"
+  discoverable: false        # opt in to §4.7 vouch-discovery
   peers:
     - hostname: "node-b"
       address: "10.0.0.2"
@@ -413,38 +410,48 @@ networking:
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `enabled` | bool | `false` | Toggles all networking. When `false`, `NetworkManager` is not created. |
-| `port` | int | `2510` | Cluster default TCP port for the mTLS server. Per-peer port overrides allowed via `address: ip:port`. |
+| `port` | int | `2510` | Default TCP port for the mTLS server. Per-peer port overrides via `address: ip:port`. |
 | `hostname` | str | `socket.gethostname()` | Node's networking hostname. Separate from `general.hostname` if needed for tests. |
-| `keys_dir` | str | `"_keys"` | Where this node's `cert.pem` / `key.pem` live (auto-generated on first run). Resolved relative to the config file's directory if not absolute. |
-| `peers` | list[dict] | `[]` | Peer trust list. **Required (non-empty)** when networking is enabled. See below. |
-| `pool_size` | int | `5` | Idle-return buffer depth per `(ip, port)`. Coerced to a positive int (`< 1`, non-numeric, or `0` fall back to the default; `0` would otherwise make the pool Queue unbounded). |
-| `discover_nodes` | bool | `false` | Run periodic node-lookup loop (`update_all_nodes`). |
-| `direct_discoverable` | bool | `false` | Allow peers that explicitly know this node's IP to connect. Auto-coerced to `true` when `auto_discoverable=true`. |
-| `auto_discoverable` | bool | `false` | Allow peers to find this node via subnet scan. Forces `direct_discoverable=true`. |
-| `heartbeat_interval` | float | `10.0` | Seconds between heartbeat ticks. Each tick pings every peer; on failure the peer is marked dead. Bad values fall back to default with a warning. |
-| `lookup_interval` | float | `60.0` | Seconds between discovery / `update_all_nodes` loop ticks. Re-resolves peer addresses and reaps unreachable nodes. Bad values fall back to default with a warning. |
-| `liveness_timeout` | float | `30.0` | A peer whose last successful heartbeat is older than this is considered dead. Should be `>= heartbeat_interval`; 2-3× is typical. Bad values fall back to default with a warning. |
-| `probe_timeout` | float | `min(heartbeat_interval, liveness_timeout)` | Per-probe budget for a single heartbeat ping (R2-LL-5). Bad values fall back to the default. |
-| `resync_interval` | float | `300.0` | Seconds between periodic full sub-snapshot resyncs that scrub ghost subscriptions (C-109). The next heartbeat tick after this interval re-sends a `MSG_SUB_ADVERTISE` snapshot. |
-| `connect_timeout` | float | `10.0` | Per-attempt budget for a single outbound TCP + TLS connect. A black-holed peer can no longer hang a caller forever. Bad values fall back to the default. Hot-reloadable. |
-| `inbound_idle_timeout` | float | `120.0` | Idle ceiling for an inbound server-side connection between requests; a connection with no request for this long is reaped. Floored at `3 × heartbeat_interval` (a healthy peer that only heartbeats is never false-reaped; the reaped socket is read-only so the peer just reconnects on demand). Bad values fall back to the default. Hot-reloadable. |
-| `request_timeout` | float | `30.0` | Fallback **per-frame** read deadline for an outbound request/stream when the caller passes no explicit `timeout`. Applies to each frame independently (including the first chunk of a stream), so a cross-node stream whose producer is legitimately slow (e.g. a >30s time-to-first-token model) should pass an explicit generous `timeout` at the call site rather than rely on this default. Bad values fall back to the default. Hot-reloadable. |
-| `max_outbound_connections` | int | `20` | Global cap on concurrently checked-out outbound connections (a process-wide semaphore); bounds the fd/socket storm a wide/slow publish fan-out could open. Callers beyond the cap block until a slot frees (backpressure). Bad values fall back to the default. **Restart-only** — the semaphore is minted once and `asyncio.Semaphore` has no live resize, so a hot-reload of this value updates the stored attr but the live cap changes only on a full restart. |
+| `keys_dir` | str | `"keys"` | Where this node's `cert.pem` / `key.pem` live (auto-generated on first run). Resolved relative to the config file's directory if not absolute. |
+| `peers` | list[dict] | `[]` | Peer trust list (see below). Empty is tolerated: the acceptor binds and swaps in the live TLS context on the first `add_peer`; the SPKI pin + roster gate still reject any unpinned inbound. |
+| `discoverable` | bool | `false` | Opt in to §4.7 vouch-discovery: accept peers vouched by an already-trusted peer, so a star can grow edges. Explicit `peers:` pins work regardless of this. Legacy `auto_discoverable` / `direct_discoverable` are accepted as aliases (either `true` → `discoverable`). |
+| `vouch_active_cap` | int | `64` | Max peers a single voucher may introduce via discovery (only relevant when `discoverable`). `<= 0` → default. |
+| `heartbeat_interval` | float | `10.0` | Seconds between heartbeat/liveness pulses to each peer. **Adopted on rebuild/restart** (see the adoption note below), not live. Bad values → default. |
+| `probe_timeout` | float | `2.0` | Per-probe budget for a single heartbeat ping. Adopted on rebuild/restart. Bad values → default. |
+| `liveness_timeout` | float | `30.0` | A peer whose last successful contact is older than this is unreachable (effective miss tolerance ≈ `liveness_timeout / heartbeat_interval`). Should be `>= heartbeat_interval`; 2-3× typical. Adopted on rebuild/restart. Bad values → default. |
+| `idle_read_deadline` | float | `max(2 × heartbeat_interval, 20)` | Idle-read deadline on an inbound link: no frame for this long tears the link and fast-fails its pending requests. Legacy alias: `inbound_idle_timeout`. Bad values → default. |
+| `stream_idle_deadline` | float | `30.0` | Per-chunk idle bound on a cross-node stream: a producer that stalls longer than this between chunks fails the stream closed. Raise it for a legitimately slow producer (e.g. a >30s time-to-first-token model). Legacy alias: `request_timeout`. `<= 0` → default. |
+| `connect_timeout` | float | `10.0` | Per-attempt budget for a single outbound TCP + TLS connect, so a black-holed peer cannot hang a dialer forever. `<= 0` → default. Adopted on rebuild/restart. |
+| `ping_floor_interval` | float | `max(0.5, heartbeat_interval × 0.5)` | Minimum spacing between directory-snapshot serves to one peer (rate-limits pull churn). Bad values → default. |
+| `per_cid_reassembly_cap` | int | `8388608` (8 MB) | Max reassembly bytes held for ONE in-flight message (per-message DoS guard). `<= 0` → default. |
+| `per_peer_reassembly_cap` | int | `16777216` (16 MB) | Max reassembly bytes across all in-flight messages from ONE peer. The biggest single value you can receive = `min(per_cid, per_peer)`, so raise BOTH to move larger single payloads. `<= 0` → default. |
+| `node_reassembly_cap` | int | `134217728` (128 MB) | Aggregate reassembly ceiling across all peers — size it to the node's memory budget. `<= 0` → default. |
+| `per_peer_cid_cap` | int | `64` | Max concurrent in-flight inbound CALLs from one peer; the next one gets an immediate `NETWORK` error. Raise for a busy orchestrator that fans many parallel calls at one node. `<= 0` → default. |
+| `lan_cidrs` | list[str] | built-in LAN ranges | CIDR ranges a vouched peer's advertised address must fall within before it is dialed (discovery safety). |
 
-The validators check `enabled`, `port`, `auto_discoverable`,
-`direct_discoverable`, and `discover_nodes` for presence (warn on
-missing).
+**Adoption:** all networking knobs are read once, at `NetworkManager` construction.
+A rebuild is triggered only by a change to `peers` / `port` / `enabled` / `hostname` /
+`keys_dir`. So a config change to a timing / discovery / timeout / cap knob **alone**
+is adopted on the next rebuild (one of those trigger fields also changing) or on a full
+restart — it does **not** take effect live mid-run.
+
+The presence-check validators warn on the LEGACY discovery keys
+(`auto_discoverable` / `direct_discoverable`, and the retired `discover_nodes`),
+not the current `discoverable`. A config that sets only `discoverable:` still
+works (the legacy names are accepted as aliases), but expect a harmless "missing"
+warning for the legacy keys.
 
 ### Per-peer fields (`peers:` entries)
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
-| `hostname` | str | YES | Canonical key for advert state and routing. |
-| `address` | str | YES | `ip`, `ip:port`, or `[ipv6]:port`. Bare IP uses cluster default port. |
+| `hostname` | str | YES | Canonical routing key (survives reconnect / IP change). |
+| `address` | str | YES | `ip` or `ip:port`. Bare IP uses cluster default port. |
 | `cert_file` | str | one of | Path to the peer's PEM-encoded certificate, relative to the config file. |
 | `cert_pem` | str | one of | Inline PEM string. Pick `cert_file` OR `cert_pem`. |
 | `fingerprint` | str | optional | `sha256:<hex>` of the SubjectPublicKeyInfo DER. Derived from the cert at parse time; if supplied, must match (mismatch is a hard error). |
 | `system_caller` | bool | optional | When `true`, this peer's calls inherit `"system"` author privileges (bypasses author whitelists). Default `false`. |
+| `dial` | str | optional | Per-edge dialer override for a NAT edge. Its PRESENCE (any value) flips this side into a dialer when hostname-lex election would otherwise make it the acceptor; the peer is dialed at its configured `address` (the `dial` value itself is never read). Rarely needed. |
 
 ```yaml
 peers:
@@ -462,10 +469,13 @@ peers:
     fingerprint: "sha256:abcd..."
 ```
 
-When `networking.enabled: true` and `peers` is empty,
-`NetworkManager.start()` raises a fail-fast error with migration
-guidance — an empty trust store would otherwise reject every connection
-with an opaque OpenSSL error.
+An empty `peers:` list with `networking.enabled: true` is tolerated: the
+node loads or generates its own identity, binds the acceptor with an
+empty-cadata listener, and simply has nothing to talk to until a peer is
+added (via a config reload or, with `discoverable`, a vouch). The SPKI
+post-check plus the roster gate still reject any unpinned inbound. This
+makes first-boot productive: a fresh node comes up and logs its
+fingerprint and cert so you can populate the other nodes' `peers:`.
 
 ### Removed / legacy fields
 
@@ -507,10 +517,7 @@ general:
 networking:
   enabled: false
   port: 2510
-  discover_nodes: false
-  direct_discoverable: false
-  auto_discoverable: false
-  peers: []                 # required non-empty when networking.enabled is true
+  peers: []                 # tolerated empty; add peers (or enable discoverable) to connect
 ```
 
 This is enough to boot. Defaults handle everything else: hostname is
@@ -542,11 +549,8 @@ networking:
   enabled: true
   hostname: alpha
   port: 2510
-  keys_dir: "_keys"
-  pool_size: 5
-  discover_nodes: true
-  direct_discoverable: true
-  auto_discoverable: false
+  keys_dir: "keys"
+  discoverable: false        # opt in to §4.7 vouch-discovery
   peers:
     - hostname: beta
       address: "10.0.0.2:2510"
@@ -580,6 +584,11 @@ validates it, and re-applies it. The async wrapper is
   `__init__` + `on_enable` path).
 - Plugin-source per-logger runtime overrides survive the reload (they
   are auto-cleared only on disable / pop / purge / shutdown).
+- **Networking** knobs are read once at `NetworkManager` construction. A reload
+  rebuilds networking only when `peers` / `port` / `enabled` / `hostname` /
+  `keys_dir` changes; a reload that touches only timing / discovery / timeout /
+  cap knobs adopts them on the next such rebuild or on restart, not live (see the
+  networking-keys table above).
 
 `save_config_file(path, content, backup=True)` validates a YAML
 payload and writes it to disk (with a `.bak` if `backup=True`). It

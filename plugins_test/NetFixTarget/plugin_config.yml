@@ -1,0 +1,237 @@
+description: Wave-2 cross-node service fixture (remote=True) — unary/echo/tag/stream endpoints + slow-handler flag + networkish raiser + rate control + fan-out topic handlers, for the networking-rewrite socket cells
+version: 0.1.1
+remote: True
+arguments:
+subscriptions:
+endpoints:
+  echo_unary:
+    internal_name: echo_unary
+    tags:
+      - netfix
+    remote: True
+    accessible_by_other_plugins: True
+    description: Echo the payload back (round-trip / fall-through)
+    arguments:
+      - name: payload
+
+  add:
+    internal_name: add
+    tags:
+      - netfix
+    remote: True
+    accessible_by_other_plugins: True
+    description: Small fast unary add (concurrent-small-call / fall-through order)
+    arguments:
+      - name: a
+      - name: b
+
+  echo_bytes:
+    internal_name: echo_bytes
+    tags:
+      - netfix
+    remote: True
+    accessible_by_other_plugins: True
+    description: Return exactly n_bytes of a fill byte (large-payload / exact-boundary byte-exact round-trip)
+    arguments:
+      - name: n_bytes
+      - name: fill
+
+  whoami:
+    internal_name: whoami
+    tags:
+      - netfix
+    remote: True
+    accessible_by_other_plugins: True
+    description: Identify the answering instance (hostname + plugin_uuid) for fall-through-order + uuid-target cells
+    arguments:
+
+  tagged_probe:
+    internal_name: tagged_probe
+    tags:
+      - netfix
+      - netfix_tool
+    remote: True
+    accessible_by_other_plugins: True
+    description: Tag-carrying endpoint for cross-node find_endpoints_by_tag (host may add ai_tool)
+    arguments:
+
+  slow_handler:
+    internal_name: slow_handler
+    tags:
+      - netfix
+    remote: True
+    accessible_by_other_plugins: True
+    description: Sleep then set a side-effect flag — cancelled handler leaves the flag UNSET (handler-timeout / catatonic cells)
+    arguments:
+      - name: delay
+      - name: key
+
+  get_flag:
+    internal_name: get_flag
+    tags:
+      - netfix
+    remote: True
+    accessible_by_other_plugins: True
+    description: Read a side-effect flag (UNSET == handler was cancelled)
+    arguments:
+      - name: key
+
+  reset_flags:
+    internal_name: reset_flags
+    tags:
+      - netfix
+    remote: True
+    accessible_by_other_plugins: True
+    description: Clear all side-effect flags
+    arguments:
+
+  raise_networkish:
+    internal_name: raise_networkish
+    tags:
+      - netfix
+    remote: True
+    accessible_by_other_plugins: True
+    description: Raise a NetworkRequestException from the handler (nested-Network wrap / propagate-not-fall-through)
+    arguments:
+
+  relay_call:
+    internal_name: relay_call
+    tags:
+      - netfix
+    remote: True
+    accessible_by_other_plugins: True
+    description: Reverse-call helper — execute another node's endpoint FROM this node (bidirectional-transfer TG-08, both-directions-heal TP-09)
+    arguments:
+      - name: target_plugin
+      - name: endpoint
+      - name: args
+      - name: hosts
+
+  r_rl_configure:
+    internal_name: r_rl_configure
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Apply/clear a rate_limits config live on this node (drives cross-node throttle without a static config)
+    arguments:
+      - name: rate_limits
+
+  r_rl_stats:
+    internal_name: r_rl_stats
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: This node's RateLimiter.stats() over the wire (exact per-bucket charge counts)
+    arguments:
+
+  stream_n:
+    internal_name: stream_n
+    tags:
+      - netfix
+    remote: True
+    accessible_by_other_plugins: True
+    description: Async gen yielding N items
+    arguments:
+      - name: n
+
+  stream_empty:
+    internal_name: stream_empty
+    tags:
+      - netfix
+    remote: True
+    accessible_by_other_plugins: True
+    description: Async gen yielding zero items (clean-close empty stream)
+    arguments:
+
+  stream_huge_item:
+    internal_name: stream_huge_item
+    tags:
+      - netfix
+    remote: True
+    accessible_by_other_plugins: True
+    description: Async gen yielding one item exceeding the per-cid 8MB reassembly bound (cid drops, stream fails, link stays up)
+    arguments:
+      - name: size_mb
+
+  stream_mid_raise:
+    internal_name: stream_mid_raise
+    tags:
+      - netfix
+    remote: True
+    accessible_by_other_plugins: True
+    description: Async gen yielding N items then raising (mid-stream raise)
+    arguments:
+      - name: n
+
+  stream_infinite:
+    internal_name: stream_infinite
+    tags:
+      - netfix
+    remote: True
+    accessible_by_other_plugins: True
+    description: Async gen yielding forever (head-of-line-block guard)
+    arguments:
+      - name: tick
+
+  stream_slow:
+    internal_name: stream_slow
+    tags:
+      - netfix
+    remote: True
+    accessible_by_other_plugins: True
+    description: Async gen yielding one item then stalling (remote stream idle/chunk-deadline timeout type)
+    arguments:
+      - name: n
+      - name: delay
+
+  fix_probe_handler:
+    internal_name: fix_probe_handler
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: request_event handler subscribed at runtime to fix/probe
+    arguments:
+      - name: event
+
+  caller_echo_handler:
+    internal_name: caller_echo_handler
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Returns the framework-resolved caller identity (system-caller-spoof / anti-spoof Type-X cells)
+    arguments:
+      - name: event
+
+  fix_who_handler:
+    internal_name: fix_who_handler
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: request_event handler identifying the answering node (fall-through order)
+    arguments:
+      - name: event
+
+  fix_fanout_handler:
+    internal_name: fix_fanout_handler
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: publish fan-out handler subscribed at runtime to fix/fanout — records each payload in order
+    arguments:
+      - name: event
+
+  fanout_log:
+    internal_name: fanout_log
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Readback of the recorded fan-out order/contents
+    arguments:
+
+  reset_fanout:
+    internal_name: reset_fanout
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Clear the fan-out log
+    arguments:

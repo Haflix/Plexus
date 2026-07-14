@@ -31,7 +31,7 @@ Submodules:
     runtime             — shared threadlocal + recursion-guard ContextVars + lifecycle timeouts
     helpers.config      — stateless config-load / validation helpers (extracted from core)
     utils               — Plugin base, Request, Event, ConfigUtil, LogUtil
-    networking          — NetworkManager + mTLS + advert protocol
+    networking          — compat shim re-exporting netcore.NetworkManager + mTLS pinning
     notifier            — TopicRegistry + Subscription + SyncDispatcher
     decorators          — @log_errors / @handle_errors family
     exceptions          — framework exception hierarchy
@@ -40,7 +40,7 @@ Submodules:
     networking_classes  — Node + RemotePlugin data classes
 """
 
-__version__ = "0.69.13"
+__version__ = "0.74.1"
 
 from .core import Plexus
 from .utils import (
@@ -145,9 +145,10 @@ __all__ = [
     "PluginState",
     "Node",
     "RemotePlugin",
-    # C-170: networking dataclasses referenced in public networking
-    # docs (peers: schema, advert protocol). Operators sometimes need
-    # to construct PeerSpec for tests / fixtures.
+    # C-170: PeerSpec is referenced in the public networking docs (peers:
+    # schema); operators construct it for tests / fixtures. AdvertSub is a
+    # retired no-op husk, re-exported only so a few legacy importers do not
+    # ImportError (the advert protocol itself is gone — netcore is pull-based).
     "AdvertSub",
     "PeerSpec",
     "TopicRegistry",

@@ -1,5 +1,5 @@
 description: In-process minimal-NM regression guards for the networking advert/liveness layer (the B-085 P-cell family); pass-polarity guards for behavior that is correct today (B-082 advert-slot invariant, N-strikes death mechanics)
-version: 0.1.0
+version: 0.6.0
 remote: false
 arguments:
 dependencies:
