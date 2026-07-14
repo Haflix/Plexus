@@ -4,15 +4,17 @@ regression guards.
 These guards previously lived ONLY in the gitignored
 ``plugins_test/audit_2026_06/`` pytest dir, so they never ran in the
 ``test_application.py`` gate. Each case here constructs the internal class
-under test (decorator / Plugin / NetworkManager / EventMixin) directly — the
-same ``object.__new__`` + stub idiom the existing ``*UnitSuite`` plugins use —
-and asserts the FIXED behavior with ``expected_status="pass"`` (the inverse
-polarity of the audit ``xfail`` guards), so a regression turns the gate RED.
+under test (decorator / Plugin / EventMixin) directly, the same
+``object.__new__`` + stub idiom the existing ``*UnitSuite`` plugins use, and
+asserts the FIXED behavior with ``expected_status="pass"`` (the inverse polarity
+of the audit ``xfail`` guards), so a regression turns the gate RED.
 
-Categories: ``decorators`` / ``networking`` / ``events``.
+Categories: ``decorators`` / ``events``. (The old ``networking`` cells that drove
+the retired push/advert god-class internals were removed with the netcore
+rewrite; that coverage now lives in the netcore transport/dispatch self-tests
+plus wave-2.)
 """
 
-import asyncio
 import logging
 import sys
 from pathlib import Path
@@ -29,126 +31,14 @@ from plexus.decorators import (  # noqa: E402
     async_gen_handle_errors,
 )
 from plexus.exceptions import RequestException  # noqa: E402
-from plexus.networking import NetworkManager  # noqa: E402
-
-# MSG_RESULT was deleted with the old wire protocol; kept module-local (NOT in the shim)
-# so this suite imports. The cells that `object.__new__(NetworkManager)` + drive old-NM
-# wire internals are retired by the netcore rewrite (reworked next pass).
-MSG_RESULT = 10
 from plexus.events import EventMixin  # noqa: E402
 from plexus.core import Plexus  # noqa: E402
-from plexus.networking_classes import Node  # noqa: E402
 from plexus.runtime import _EMIT_DEPTH, _MAX_EMIT_DEPTH  # noqa: E402
 
 from _test_helpers import CaseRecorder  # noqa: E402
 
 
-SUITE_VERSION = "0.1.0"
-
-
-# --- networking stub stream objects (object-identity tracking only) ---------
-class _NetReader:
-    """Minimal asyncio.StreamReader stand-in."""
-
-
-class _PoolWriter:
-    """Pooled-connection writer stand-in for the _get_connection cases. Carries
-    the ``_aio_pool_generation`` the pull-side stale check reads; ``drain`` is a
-    no-op (healthy)."""
-
-    def __init__(self, generation: int = 0) -> None:
-        self.closed = False
-        self._aio_pool_generation = generation
-
-    def write(self, _data):
-        return None
-
-    async def drain(self):
-        return None
-
-    def close(self):
-        self.closed = True
-
-    async def wait_closed(self):
-        return None
-
-    def get_extra_info(self, *_a, **_k):
-        return None
-
-
-class _DrainTimeoutWriter:
-    """Writer whose ``drain`` raises TimeoutError, to drive the
-    _handle_execute_stream per-item drain-timeout early-return (BUG-007)."""
-
-    def __init__(self) -> None:
-        self.closed = False
-
-    def write(self, _data):
-        return None
-
-    async def drain(self):
-        raise asyncio.TimeoutError("simulated stuck-peer drain timeout")
-
-    def close(self):
-        self.closed = True
-
-    def get_extra_info(self, *_a, **_k):
-        return None
-
-
-class _RecordingWriter:
-    """Writer that records close()/write() for the BUG-030 cases."""
-
-    def __init__(self) -> None:
-        self.closed = False
-        self.write_calls = 0
-
-    def write(self, _data):
-        self.write_calls += 1
-
-    def close(self):
-        self.closed = True
-
-    async def drain(self):
-        return None
-
-    def get_extra_info(self, _name=None, default=None):
-        return default
-
-
-class _FakePlexusStream:
-    """self.plexus stand-in for BUG-007: admit + execute_stream returning a
-    tracked source async generator."""
-
-    def __init__(self, source_agen_factory):
-        self._factory = source_agen_factory
-        self.last_agen = None
-
-    def _rl_admit_inbound(self, _peer, _flag, _now=None):
-        return None  # admitted
-
-    def execute_stream(self, **_kwargs):
-        self.last_agen = self._factory()
-        return self.last_agen
-
-
-class _FakePlexusRaisingTimeout:
-    """self.plexus stand-in for BUG-030: execute()/execute_stream simulate a
-    plugin ENDPOINT that raises a plain builtins.TimeoutError (NOT a drain
-    timeout, yet the aliased type on 3.11+)."""
-
-    def _rl_admit_inbound(self, _peer, _flag, _now=None):
-        return None  # admitted
-
-    async def execute(self, *_a, **_k):
-        raise TimeoutError("handler endpoint timed out talking to upstream")
-
-    def execute_stream(self, *_a, **_k):
-        async def _agen():
-            raise TimeoutError("stream handler endpoint timed out")
-            yield  # pragma: no cover - makes this an async generator
-
-        return _agen()
+SUITE_VERSION = "0.2.0"
 
 
 # --- events stubs -----------------------------------------------------------
@@ -178,39 +68,6 @@ class _EvTopicRegistry:
 
     async def find_all(self, _topic):
         return list(self._subs)
-
-
-class _Pub019:
-    """Publisher for BUG-019: hosts='remote' so the local fan-out is skipped
-    and only the remote-dispatch block runs."""
-
-    plugin_name = "pub-plugin"
-    plugin_uuid = "pub-uuid"
-    verbose_notifier = False
-    events = {
-        "evt": {"enabled": True, "topic": "demo/topic", "hosts": "remote"},
-    }
-
-
-class _StubNM019:
-    """network stand-in for BUG-019: provides the per-peer dispatch dict, the
-    in-lock recheck lock, nodes, and a publish_event_remote spy that records
-    every ACTUALLY-scheduled fan-out."""
-
-    def __init__(self, per_peer_dict, nodes):
-        self.is_ready = True
-        self._per_peer = per_peer_dict
-        self.nodes = nodes
-        self._adverts_struct_lock = asyncio.Lock()
-        self._inflight_publishes = {}
-        self.scheduled_calls = []
-
-    async def _build_remote_dispatch(self, **_kwargs):
-        return self._per_peer
-
-    async def publish_event_remote(self, ip, *_a, **_k):
-        self.scheduled_calls.append(ip)
-        return None
 
 
 class _ConcretePlugin(Plugin):
@@ -277,17 +134,9 @@ class TestAuditPortUnitSuite(Plugin):
         await self._bug038_handle_errors_closes_inner(rec, kw)
         await self._bug043_call_time_guard(rec, kw)
 
-        # networking
-        await self._bug007_handle_execute_stream_closes_source(rec, kw)
-        await self._bug024_pooled_writer_tracked_before_healthcheck(rec, kw)
-        await self._bug025_drains_all_stale_in_one_call(rec, kw)
-        await self._bug030_handle_execute_routes_handler_timeout(rec, kw)
-        await self._bug030_handle_execute_stream_routes_handler_timeout(rec, kw)
-
         # events
         await self._bug017_depth_drop_preserves_suppressed_count(rec, kw)
         await self._bug018_stream_pre_dispatch_raise_emits_ended(rec, kw)
-        await self._bug019_disabled_peer_not_overcounted(rec, kw)
 
         return rec.to_dict()
 
@@ -391,269 +240,7 @@ class TestAuditPortUnitSuite(Plugin):
             **kw,
         )
 
-    # ----- networking (BUG-007, BUG-024, BUG-025, BUG-030) -----
-
-    async def _bug007_handle_execute_stream_closes_source(self, rec, kw):
-        # BUG-007: _handle_execute_stream wraps its source-agen consumption in
-        # try/finally: await agen.aclose(), so an early exit (here a per-item
-        # drain TimeoutError -> writer.close(); return) closes the SOURCE
-        # generator within the call -- its finally runs deterministically,
-        # not deferred to GC.
-        async def body(c):
-            c.skip("old-NM _handle_execute_stream wire internals retired by the netcore "
-                   "rewrite; covered by netcore transport/dispatch self-tests")
-            cleanup_ran = {"value": False}
-
-            async def _source():
-                try:
-                    yield "item-0"
-                    yield "item-1"  # never reached -> proves mid-stream exit
-                finally:
-                    cleanup_ran["value"] = True
-
-            nm = object.__new__(NetworkManager)
-            nm._logger = logging.getLogger("test.audit_port.BUG007")
-            nm.plexus = _FakePlexusStream(_source)
-            nm._self_impersonation_check = lambda a, w, l: False
-
-            async def _b018b(author, author_id, ctx, writer, label):
-                return author, author_id, False
-
-            nm._apply_b018b_guard = _b018b
-            nm._count_sent = lambda w, n: None
-
-            async def _noop_end(writer):
-                return None
-
-            nm._send_end_stream = _noop_end
-
-            writer = _DrainTimeoutWriter()
-            data = {
-                "plugin": "P", "method": "stream_it", "plugin_uuid": "u",
-                "author": "remote", "author_id": "remote", "timeout": None,
-                "author_host": None, "request_id": "r", "args": [],
-            }
-            await nm._handle_execute_stream(
-                reader=None, writer=writer, data=data,
-                conn_context={"peer_hostname": "stub-peer"},
-            )
-            # Sanity: took the drain-timeout early-return (writer closed).
-            c.expect(writer.closed, True)
-            # FIXED: source generator's finally ran within the call.
-            assert cleanup_ran["value"] is True, (
-                "source async generator must be aclose()d on early return, "
-                "not left for GC"
-            )
-
-        await rec.run_case(
-            "networking.handle_execute_stream_closes_source_on_early_return",
-            body, tags=("networking", "stream"), bug_ids=("BUG-007",),
-            category="networking", **kw,
-        )
-
-    async def _bug024_pooled_writer_tracked_before_healthcheck(self, rec, kw):
-        # BUG-024: _get_connection adds a pooled writer to _checked_out_writers
-        # IMMEDIATELY after pool.get() (before the async health check), so a
-        # concurrent stop() drain can see+close it. We drive the REAL
-        # _get_connection, park it inside the stubbed health check via an
-        # asyncio.Event, and assert the writer is tracked DURING the check (the
-        # buggy code only added it on the healthy return). Deterministic; the
-        # real stop() drain logic is intentionally NOT reproduced here.
-        async def body(c):
-            c.skip("old-NM _handle_execute*/_get_connection wire internals retired by the netcore rewrite; covered by netcore transport/dispatch self-tests")
-            IP = "10.0.0.7"
-            key = (IP, 9999)
-            nm = object.__new__(NetworkManager)
-            nm._logger = logging.getLogger("test.audit_port.BUG024")
-            nm.pool_size = 4
-            nm.connection_pools = {}
-            nm._checked_out_writers = set()
-            nm._pool_generation = {key: 0}
-            nm.peers_by_endpoint = {}
-            nm._stopping = False
-            nm._pool_key = lambda ip: key
-
-            reader = _NetReader()
-            writer = _PoolWriter(generation=0)  # matches current gen -> healthy
-            nm.connection_pools[key] = asyncio.Queue(maxsize=nm.pool_size)
-            nm.connection_pools[key].put_nowait((reader, writer))
-
-            in_healthcheck = asyncio.Event()
-            release = asyncio.Event()
-
-            async def _send_message(_w, _mt, _d):
-                in_healthcheck.set()
-                await release.wait()
-
-            async def _receive_message(_r):
-                return (MSG_RESULT, {})
-
-            nm._send_message = _send_message
-            nm._receive_message = _receive_message
-
-            task = asyncio.create_task(nm._get_connection(IP))
-            try:
-                await asyncio.wait_for(in_healthcheck.wait(), timeout=5.0)
-                # FIXED: writer tracked before the health check completes.
-                tracked_during = writer in nm._checked_out_writers
-                release.set()
-                _rd, wr = await asyncio.wait_for(task, timeout=5.0)
-            finally:
-                release.set()  # never let the task hang the suite
-                if not task.done():
-                    # Defensive: if setup ever failed before the happy path
-                    # awaited the task, cancel it rather than orphan it.
-                    task.cancel()
-                    try:
-                        await task
-                    except BaseException:
-                        pass
-
-            c.expect(wr is writer, True)
-            assert tracked_during is True, (
-                "pooled writer must be in _checked_out_writers DURING the "
-                "health check (tracked immediately after pool.get())"
-            )
-
-        await rec.run_case(
-            "networking.get_connection_tracks_pooled_writer_before_healthcheck",
-            body, tags=("networking", "pool"), bug_ids=("BUG-024",),
-            category="networking", **kw,
-        )
-
-    async def _bug025_drains_all_stale_in_one_call(self, rec, kw):
-        # BUG-025: _get_connection loops over pooled connections, draining ALL
-        # stale-generation writers in ONE call (pool empty after) instead of
-        # one-per-call. Seed 3 stale writers (generation != current), call once,
-        # assert the pool is fully drained and a fresh connection is returned.
-        async def body(c):
-            c.skip("old-NM _handle_execute*/_get_connection wire internals retired by the netcore rewrite; covered by netcore transport/dispatch self-tests")
-            IP = "10.0.0.8"
-            key = (IP, 9999)
-            nm = object.__new__(NetworkManager)
-            nm._logger = logging.getLogger("test.audit_port.BUG025")
-            nm.pool_size = 5
-            nm.connection_pools = {}
-            nm._checked_out_writers = set()
-            nm._pool_generation = {key: 5}  # current generation
-            nm.peers_by_endpoint = {}
-            nm._stopping = False
-            nm._pool_key = lambda ip: key
-
-            pool = asyncio.Queue(maxsize=nm.pool_size)
-            stale_writers = [_PoolWriter(generation=0) for _ in range(3)]
-            for w in stale_writers:
-                pool.put_nowait((_NetReader(), w))
-            nm.connection_pools[key] = pool
-
-            fresh_reader, fresh_writer = _NetReader(), _PoolWriter(generation=5)
-
-            async def _create_connection(_ip):
-                return (fresh_reader, fresh_writer)
-
-            nm._create_connection = _create_connection
-
-            _rd, wr = await nm._get_connection(IP)
-            # All 3 stale writers drained in ONE call -> pool empty.
-            c.expect(pool.empty(), True)
-            c.expect(all(w.closed for w in stale_writers), True)
-            c.expect(wr is fresh_writer, True)
-
-        await rec.run_case(
-            "networking.get_connection_drains_all_stale_in_one_call",
-            body, tags=("networking", "pool"), bug_ids=("BUG-025",),
-            category="networking", **kw,
-        )
-
-    async def _bug030_handle_execute_routes_handler_timeout(self, rec, kw):
-        # BUG-030: a handler-raised plain TimeoutError must route to the
-        # error-frame path (_send_error_pickled), not be misclassified as a
-        # drain timeout and suppressed. The _DrainTimeout marker distinguishes
-        # the two (on 3.11+ asyncio.TimeoutError IS builtins.TimeoutError).
-        async def body(c):
-            c.skip("old-NM _handle_execute*/_get_connection wire internals retired by the netcore rewrite; covered by netcore transport/dispatch self-tests")
-            nm = object.__new__(NetworkManager)
-            nm._logger = logging.getLogger("test.audit_port.BUG030e")
-            nm.plexus = _FakePlexusRaisingTimeout()
-            nm._self_impersonation_check = lambda a, w, l: False
-
-            async def _b018b(author, author_id, ctx, writer, label):
-                return author, author_id, False
-
-            nm._apply_b018b_guard = _b018b
-            sent = []
-
-            async def _spy_send_error_pickled(_w, exc):
-                sent.append(exc)
-
-            nm._send_error_pickled = _spy_send_error_pickled
-
-            writer = _RecordingWriter()
-            data = {
-                "plugin": "P", "method": "ep", "author": "remote",
-                "author_id": "remote", "author_host": None, "request_id": "r",
-                "args": [], "timeout": None,
-            }
-            await nm._handle_execute(None, writer, data, conn_context={})
-            # FIXED: the handler TimeoutError round-trips via the error frame.
-            assert len(sent) >= 1, (
-                "handler-raised TimeoutError must route to _send_error_pickled, "
-                "not be suppressed as a drain timeout"
-            )
-
-        await rec.run_case(
-            "networking.handle_execute_routes_handler_timeout_to_error_frame",
-            body, tags=("networking", "timeout"), bug_ids=("BUG-030",),
-            category="networking", **kw,
-        )
-
-    async def _bug030_handle_execute_stream_routes_handler_timeout(self, rec, kw):
-        # BUG-030 (stream): a streaming handler whose generator raises a plain
-        # TimeoutError must emit the __STREAM_EXCEPTION__ frame (via
-        # _send_stream_chunk), not be misclassified as a drain timeout.
-        async def body(c):
-            c.skip("old-NM _handle_execute*/_get_connection wire internals retired by the netcore rewrite; covered by netcore transport/dispatch self-tests")
-            nm = object.__new__(NetworkManager)
-            nm._logger = logging.getLogger("test.audit_port.BUG030s")
-            nm.plexus = _FakePlexusRaisingTimeout()
-            nm._self_impersonation_check = lambda a, w, l: False
-
-            async def _b018b(author, author_id, ctx, writer, label):
-                return author, author_id, False
-
-            nm._apply_b018b_guard = _b018b
-            nm._count_sent = lambda w, n: None
-            chunks = []
-
-            async def _spy_send_stream_chunk(_w, obj):
-                chunks.append(obj)
-
-            async def _noop_end(_w):
-                return None
-
-            nm._send_stream_chunk = _spy_send_stream_chunk
-            nm._send_end_stream = _noop_end
-
-            writer = _RecordingWriter()
-            data = {
-                "plugin": "P", "method": "ep", "plugin_uuid": "u",
-                "author": "remote", "author_id": "remote", "author_host": None,
-                "request_id": "r", "args": [], "timeout": None,
-            }
-            await nm._handle_execute_stream(None, writer, data, conn_context={})
-            # FIXED: the handler TimeoutError surfaces as a stream-exception frame.
-            assert len(chunks) >= 1, (
-                "streaming handler TimeoutError must emit __STREAM_EXCEPTION__ "
-                "via _send_stream_chunk, not be suppressed"
-            )
-
-        await rec.run_case(
-            "networking.handle_execute_stream_routes_handler_timeout",
-            body, tags=("networking", "timeout", "stream"),
-            bug_ids=("BUG-030",), category="networking", **kw,
-        )
-
-    # ----- events (BUG-017, BUG-018, BUG-019) -----
+    # ----- events (BUG-017, BUG-018) -----
 
     async def _bug017_depth_drop_preserves_suppressed_count(self, rec, kw):
         # BUG-017: when _internal_emit is DROPPED by the recursive-emit depth
@@ -769,63 +356,5 @@ class TestAuditPortUnitSuite(Plugin):
         await rec.run_case(
             "events.request_event_stream_pre_dispatch_raise_emits_ended",
             body, tags=("events", "stream"), bug_ids=("BUG-018",),
-            category="events", **kw,
-        )
-
-    async def _bug019_disabled_peer_not_overcounted(self, rec, kw):
-        # BUG-019: publish_event's returned count must equal the fan-out it
-        # actually SCHEDULED, not the pre-loop per-peer snapshot. A peer present
-        # in _build_remote_dispatch but disabled by the in-lock recheck must NOT
-        # be counted. Two peers survive the build; one is disabled, so only one
-        # publish_event_remote schedules and the returned count must be 1.
-        async def body(c):
-            c.skip("mocks old-NM internals (Node, nm.nodes/_build_remote_dispatch, "
-                   "nm.scheduled_calls) which the netcore rewrite deletes. The 'scheduled "
-                   "count excludes a disabled/unreachable peer' behavior is now intrinsic to "
-                   "route_publish (candidates = reachable ∩ roster), covered by the real "
-                   "cross-node publish_event case + TP-04/B-019 in the wave-1 floor")
-            per_peer = {"peer-keep": [object()], "peer-drop": [object()]}
-            nodes = [
-                Node(IP="10.0.0.2", hostname="peer-keep",
-                     enabled=True, auto_discoverable=False),
-                Node(IP="10.0.0.3", hostname="peer-drop",
-                     enabled=False, auto_discoverable=False),
-            ]
-
-            es = object.__new__(EventMixin)
-            es._logger = logging.getLogger("test.audit_port.BUG019")
-            es.hostname = "port-own-host"
-            es.networking_enabled = True
-            es.network = _StubNM019(per_peer, nodes)
-            es._rl_admit_out = lambda *a, **k: None
-            es._emitted = []
-            es._internal_emit = (
-                lambda topic, /, **payload: es._emitted.append((topic, payload))
-            )
-
-            spawned = []
-
-            def _spawn_tracked(coro, name=None):
-                t = asyncio.ensure_future(coro)
-                spawned.append(t)
-                return t
-
-            es._spawn_tracked = _spawn_tracked
-            es._spawn_fire_and_forget = lambda coro, name=None: asyncio.ensure_future(coro)
-
-            returned = await es.publish_event(_Pub019(), "evt", payload={"x": 1})
-            # Drain the scheduled fan-out deterministically (no sleep reliance).
-            if spawned:
-                await asyncio.gather(*spawned, return_exceptions=True)
-
-            nm = es.network
-            # Only the enabled peer was dispatched (the disabled one skipped).
-            c.expect(nm.scheduled_calls, ["10.0.0.2"])
-            # FIXED: returned count matches the actually-scheduled fan-out.
-            c.expect(returned, len(nm.scheduled_calls))
-
-        await rec.run_case(
-            "events.publish_event_count_excludes_disabled_peer",
-            body, tags=("events", "remote"), bug_ids=("BUG-019",),
             category="events", **kw,
         )

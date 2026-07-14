@@ -41,7 +41,7 @@ from plexus.netcore import (  # noqa: E402
 from _test_helpers import CaseRecorder  # noqa: E402
 
 
-SUITE_VERSION = "0.1.0"
+SUITE_VERSION = "0.2.0"
 
 # (module-short, module-object) in a stable order.
 _MODULES = [
@@ -53,7 +53,9 @@ _MODULES = [
 ]
 
 # Cells that stand up real loopback sockets/TLS -> gated behind PLEXUS_NETCORE_SOCKET.
-_SOCKET_MODULES = frozenset({"transport"})  # every transport cell drives a real loopback pair
+# The transport module is socket by DEFAULT (most of its cells drive a real loopback
+# pair), with the genuinely in-process ones carved out in _PURE_CELLS below.
+_SOCKET_MODULES = frozenset({"transport"})
 _SOCKET_CELLS = frozenset(
     {
         ("membership", "test_socket_linkup_and_revoke"),
@@ -61,9 +63,19 @@ _SOCKET_CELLS = frozenset(
         ("dispatch", "test_end_to_end"),
     }
 )
+# In-process cells that live in a socket-DEFAULT module (duck-typed stand-ins, no
+# socket/loop) -> they ALWAYS run in the default boot despite the module default.
+_PURE_CELLS = frozenset(
+    {
+        ("transport", "test_node_wide_reservation_guaranteed_minimum"),
+        ("transport", "test_dial_refused_pruned_on_stop_link"),
+    }
+)
 
 
 def _is_socket(mod_short: str, name: str) -> bool:
+    if (mod_short, name) in _PURE_CELLS:
+        return False
     return mod_short in _SOCKET_MODULES or (mod_short, name) in _SOCKET_CELLS
 
 

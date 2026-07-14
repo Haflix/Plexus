@@ -414,8 +414,28 @@ def test_node_wide_reservation_guaranteed_minimum():
     assert Transport.can_charge(t2, SimpleNamespace(_reasm_bytes=3 * MB), 1 * MB) is False  # over min, node full
 
 
+def test_dial_refused_pruned_on_stop_link():
+    """A7 (§8.3 observability): stop_link prunes the stale `_last_dial_refused`
+    entry so a revoke+re-add (or any link teardown) cannot freeze a stale
+    `connection_refused` in the snapshot's `unreachable_reason`. remove_peer routes
+    through stop_link, so this also covers the revoke path. With no link/probation
+    registered for the hostname, stop_link is pure dict ops (no `_spawn`), so a
+    duck-typed stand-in exercises it without sockets or a running loop."""
+    from types import SimpleNamespace
+    t = SimpleNamespace(_generations={}, _supervisors={}, _links={},
+                        _probation={},
+                        _last_dial_refused={"peerX": True, "peerY": True})
+    Transport.stop_link(t, "peerX")
+    assert "peerX" not in t._last_dial_refused, "stop_link did not prune the dial-refused reason"
+    assert "peerY" in t._last_dial_refused, "stop_link pruned an unrelated peer's reason"
+    # idempotent: stop_link on an already-pruned / never-refused hostname is a no-op.
+    Transport.stop_link(t, "peerX")
+    assert "peerX" not in t._last_dial_refused
+
+
 async def main():
     test_node_wide_reservation_guaranteed_minimum()
+    test_dial_refused_pruned_on_stop_link()
     await test_unary_roundtrip()
     await test_large_value_byte_exact()
     await test_stream_three_and_empty()

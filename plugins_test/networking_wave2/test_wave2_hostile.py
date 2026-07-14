@@ -239,7 +239,18 @@ def test_TP73_reassembly_bound_keeps_link():
                 pass
             time.sleep(1.0)
             evs, _ = _read_obs(node, topic="_core/net/reject")
-            assert cancelled or evs, "reassembly-bound exceed produced no CANCEL/reject"
+            # A8: the reassembly-bound reject is now observable on _core/net/reject
+            # carrying reason + the offending peer hostname (it was a silent no-op
+            # before observe_reject was routed through manager._observe). This is the
+            # primary assertion; the CANCEL frame (cancelled) and link-stays-up below
+            # are the wire-level corroboration.
+            reasm = [e for e in evs if e["payload"].get("reason") == "reassembly_bound"]
+            assert reasm, (
+                f"reassembly-bound reject not observed on _core/net/reject "
+                f"(cancelled={cancelled}): {[e['payload'] for e in evs]}")
+            assert any(e["payload"].get("hostname") == HOSTILE_LOW for e in reasm), (
+                f"reassembly-bound reject missing/incorrect hostname (want "
+                f"{HOSTILE_LOW}): {[e['payload'] for e in reasm]}")
             # LINK STAYS UP: a fresh PING is still answered.
             assert cli.link_is_up(), "link was torn by a reassembly-bound exceed (should stay up)"
             # control: an under-bound CALL completes.
@@ -572,13 +583,23 @@ def test_TP74_pong_snapshot_over_bound_keeps_peer_reachable():
         node = _spawn_target_dialing(h, server.port, hpem)
         # give the node time to dial + pulse + trip the bound a few times
         time.sleep(8.0)
-        _, snap = _read_obs(node)
+        evs, snap = _read_obs(node, topic="_core/net/reject")
         entry = _snap_peer(snap, HOSTILE_HIGH)
         assert entry is not None, "hostile peer absent from snapshot"
         assert entry.get("reachable"), (
             "PONG-snapshot over-bound downed the peer (should stay reachable via the "
             f"header stamp): {entry}")
         assert server.pings_seen >= 1, "node never pulsed the hostile (no dial?)"
+        # A8: the PONG-snapshot over-bound is a pending-side reassembly exceed, which
+        # also emits an observable _core/net/reject{reason:reassembly_bound} carrying
+        # the peer hostname, while the peer stays reachable via the header stamp.
+        reasm = [e for e in evs if e["payload"].get("reason") == "reassembly_bound"]
+        assert reasm, (
+            f"PONG-snapshot over-bound produced no observable _core/net/reject: "
+            f"{[e['payload'] for e in evs]}")
+        assert any(e["payload"].get("hostname") == HOSTILE_HIGH for e in reasm), (
+            f"reassembly-bound reject missing/incorrect hostname (want "
+            f"{HOSTILE_HIGH}): {[e['payload'] for e in reasm]}")
     finally:
         if server:
             server.stop()

@@ -1,5 +1,5 @@
 description: Structured ports of the 2026-06-21 audit-bug regression guards (networking / events / decorators) that previously lived only in the gitignored audit_2026_06 pytest dir
-version: 0.1.0
+version: 0.2.0
 remote: false
 arguments:
 dependencies:
