@@ -48,6 +48,17 @@ class NetFixTarget(Plugin):
                 target_access_name=target,
             )
             self._sub_ids.append(sid)
+        # B-092: a hosts="local" sub used ONLY by the net_hostile receiver-gate
+        # cell. It opts out of remote publishers, so an inbound FANOUT/FIRST
+        # from a peer must be rejected by _sub_accepts_remote_publisher at the
+        # RECEIVER (manager.py:638). Being hosts="local" it never advertises
+        # (remote_eligible=False, manager.py:527), so it adds no directory
+        # surface and cannot affect any other cell's routing/counts.
+        lsid = await self._plexus.subscribe_event(
+            "fix/localonly", self.plugin_name, self.plugin_uuid,
+            target_access_name="fix_probe_handler", hosts="local",
+        )
+        self._sub_ids.append(lsid)
 
     @async_log_errors
     async def on_disable(self):
@@ -108,6 +119,22 @@ class NetFixTarget(Plugin):
     async def get_flag(self, key: str = "slow") -> bool:
         """Read a side-effect flag (UNSET == the handler was cancelled)."""
         return bool(self._flags.get(key, False))
+
+    @async_log_errors
+    async def localonly_selftest(self) -> bool:
+        """B-092 existence control for the net_hostile receiver-gate cell.
+        True iff the hosts="local" sub on fix/localonly is present and enabled
+        in this node's local registry (the SAME topic the cell sends a remote
+        request to). Lets the cell attribute a remote "no pong" to the receiver
+        gate (manager.py:638) rather than to a missing/typo'd sub. Checks the
+        registry directly (an execute, not a gated event) so the gate under
+        test is not involved in the existence proof itself."""
+        subs = await self._plexus.topic_registry.list_local_subs()
+        return any(
+            getattr(s, "topic_pattern", None) == "fix/localonly"
+            and getattr(s, "enabled", True)
+            for s in subs
+        )
 
     @async_log_errors
     async def reset_flags(self) -> bool:

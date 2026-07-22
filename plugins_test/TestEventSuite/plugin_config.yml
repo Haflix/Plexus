@@ -1,5 +1,5 @@
 description: PR3 event API suite — comprehensive PLAN J coverage (Stage E)
-version: "0.3.0"
+version: "0.4.0"
 remote: false
 verbose_notifier: true
 prefix: "PSuite"
@@ -124,6 +124,14 @@ events:
     hosts: "local"
   edge_static_topic_event:
     topic: "test_event/edge/static_topic"
+    hosts: "local"
+
+  # ── B-092: request_event handler-exception surfacing ─────────────────
+  # A dedicated topic with no standing sub; the cell adds a runtime sub
+  # routing it to TestEventBadActor's raising handler, so request_event
+  # against it must PROPAGATE (unlike publish_event, which swallows).
+  req_raise_event:
+    topic: "test_event/req/raise"
     hosts: "local"
 
 subscriptions:

@@ -15,9 +15,11 @@ rewrite; that coverage now lives in the netcore transport/dispatch self-tests
 plus wave-2.)
 """
 
+import dataclasses
 import logging
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -33,12 +35,14 @@ from plexus.decorators import (  # noqa: E402
 from plexus.exceptions import RequestException  # noqa: E402
 from plexus.events import EventMixin  # noqa: E402
 from plexus.core import Plexus  # noqa: E402
+from plexus.notifier import Subscription  # noqa: E402
+from plexus.netcore.types import RemoteSub  # noqa: E402
 from plexus.runtime import _EMIT_DEPTH, _MAX_EMIT_DEPTH  # noqa: E402
 
 from _test_helpers import CaseRecorder  # noqa: E402
 
 
-SUITE_VERSION = "0.2.0"
+SUITE_VERSION = "0.3.0"
 
 
 # --- events stubs -----------------------------------------------------------
@@ -137,6 +141,10 @@ class TestAuditPortUnitSuite(Plugin):
         # events
         await self._bug017_depth_drop_preserves_suppressed_count(rec, kw)
         await self._bug018_stream_pre_dispatch_raise_emits_ended(rec, kw)
+
+        # B-092: receiver-side remote-publisher host gate (was untested)
+        await self._b092_remote_publisher_matrix(rec, kw)
+        await self._b092_remote_publisher_attrs_present(rec, kw)
 
         return rec.to_dict()
 
@@ -356,5 +364,129 @@ class TestAuditPortUnitSuite(Plugin):
         await rec.run_case(
             "events.request_event_stream_pre_dispatch_raise_emits_ended",
             body, tags=("events", "stream"), bug_ids=("BUG-018",),
+            category="events", **kw,
+        )
+
+    # ----- events (B-092 remote-publisher host gate) -----
+
+    async def _b092_remote_publisher_matrix(self, rec, kw):
+        # B-092: `_sub_accepts_remote_publisher` (events.py:575-634) is the
+        # receiver-side host gate deciding whether a LOCAL sub accepts an event
+        # from a REMOTE peer, based on the sub's `hosts` / `blocked_hosts`. The
+        # netcore rewrite made it load-bearing (route_request/route_publish are
+        # UNFILTERED beyond topic-match, directory.py:378/407) yet it had ZERO
+        # coverage anywhere.
+        #
+        # This is the LOGIC truth table only. It is a pure function of
+        # (sub.hosts, sub.blocked_hosts, author_host) -- it reads no instance
+        # state -- so it runs on a bare EventMixin with a SimpleNamespace sub,
+        # exactly as it reads a real Subscription / RemoteSub (both expose the
+        # two attrs; guarded by _b092_..._attrs_present below). What the table
+        # does NOT prove is that the predicate is actually CALLED on the inbound
+        # path -- that wiring is the two multinode e2e cells (sender pre-filter
+        # events.py:1046; receiver gate netcore/manager.py:638).
+        #
+        # `author` (3rd arg) is UNUSED by the body -- author filtering lives in
+        # `_sub_accepts_author` -- so it is fixed here and never varied.
+        async def body(c):
+            em = object.__new__(EventMixin)
+            AH = "peerA"      # the remote author's host on the wire
+            OTHER = "peerB"   # some other host, never the author
+
+            # (hosts, blocked_hosts, author_host, expected, why)
+            # expected hand-written per row (NOT re-derived from the branch
+            # logic), so a logic regression flips exactly one cell.
+            table = [
+                # --- hosts axis, blocked_hosts=None ---
+                ("local", None, AH, False, "hosts=local rejects remote (599)"),
+                (None, None, AH, True, "hosts=None accepts (602)"),
+                ("any", None, AH, True, "hosts=any accepts (602)"),
+                ("remote", None, AH, True, "hosts=remote accepts (602)"),
+                (AH, None, AH, True, "hosts=str==author_host accepts (607)"),
+                (OTHER, None, AH, False, "hosts=str!=author_host rejects (607)"),
+                ([AH], None, AH, True, "hosts=[author_host] accepts (610)"),
+                ([OTHER], None, AH, False, "hosts=[other] rejects"),
+                (["any"], None, AH, True, "hosts=[any] accepts (611)"),
+                (["remote"], None, AH, True, "hosts=[remote] accepts (612)"),
+                ([], None, AH, False, "hosts=[] empty list rejects"),
+                # non-str/non-list/non-None -> else:614. int stands in for the
+                # whole class (dict/float/... all hit the same else, so one row
+                # covers the branch).
+                (123, None, AH, False, "hosts=wrong-type rejects (614)"),
+                # --- blocked_hosts axis, hosts accepts via 'any' ---
+                ("any", "any", AH, False, "blocked=any rejects (624)"),
+                ("any", "remote", AH, False, "blocked=remote rejects (624)"),
+                ("any", AH, AH, False, "blocked=str==author_host rejects (624)"),
+                ("any", OTHER, AH, True,
+                 "blocked=str!=author_host falls through to accept (634)"),
+                ("any", [AH], AH, False, "blocked=[author_host] rejects (630)"),
+                ("any", [OTHER], AH, True, "blocked=[other] accepts"),
+                ("any", [], AH, True, "blocked=[] empty list accepts"),
+                # ASYMMETRY: a wrong-type `hosts` REJECTS (614) but a wrong-type
+                # `blocked_hosts` is IGNORED and ACCEPTS (falls to 634). Pinned
+                # so the mismatch can't silently drift.
+                ("any", 123, AH, True,
+                 "blocked=int wrong-type IGNORED -> accepts (634), asymmetry"),
+                # --- precedence: block overrides an accepting hosts ---
+                ([AH], [AH], AH, False,
+                 "hosts=[author] accepts but blocked=[author] wins -> reject"),
+                # --- author_host=None: DEFENSIVE/UNREACHABLE on the real paths
+                # (manager.py feeds identity.hostname, always a concrete str).
+                # Use hosts=[None]/blocked=[None] so these actually PIN the
+                # `author_host is not None` guards at 610/630: without the
+                # guard, `None in [None]` is True and the outcome would flip. A
+                # non-None list member would not (None != that member either
+                # way), so it would not exercise the guard. ---
+                ([None], None, None, False,
+                 "author_host=None, hosts=[None]: 610 guard blocks None-match -> reject"),
+                ("any", [None], None, True,
+                 "author_host=None, blocked=[None]: 630 guard blocks None-match -> accept"),
+            ]
+
+            failures = []
+            for hosts, blocked, author_host, expected, why in table:
+                sub = SimpleNamespace(hosts=hosts, blocked_hosts=blocked)
+                got = em._sub_accepts_remote_publisher(
+                    sub, author_host, "SomePublisher")
+                if got is not expected:
+                    failures.append(
+                        f"hosts={hosts!r} blocked={blocked!r} "
+                        f"author_host={author_host!r} -> got {got!r}, "
+                        f"expected {expected!r} ({why})"
+                    )
+            c.set_marker("rows_checked=%d" % len(table))
+            if failures:
+                raise AssertionError(
+                    "%d/%d host-gate rows wrong:\n  %s"
+                    % (len(failures), len(table), "\n  ".join(failures))
+                )
+
+        await rec.run_case(
+            "events.remote_publisher_host_gate_matrix", body,
+            tags=("events", "networking", "host_filter"), bug_ids=("B-092",),
+            category="events", **kw,
+        )
+
+    async def _b092_remote_publisher_attrs_present(self, rec, kw):
+        # The matrix above drives a SimpleNamespace fake, and the predicate
+        # reads `getattr(sub, "hosts"/"blocked_hosts", None)`. If a future
+        # rename dropped either field from the REAL objects, that getattr would
+        # silently read None ("no filter") and the matrix would never notice.
+        # Pin that both wire-crossing sub shapes actually declare both fields.
+        async def body(c):
+            sub_fields = {f.name for f in dataclasses.fields(Subscription)}
+            rs_fields = {f.name for f in dataclasses.fields(RemoteSub)}
+            for name, fields in (("Subscription", sub_fields),
+                                 ("RemoteSub", rs_fields)):
+                for attr in ("hosts", "blocked_hosts"):
+                    if attr not in fields:
+                        raise AssertionError(
+                            f"{name} no longer declares {attr!r}; the host-gate "
+                            f"predicate would read it as None (no filter)"
+                        )
+
+        await rec.run_case(
+            "events.remote_publisher_host_gate_attrs_present", body,
+            tags=("events", "networking", "host_filter"), bug_ids=("B-092",),
             category="events", **kw,
         )

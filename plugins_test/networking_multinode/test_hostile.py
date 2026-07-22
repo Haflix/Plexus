@@ -180,6 +180,67 @@ def test_TP71_system_caller_spoof_ignored():
         shutil.rmtree(hk, ignore_errors=True)
 
 
+def test_B092_receiver_host_gate_rejects_remote_at_local_sub():
+    """B-092: a local sub with hosts="local" opts OUT of remote publishers.
+    An inbound FIRST from a peer must be rejected by
+    `_sub_accepts_remote_publisher` at the RECEIVER (manager.py:638), so no
+    local sub answers. This ISOLATES 638: a raw hostile client bypasses the
+    sender-side pre-filter (events.py:1046) that a cooperative peer would apply
+    first, so 638 is the only gate left standing. Delete the 638 check and the
+    negative below flips to a pong. Control: the hosts="any" fix/probe sub DOES
+    answer, proving the link + dispatch are live (the negative is not a
+    dead-link false pass)."""
+    h = new_harness()
+    hk, hc, hkey, hpem = _gen_cert(HOSTILE_LOW)
+    try:
+        node = _spawn_target(h, hostile_specs=[peer_spec(HOSTILE_LOW, 1, hpem)])
+        cli = HostileClient("127.0.0.1", node.port, cert_file=hc, key_file=hkey)
+        cli.connect()
+        try:
+            # EXISTENCE control — prove the hosts="local" sub is actually
+            # registered on the target (same topic the negative queries).
+            # Without this, a missing / typo'd / disabled sub would ALSO yield
+            # "no pong" and the negative would pass without the gate ever
+            # running. localonly_selftest reads the local registry directly (an
+            # execute, not a gated event), so the receiver gate is not involved
+            # in this proof.
+            ke, ve = cli.call_unary(
+                selector={"plugin": "NetFixTarget",
+                          "endpoint": "localonly_selftest"},
+                mode=wire.MODE_UNARY, caller=_caller(HOSTILE_LOW),
+                args_obj={}, timeout=8.0)
+            assert ke == "value" and ve is True, (
+                f"fix/localonly sub not registered on the target — the negative "
+                f"below would be vacuous (a missing sub also yields no pong): "
+                f"{ke}/{ve!r}")
+
+            # NEGATIVE — request at the hosts="local" sub. author_host is the
+            # authenticated hostile hostname (no anti-spoof drift), so the ONLY
+            # reason it can be refused is the receiver host gate. Assert on
+            # "did not produce a pong" rather than a specific error kind, so the
+            # cell is robust to whether no-match surfaces as ERROR or empty.
+            kind, val = cli.call_unary(
+                selector={"topic": "fix/localonly"}, mode=wire.MODE_FIRST,
+                caller=_caller(HOSTILE_LOW), args_obj={}, timeout=8.0)
+            answered = (kind == "value" and isinstance(val, dict)
+                        and val.get("pong"))
+            assert not answered, (
+                f"a hosts='local' sub answered a REMOTE request — receiver gate "
+                f"manager.py:638 not applied: {kind}/{val!r}")
+            # CONTROL — the hosts="any" fix/probe sub answers a remote request.
+            k2, v2 = cli.call_unary(
+                selector={"topic": "fix/probe"}, mode=wire.MODE_FIRST,
+                caller=_caller(HOSTILE_LOW), args_obj={}, timeout=8.0)
+            assert k2 == "value" and isinstance(v2, dict) and v2.get("pong"), (
+                f"hosts='any' sub did not answer a remote request (link/dispatch "
+                f"dead — the negative case would be a false pass): {k2}/{v2!r}")
+        finally:
+            cli.close()
+    finally:
+        h.teardown()
+        shutil.rmtree(hk, ignore_errors=True)
+
+
 def test_TP72_anti_spoof_author_host_mismatch():
     """caller.author_host != authenticated hostname → dropped + hostname_mismatch;
     control = a matching author_host is delivered."""

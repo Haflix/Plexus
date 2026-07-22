@@ -41,7 +41,7 @@ from plexus.exceptions import RequestException  # noqa: E402
 from _test_helpers import CaseRecorder  # noqa: E402
 
 
-SUITE_VERSION = "0.3.0"
+SUITE_VERSION = "0.4.0"
 
 TARGET = "TestEventTarget"
 BAD_ACTOR = "TestEventBadActor"
@@ -1149,10 +1149,56 @@ class TestEventSuite(Plugin):
             body_default_workers_4,
             tags=("basic", "sync"), **kw,
         )
+        # B-092: the COMPLEMENT of the cell above. publish_event SWALLOWS a
+        # handler raise (logged, count returned); request_event must PROPAGATE
+        # it to the caller (events.py:1592-1595 re-raises as RequestException).
+        # The publish path asserts the OPPOSITE contract, so it does NOT cover
+        # request_event propagation — that is this cell. Same raising handler as
+        # above, opposite API, so the contrast is exact.
+        async def body_request_handler_raise_propagates(c):
+            loaded = await self._ensure_loaded(BAD_ACTOR)
+            if not loaded:
+                c.skip("TestEventBadActor not registered in test_config.yml")
+                return
+            try:
+                await self.execute(BAD_ACTOR, "configure",
+                                   ({"raise_msg": "request_handler_boom"},))
+                # Dedicated topic (req_raise_event -> test_event/req/raise) with
+                # NO standing sub, so the raising handler is the SOLE answerer
+                # and request_event cannot silently pick a different sub.
+                sub_id = await self._plexus.subscribe_event(
+                    "test_event/req/raise",
+                    self.plugin_name,
+                    self.plugin_uuid,
+                    target_plugin=BAD_ACTOR,
+                    target_access_name="handle_raising_sync",
+                )
+                try:
+                    # THE assertion: the handler's RuntimeError surfaces to the
+                    # caller (wrapped in RequestException), carrying the message.
+                    c.expect_exception(RequestException,
+                                       match="request_handler_boom")
+                    await self.request_event("req_raise_event", payload={"x": 1},
+                                             timeout=5.0)
+                finally:
+                    try:
+                        await self._plexus.unsubscribe_event(sub_id)
+                    except Exception:
+                        pass
+            finally:
+                await self._ensure_unloaded(BAD_ACTOR)
+
         await rec.run_case(
             "event.sync.handler_raises_logged_not_propagated",
             body_handler_raises_logged_not_propagated,
             tags=("basic", "sync", "error"),
+            hard_timeout_s=20.0,
+            **kw,
+        )
+        await rec.run_case(
+            "event.request.handler_raise_propagates",
+            body_request_handler_raise_propagates,
+            tags=("basic", "error"), bug_ids=("B-092",),
             hard_timeout_s=20.0,
             **kw,
         )

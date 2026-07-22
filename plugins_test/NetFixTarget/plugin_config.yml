@@ -1,5 +1,5 @@
 description: Wave-2 cross-node service fixture (remote=True) — unary/echo/tag/stream endpoints + slow-handler flag + networkish raiser + rate control + fan-out topic handlers, for the networking-rewrite socket cells
-version: 0.1.1
+version: 0.1.3
 remote: True
 arguments:
 subscriptions:
@@ -83,6 +83,15 @@ endpoints:
     remote: True
     accessible_by_other_plugins: True
     description: Clear all side-effect flags
+    arguments:
+
+  localonly_selftest:
+    internal_name: localonly_selftest
+    tags:
+      - netfix
+    remote: True
+    accessible_by_other_plugins: True
+    description: B-092 existence control — reports whether the hosts=local fix/localonly sub is registered locally
     arguments:
 
   raise_networkish:

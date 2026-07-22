@@ -32,7 +32,7 @@ from plexus.exceptions import (  # noqa: E402
 )
 from _test_helpers import CaseRecorder  # noqa: E402
 
-SUITE_VERSION = "0.1.0"
+SUITE_VERSION = "0.3.0"  # aligned to plugin_config.yml (was drifted at 0.1.0)
 
 FIX = "NetFixTarget"
 OBS = "NetObsProbe"
@@ -323,6 +323,75 @@ class MultinodeDriver(Plugin):
             assert invoked_any, "peer handler marker never set even on hosts=any (flag mechanism broken)"
             await self.execute(CTL, "ctl_sub_remove", {"label": "tp05b"}, hosts=[peer])
         await rec.run_case("TP-05b.local_short_circuit", tp05b, category="routing", **kw)
+
+        # B-092 sender-side host gate — the SENDER pre-filter at events.py:1046
+        # applies _sub_accepts_remote_publisher against each peer's advertised
+        # sub BEFORE scheduling a FANOUT frame. A sub whose `hosts` names only a
+        # non-driver host must be pre-filtered out: 0 scheduled, nothing
+        # delivered. This is the sole non-hostile path that reaches the
+        # predicate over the wire (a `hosts="local"` sub would be dropped at
+        # advertisement, manager.py:527, and never reach the predicate at all —
+        # so it must be an ADVERTISED-but-rejected sub, not a local one).
+        # The RECEIVER gate (manager.py:638) is a cooperative driver's own
+        # pre-filter's shadow and is covered separately by the net_hostile cell.
+        async def b092_sender_host_gate(c):
+            # DH is the DRIVER's own hostname. At the sender pre-filter it is
+            # passed as author_host (the publisher publishing from here), i.e.
+            # the host a peer sub must accept/reject.
+            DH = self._plexus.hostname
+            TOPIC, EV = "fix/b092", "ev_b092"
+
+            async def _add(label, hosts):
+                await self.execute(CTL, "ctl_sub_add", {
+                    "label": label, "topic": TOPIC,
+                    "target_access_name": "fix_fanout_handler",
+                    "target_plugin": FIX, "hosts": hosts}, hosts=[peer])
+                # let the added sub advertise back to the driver's directory
+                await asyncio.sleep(_HEARTBEAT_GUESS * 3)
+
+            async def _remove(label):
+                await self.execute(CTL, "ctl_sub_remove", {"label": label},
+                                   hosts=[peer])
+
+            # NEGATIVE — sub accepts only from the peer's OWN host, never the
+            # driver. author_host=DH is not in [peer] → predicate rejects at the
+            # sender, so route_publish yields it but 1046 filters it out.
+            # ctl_sub_remove in a finally so a mid-cell raise can't leak the
+            # advertised sub into later pair-group cells.
+            await self.execute(FIX, "reset_fanout", {}, hosts=[peer])
+            await _add("b092neg", [peer])
+            try:
+                n_rej = await self.publish_event(EV, payload={"b092": "neg"}, hosts="any")
+                await asyncio.sleep(_HEARTBEAT_GUESS * 2)  # let any wrongly-sent frame land
+                log_rej = await self.execute(FIX, "fanout_log", {}, hosts=[peer])
+            finally:
+                await _remove("b092neg")
+            assert n_rej == 0, (
+                f"sender scheduled {n_rej} for a sub that rejects the driver "
+                f"host (events.py:1046 pre-filter not applied)")
+            assert log_rej == [], (
+                f"rejected sub still received the fanout: {log_rej!r}")
+
+            # POSITIVE control — same sub but hosts=[driver host] → predicate
+            # accepts. Proves the sub really advertised and the delivery path
+            # works, so the negative n_rej==0 cannot be a silent "sub never
+            # existed / link down" false pass.
+            await self.execute(FIX, "reset_fanout", {}, hosts=[peer])
+            await _add("b092pos", [DH])
+            try:
+                n_acc = await self.publish_event(EV, payload={"b092": "pos"}, hosts="any")
+                await asyncio.sleep(_HEARTBEAT_GUESS * 2)
+                log_acc = await self.execute(FIX, "fanout_log", {}, hosts=[peer])
+            finally:
+                await _remove("b092pos")
+            assert n_acc >= 1, (
+                f"sender scheduled {n_acc} for a sub that accepts the driver "
+                f"host (advert not propagated or link down — the negative case "
+                f"above would be a false pass)")
+            assert {"b092": "pos"} in log_acc, (
+                f"accepting sub did not receive the fanout: {log_acc!r}")
+        await rec.run_case("B-092.sender_host_gate", b092_sender_host_gate,
+                           category="routing", **kw)
 
         # TP-17b — nested-Network handler raise is WRAPPED → propagates (no fall-through).
         async def tp17b(c):
