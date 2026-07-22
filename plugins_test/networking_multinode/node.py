@@ -1,9 +1,9 @@
-"""Generic multi-peer Plexus node runner for the wave-2 cooperative socket suite.
+"""Generic multi-peer Plexus node runner for the multinode cooperative socket suite.
 
-Extends the networking_pair/pair_node.py pattern to N peers + the rewrite config
+Extends the two-node pattern to N peers + the netcore config
 surface. Boots a headless node from a per-role config (config.driver/peer/peer2),
 injects port + keys_dir + a PEERS list (from a JSON file) + networking knobs (fast
-heartbeat etc.), exports env the fixture plugins read (Wave2Driver / NetObsProbe /
+heartbeat etc.), exports env the fixture plugins read (MultinodeDriver / NetObsProbe /
 NetCtl), waits until ready, writes a ready-file, and runs until signalled.
 
 Validates against the winning rewrite POST-combine: the rewrite exposes the
@@ -12,7 +12,7 @@ names). Knob NAMES are rewrite-defined; passed through verbatim from --net-knobs
 the harness adapts to the landed branch without an edit here.
 
 CLI (peer/knob flags layered on the shared runner parser):
-    python plugins_test/networking_wave2/wave2_node.py \
+    python plugins_test/networking_multinode/node.py \
         --config config.driver.yml --port 0 --ready-file <r> --keys-dir <d> \
         --peers-file <peers.json> --net-knobs-file <knobs.json> \
         --group pair --result-file <res> --phase-file <ph> --discoverable
@@ -33,7 +33,7 @@ from plugins_test._runner_cli import build_runner_parser  # noqa: E402
 
 
 async def main() -> None:
-    ap = build_runner_parser(description="wave-2 cooperative socket node.")
+    ap = build_runner_parser(description="multinode cooperative socket node.")
     ap.add_argument("--peers-file", default="",
                     help="JSON list of peer dicts {hostname,address,cert_pem,"
                          "system_caller?,dial?} for the networking peers list")
@@ -42,7 +42,7 @@ async def main() -> None:
                          "heartbeat / liveness / reassembly-cap / per-voucher cap "
                          "overrides — rewrite key names, passed verbatim)")
     ap.add_argument("--discoverable", action="store_true")
-    ap.add_argument("--group", default="", help="Wave2Driver cell group / cell id")
+    ap.add_argument("--group", default="", help="MultinodeDriver cell group / cell id")
     ap.add_argument("--cell", default="", help="single-cell id for lifecycle runs")
     ap.add_argument("--result-file", default="")
     ap.add_argument("--phase-file", default="")
@@ -59,31 +59,31 @@ async def main() -> None:
 
     # Env the fixture plugins read in on_enable.
     if args.group:
-        os.environ["WAVE2_GROUP"] = args.group
+        os.environ["MULTINODE_GROUP"] = args.group
     if args.cell:
-        os.environ["WAVE2_CELL"] = args.cell
+        os.environ["MULTINODE_CELL"] = args.cell
     if args.result_file:
-        os.environ["WAVE2_RESULT_FILE"] = args.result_file
+        os.environ["MULTINODE_RESULT_FILE"] = args.result_file
     if args.phase_file:
-        os.environ["WAVE2_PHASE_FILE"] = args.phase_file
+        os.environ["MULTINODE_PHASE_FILE"] = args.phase_file
     if args.obs_result_file:
         os.environ["NETOBS_RESULT_FILE"] = args.obs_result_file
     if args.reload_config:
-        os.environ["WAVE2_RELOAD_CONFIG"] = args.reload_config
+        os.environ["MULTINODE_RELOAD_CONFIG"] = args.reload_config
     if args.readd_spec:
-        os.environ["WAVE2_READD_SPEC"] = args.readd_spec
+        os.environ["MULTINODE_READD_SPEC"] = args.readd_spec
     if args.addpeer_spec:
-        os.environ["WAVE2_ADDPEER_SPEC"] = args.addpeer_spec
+        os.environ["MULTINODE_ADDPEER_SPEC"] = args.addpeer_spec
     if args.orphan_host:
-        os.environ["WAVE2_ORPHAN_HOST"] = args.orphan_host
+        os.environ["MULTINODE_ORPHAN_HOST"] = args.orphan_host
     if args.vouch_cap:
-        os.environ["WAVE2_VOUCH_CAP"] = args.vouch_cap
-    os.environ["WAVE2_CONFIG_PATH"] = args.config
+        os.environ["MULTINODE_VOUCH_CAP"] = args.vouch_cap
+    os.environ["MULTINODE_CONFIG_PATH"] = args.config
     # Peer hostnames the driver may target (csv), derived from the peers file.
     peers = []
     if args.peers_file and Path(args.peers_file).exists():
         peers = json.loads(Path(args.peers_file).read_text(encoding="utf-8"))
-    os.environ["WAVE2_PEER_HOSTS"] = ",".join(
+    os.environ["MULTINODE_PEER_HOSTS"] = ",".join(
         p.get("hostname", "") for p in peers if p.get("hostname")
     )
 

@@ -1,11 +1,11 @@
-"""Spawn / keypair / topology machinery for the wave-2 cooperative socket suite.
+"""Spawn / keypair / topology machinery for the multinode cooperative socket suite.
 
-Real-socket, multi-subprocess. Mirrors networking_pair's helpers, generalized to N
-nodes + runtime peer/knob injection via JSON files consumed by wave2_node.py.
+Real-socket, multi-subprocess: N nodes plus runtime peer/knob injection via JSON
+files consumed by node.py.
 
-Validates against the winning rewrite POST-combine (the rewrite exposes snapshot()
-+ the _core/* events + the networking config surface these drive). Cannot run on
-current code (no snapshot()/add_peer). Gated behind PLEXUS_PAIR_TEST by the tests.
+Drives the netcore surface (snapshot(), the _core/* events, the networking config
+keys). Netcore shipped in f71906b, so this runs against live code. Gated behind
+PLEXUS_PAIR_TEST by the tests.
 """
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from plexus.serialization import generate_keypair  # noqa: E402
 
-NODE_SCRIPT = _HERE / "wave2_node.py"
+NODE_SCRIPT = _HERE / "node.py"
 CONFIG_DRIVER = _HERE / "config.driver.yml"
 CONFIG_PEER = _HERE / "config.peer.yml"
 CONFIG_PEER2 = _HERE / "config.peer2.yml"

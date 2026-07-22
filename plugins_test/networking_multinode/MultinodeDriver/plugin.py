@@ -1,9 +1,9 @@
-"""Wave2Driver — the in-node cell driver for the wave-2 cooperative socket suite.
+"""MultinodeDriver — the in-node cell driver for the multinode cooperative socket suite.
 
-Runs on the driver node (w2a-driver). Reads WAVE2_GROUP (pair / trio) or WAVE2_CELL
-(a single lifecycle cell), drives the wave-2 cooperative cells via the four
+Runs on the driver node (w2a-driver). Reads MULTINODE_GROUP (pair / trio) or MULTINODE_CELL
+(a single lifecycle cell), drives the multinode cooperative cells via the four
 primitives + the NetObsProbe / NetCtl fixtures, records each with CaseRecorder, and
-writes the result dict to WAVE2_RESULT_FILE for the pytest orchestrator to assert
+writes the result dict to MULTINODE_RESULT_FILE for the pytest orchestrator to assert
 (``failed==0 and errored==0``). Lifecycle cells that need the parent to kill/respawn
 a peer use a phase file (PairProbe S4 idiom): the driver signals a phase, the pytest
 acts, the driver continues.
@@ -50,7 +50,7 @@ _HEARTBEAT_GUESS = 1.5  # tests set a fast heartbeat via net-knobs; used for wai
 # config — the limiter requires max>0), and once drained, the r_rl_stats read is
 # itself rejected in that same drained region. No peer-LOCAL observe path exists.
 #
-# HONEST coverage note: skipping these DOES drop unique wave-2 coverage that TG-01b
+# HONEST coverage note: skipping these DOES drop unique multinode coverage that TG-01b
 # does NOT provide — TG-01b only proves PING/PONG/_core are EXEMPT, not that:
 #   * TG-01: framework_in EXHAUSTION rejects app calls while nodes_in stays independent
 #   * TG-23: a rate-rejected fall-through candidate is charged with NO refund
@@ -68,12 +68,12 @@ _RATE_CTRLPLANE_SKIP = (
 )
 
 
-class Wave2Driver(Plugin):
+class MultinodeDriver(Plugin):
     @log_errors
     def on_load(self, *args, **kwargs):
         self._task = None
         self._peers = [
-            h for h in os.environ.get("WAVE2_PEER_HOSTS", "").split(",") if h
+            h for h in os.environ.get("MULTINODE_PEER_HOSTS", "").split(",") if h
         ]
 
     @async_log_errors
@@ -178,7 +178,7 @@ class Wave2Driver(Plugin):
         return total
 
     def _write_phase(self, phase):
-        pf = os.environ.get("WAVE2_PHASE_FILE", "")
+        pf = os.environ.get("MULTINODE_PHASE_FILE", "")
         if pf:
             try:
                 Path(pf).write_text(str(phase), encoding="utf-8")
@@ -188,7 +188,7 @@ class Wave2Driver(Plugin):
     async def _wait_phase_ack(self, want, timeout):
         """Wait for the pytest to write `want` back into the phase file + "-ack"
         suffix (so the driver knows the kill/respawn landed)."""
-        pf = os.environ.get("WAVE2_PHASE_FILE", "")
+        pf = os.environ.get("MULTINODE_PHASE_FILE", "")
         if not pf:
             return False
         loop = asyncio.get_running_loop()
@@ -204,10 +204,10 @@ class Wave2Driver(Plugin):
 
     # ── run dispatch ────────────────────────────────────────────────────
     async def _run(self):
-        rec = CaseRecorder("Wave2Driver", SUITE_VERSION, self._plexus)
+        rec = CaseRecorder("MultinodeDriver", SUITE_VERSION, self._plexus)
         kw = dict(remote_available=True)
-        group = os.environ.get("WAVE2_GROUP", "")
-        cell = os.environ.get("WAVE2_CELL", "")
+        group = os.environ.get("MULTINODE_GROUP", "")
+        cell = os.environ.get("MULTINODE_CELL", "")
         try:
             if group == "pair":
                 await self._await_link(self._peer)
@@ -230,14 +230,14 @@ class Wave2Driver(Plugin):
             self._write_result(rec.to_dict())
 
     def _write_result(self, data):
-        rf = os.environ.get("WAVE2_RESULT_FILE", "")
+        rf = os.environ.get("MULTINODE_RESULT_FILE", "")
         if not rf:
             return
         try:
             with open(rf, "w", encoding="utf-8") as f:
                 json.dump(data, f, default=repr)
         except OSError:
-            self._logger.exception("Wave2Driver: result write failed")
+            self._logger.exception("MultinodeDriver: result write failed")
 
     # ════════════════════════ PAIR-GROUP CELLS ════════════════════════
     async def _pair_cells(self, rec, kw):
@@ -701,7 +701,7 @@ class Wave2Driver(Plugin):
         # TP-50 — orphaned vouched peer: observable + manually removable (redial cap
         # = pytest-side StallListener.connect_count, per A4).
         async def tp50(c):
-            spec = os.environ.get("WAVE2_ORPHAN_HOST", "")
+            spec = os.environ.get("MULTINODE_ORPHAN_HOST", "")
             if not spec:
                 c.skip("no orphan vouched host wired for this boot")
             await asyncio.sleep(_HEARTBEAT_GUESS * 4)
@@ -719,7 +719,7 @@ class Wave2Driver(Plugin):
         async def tp47(c):
             # Needs a small per-voucher cap (net-knobs) + the hub vouching > cap
             # victims (StallListener addrs). Assert a vouch_rejected fired.
-            if os.environ.get("WAVE2_VOUCH_CAP", "") == "":
+            if os.environ.get("MULTINODE_VOUCH_CAP", "") == "":
                 c.skip("per-voucher cap topology not wired for this boot")
             await asyncio.sleep(_HEARTBEAT_GUESS * 5)
             evs = await self._obs_events(self._plexus.hostname, topic="_core/peer/vouch_rejected")
@@ -935,7 +935,7 @@ class Wave2Driver(Plugin):
             assert not self._reachable(peer), "peer still reachable right after revoke"
             # reload a config that STILL lists the peer (rebuild-trigger key flipped)
             # — a durable tombstone must NOT re-add the runtime-revoked config peer.
-            reload_cfg = os.environ.get("WAVE2_RELOAD_CONFIG", "")
+            reload_cfg = os.environ.get("MULTINODE_RELOAD_CONFIG", "")
             if not reload_cfg:
                 c.skip("no reload config wired for this boot")
             res = await self.execute(CTL, "ctl_reload_config", {"config_path": reload_cfg}, hosts="local")
@@ -949,7 +949,7 @@ class Wave2Driver(Plugin):
         # runtime add_peer → routable within a heartbeat of LINK-UP.
         async def body(c):
             # boot with NO peer configured; the pytest supplies the peer spec via env file.
-            spec_path = os.environ.get("WAVE2_ADDPEER_SPEC", "")
+            spec_path = os.environ.get("MULTINODE_ADDPEER_SPEC", "")
             if not spec_path or not Path(spec_path).exists():
                 c.skip("no add_peer spec provided")
             spec = json.loads(Path(spec_path).read_text(encoding="utf-8"))
@@ -1041,7 +1041,7 @@ class Wave2Driver(Plugin):
         # operator re-add of a revoked hostname → routes again (clears tombstone);
         # control = without re-add it stays gone.
         async def body(c):
-            spec_path = os.environ.get("WAVE2_READD_SPEC", "")
+            spec_path = os.environ.get("MULTINODE_READD_SPEC", "")
             assert await self._await_link(peer), "peer not up"
             await self.execute(CTL, "ctl_remove_peer", {"hostname": peer}, hosts="local")
             await asyncio.sleep(_HEARTBEAT_GUESS * 3)
@@ -1087,7 +1087,7 @@ class Wave2Driver(Plugin):
         # reconfigure during an in-flight cross-node request → fails PROMPTLY.
         async def body(c):
             assert await self._await_link(peer), "peer not up"
-            reload_cfg = os.environ.get("WAVE2_RELOAD_CONFIG", "")
+            reload_cfg = os.environ.get("MULTINODE_RELOAD_CONFIG", "")
             if not reload_cfg:
                 c.skip("no reload config wired for this boot")
             inflight = asyncio.create_task(self.execute(FIX, "slow_handler", {"delay": 60.0}, hosts=[peer]))

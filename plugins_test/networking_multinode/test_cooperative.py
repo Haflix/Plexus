@@ -1,10 +1,10 @@
-"""Wave-2 COOPERATIVE socket cells (batch 1) — real multi-node acceptance net.
+"""Multinode COOPERATIVE socket cells (batch 1) — real multi-node acceptance net.
 
-Boots real rewrite nodes (driver + 1-2 peers) via wave2_node.py, drives the
-cooperative wave-2 cells through Wave2Driver (which asserts the §A public surface
+Boots real rewrite nodes (driver + 1-2 peers) via node.py, drives the
+cooperative multinode cells through MultinodeDriver (which asserts the §A public surface
 and writes a CaseRecorder result), and fails the pytest if any cell fails/errors.
 
-Topology per group (see _wave2_harness): pair (2 mesh), trio_mesh (3 mesh), star
+Topology per group (see _harness): pair (2 mesh), trio_mesh (3 mesh), star
 (driver pins only the hub), discovery (discoverable + hub vouches peer2). Lifecycle
 cells are phase-coordinated: the driver signals a phase, this test kills/respawns/
 supplies the peer, the driver continues.
@@ -12,7 +12,7 @@ supplies the peer, the driver continues.
 Validates against the winning rewrite POST-COMBINE (no rewrite is deployed yet).
 Gated behind PLEXUS_PAIR_TEST so a blanket `pytest plugins_test/` never boots real
 nodes. Run explicitly:
-    PLEXUS_PAIR_TEST=1 python -m pytest plugins_test/networking_wave2/
+    PLEXUS_PAIR_TEST=1 python -m pytest plugins_test/networking_multinode/
 """
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ import time
 
 import pytest
 
-from _wave2_harness import (
+from _harness import (
     Harness, new_harness, wait_file, wait_phase, tail, peer_spec,
     CONFIG_DRIVER, CONFIG_PEER, CONFIG_PEER2, CONFIG_PEER_CHANGED,
     DRIVER_HOST, PEER_HOST, PEER2_HOST, RESULT_TIMEOUT, READY_TIMEOUT,
@@ -328,7 +328,7 @@ def test_TP15_own_keypair_mismatch_boot_abort():
     from plexus.serialization import generate_keypair
     import tempfile, shutil, subprocess, sys
     from pathlib import Path
-    from _wave2_harness import NODE_SCRIPT, CONFIG_PEER, REPO_ROOT, free_port
+    from _harness import NODE_SCRIPT, CONFIG_PEER, REPO_ROOT, free_port
     tmp = Path(tempfile.mkdtemp(prefix="w2_tp15_"))
     keys = Path(tempfile.mkdtemp(prefix="w2_tp15_keys_"))
     other = Path(tempfile.mkdtemp(prefix="w2_tp15_other_"))
@@ -368,7 +368,7 @@ def test_TP58_config_key_migration():
     `cert` retained → the node still BOOTS CLEAN (presence-only per A6/A8)."""
     import tempfile, shutil, subprocess, sys, json
     from pathlib import Path
-    from _wave2_harness import (NODE_SCRIPT, CONFIG_PEER, REPO_ROOT, free_port,
+    from _harness import (NODE_SCRIPT, CONFIG_PEER, REPO_ROOT, free_port,
                                 wait_file, READY_TIMEOUT)
     from plexus.serialization import generate_keypair
     tmp = Path(tempfile.mkdtemp(prefix="w2_tp58_"))

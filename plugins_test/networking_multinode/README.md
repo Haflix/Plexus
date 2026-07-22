@@ -1,26 +1,31 @@
-# networking_wave2 — wave-2 COOPERATIVE socket cells (batch 1)
+# networking_multinode — real-socket, multi-process, multi-node tests
 
-Real multi-node acceptance net for the networking rewrite. Boots real rewrite
-nodes (driver + 1-2 peers) and drives the cooperative wave-2 cells through
-`Wave2Driver`, asserting the §A public surface. Validates against the winning
-rewrite POST-combine (no rewrite is deployed yet; cannot run on current code —
-uses `snapshot()` / `_core/*` / rewrite config keys). Gated behind
-`PLEXUS_PAIR_TEST`.
+The multi-node acceptance net for netcore. Boots real nodes as separate
+processes (driver + 1-2 peers) and drives cooperative cells through
+`MultinodeDriver`, asserting the §A public surface, plus a hostile-peer batch
+(malformed frames, PING floods, reserved topics, spoofed author, vouched certs)
+and a races batch.
+
+Netcore shipped in `f71906b` (2026-07-14), so this tree runs against live code.
+Opt-in behind `PLEXUS_PAIR_TEST`, and NOT part of the boot gate: it spawns ~100
+processes across its cells, which is a genuinely different cost profile from the
+in-process suites. (Renamed from `networking_wave2` on 2026-07-22 — "wave 2" was
+a phase label from the rewrite project and said nothing about what is tested.)
 
 ```
-PLEXUS_PAIR_TEST=1 python -m pytest plugins_test/networking_wave2/
+PLEXUS_PAIR_TEST=1 python -m pytest plugins_test/networking_multinode/
 ```
 
 ## Pieces
-- `wave2_node.py` — generic N-peer node runner (injects port/keys/peers/knobs;
+- `node.py` — generic N-peer node runner (injects port/keys/peers/knobs;
   exports env for the fixture plugins).
 - `config.{driver,peer,peer2,peer_changed}.yml` — role configs (hostnames
   w2a-driver < w2b-peer < w2c-peer2 so dial election is deterministic).
-- `Wave2Driver/` — the in-node cell driver (CaseRecorder; group/cell via env;
+- `MultinodeDriver/` — the in-node cell driver (CaseRecorder; group/cell via env;
   drives the four primitives + NetFixTarget/NetObsProbe/NetCtl; writes a result
   file). Fixtures live at `plugins_test/{NetFixTarget,NetObsProbe,NetCtl}`.
-- `_wave2_harness.py` — spawn/keypair/topology helpers for the pytest.
-- `test_wave2_cooperative.py` — spawns each topology, asserts the driver result
+- `_harness.py` — spawn/keypair/topology helpers for the pytest.
+- `test_cooperative.py` — spawns each topology, asserts the driver result
   (fails the pytest on any failed/errored cell), plus the lifecycle + P-cell tests.
 
 ## Groups → topology → cells
@@ -37,8 +42,8 @@ PLEXUS_PAIR_TEST=1 python -m pytest plugins_test/networking_wave2/
 - **P-cells** (boot behavior): TP-15 (own-keypair mismatch → LOUD abort),
   TP-58 (config-key migration → clean boot).
 
-## Batch 2 — Type-X hostile + races (`test_wave2_hostile.py`, `test_wave2_races.py`)
-- **`test_wave2_hostile.py`** (Type-X, via `net_hostile` HostileClient +
+## Batch 2 — Type-X hostile + races (`test_hostile.py`, `test_races.py`)
+- **`test_hostile.py`** (Type-X, via `net_hostile` HostileClient +
   HostilePongServer against a real target node whose NetObsProbe self-dumps to a
   file): TP-70 (unpinned SPKI + resumed), TP-71 (system-caller spoof), TP-72
   (anti-spoof), TP-73 (reassembly bound keeps link), TP-75 (slow-drip absolute
@@ -47,13 +52,13 @@ PLEXUS_PAIR_TEST=1 python -m pytest plugins_test/networking_wave2/
   keeps link, A10), TG-20 (SafeUnpickler RCE guard), TG-09 (guaranteed-minimum). //
   ACCEPTOR mode (node dials hostile): TP-74 (PONG-snapshot over-bound), TP-77/78
   (malformed / SPKI-mismatch vouched cert), TG-17 (over-count vouched_peers).
-- **`test_wave2_races.py`** (fault-injected, driver lifecycle cells): TP-38
+- **`test_races.py`** (fault-injected, driver lifecycle cells): TP-38
   (revoke-during-await via `pong_delay`), TP-46 (remove-mid-dial via StallListener),
   TP-51 (pulse survives poison), TP-37 (revoke stays gone), TP-41 (operator re-add),
   TG-04 (LinkRefused fast-path via a dead port).
-- **`test_wave2_deadline_unit.py`** — TP-33/TG-18 injected-`now` unit test (skips
+- **`test_deadline_unit.py`** — TP-33/TG-18 injected-`now` unit test (skips
   until the branch exposes an injectable-clock deadline hook).
-- **`WAVE2_BATCH2_FCASES.md`** — §F white-box items with no injectable §A observable:
+- **`BATCH2_FCASES.md`** — §F white-box items with no injectable §A observable:
   TP-33/TG-18 (monotonic anchor), TP-48 (removed-voucher in-flight), TP-49 (flap-guard
   no-tear half = §F#22).
 

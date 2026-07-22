@@ -1,5 +1,5 @@
-description: Wave-2 cooperative cell driver — runs on the driver node, drives the cooperative socket cells via the four primitives + NetObsProbe/NetCtl, writes a CaseRecorder result file (group/cell selected by env)
-version: 0.1.3
+description: Multinode cooperative cell driver — runs on the driver node, drives the cooperative socket cells via the four primitives + NetObsProbe/NetCtl, writes a CaseRecorder result file (group/cell selected by env)
+version: 0.2.0
 remote: False
 arguments:
 subscriptions:

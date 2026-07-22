@@ -174,7 +174,7 @@ plugins:
   # In-process minimal-NM guards for the networking advert/liveness layer
   # (the B-085 "P-cell" family). The real-socket half used to live in
   # plugins_test/networking_pair/, deleted 2026-07-22 (it drove the retired
-  # push-advert protocol); plugins_test/networking_wave2/ is the surviving
+  # push-advert protocol); plugins_test/networking_multinode/ is the surviving
   # real-socket harness, opt-in behind PLEXUS_PAIR_TEST.
   - name: TestNetPairUnitSuite
     enabled: true

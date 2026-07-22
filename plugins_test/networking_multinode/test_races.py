@@ -1,6 +1,6 @@
-"""Wave-2 RACE cells (batch 2, §E) — fault-injected against a real driver node.
+"""Multinode RACE cells (batch 2, §E) — fault-injected against a real driver node.
 
-Injectable-black-box races: the driver node (Wave2Driver, lifecycle group) drives
+Injectable-black-box races: the driver node (MultinodeDriver, lifecycle group) drives
 the mutation (remove_peer / observes reachability) while this pytest runs the fault
 injector that opens the race window:
   * TP-38 revoke-during-ping-await → a HostilePongServer with pong_delay (the
@@ -13,7 +13,7 @@ injector that opens the race window:
 Plus the cooperative revoke/re-add/refused topology follow-ups (TP-37/41, TG-04).
 
 TP-48 (removed-voucher in-flight snapshot) and TP-49 (flap-guard no-tear) are
-WHITE-BOX (§F) — see WAVE2_BATCH2_FCASES.md; they have no injectable §A observable.
+WHITE-BOX (§F) — see BATCH2_FCASES.md; they have no injectable §A observable.
 
 Direction: driver = "w2a-driver" (lex-lowest) → it dials every peer. Injector
 hostnames are all lex-HIGHER so the driver dials them. Validates POST-combine.
@@ -37,7 +37,7 @@ if str(_HERE.parent) not in sys.path:
 
 from net_hostile.hostile_server import HostilePongServer  # noqa: E402
 from net_hostile.hostile_client import StallListener  # noqa: E402
-from _wave2_harness import (  # noqa: E402
+from _harness import (  # noqa: E402
     new_harness, wait_file, tail, peer_spec, free_port,
     CONFIG_DRIVER, CONFIG_PEER, CONFIG_PEER2, DRIVER_HOST, PEER_HOST, PEER2_HOST,
     RESULT_TIMEOUT,

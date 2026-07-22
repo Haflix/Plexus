@@ -4,7 +4,7 @@ reassembly deadline (A5 disposition: no OS-clock stepping; §F + this unit test)
 This validates the SPEC v4.4.2 §4.4 fix: the absolute per-reassembly deadline is
 anchored on `time.monotonic()`, so a backward WALL-clock step cannot extend a
 slow-drip DoS. It binds to the WINNING branch's reassembly-deadline check, which
-the §F rubric (WAVE2_BATCH2_FCASES.md) requires to accept an injectable `now` in
+the §F rubric (BATCH2_FCASES.md) requires to accept an injectable `now` in
 test mode. Until the swap wires the exact symbol, this SKIPS with the requirement.
 
 NOT a socket cell (runs in-process against netcore). Not gated behind
@@ -48,7 +48,7 @@ def test_absolute_deadline_is_monotonic_anchored():
     if check is None:
         pytest.skip(
             "netcore reassembly-deadline check not found / no injectable-`now` hook "
-            "yet. §F requirement (WAVE2_BATCH2_FCASES.md): the absolute-reassembly-"
+            "yet. §F requirement (BATCH2_FCASES.md): the absolute-reassembly-"
             "deadline predicate must accept an injectable `now` (monotonic) so this "
             "test can drive it; and must use time.monotonic(), never wall-clock. "
             "Bind the exact symbol at the phase-6 swap.")

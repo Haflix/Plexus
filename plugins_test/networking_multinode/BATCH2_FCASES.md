@@ -1,13 +1,13 @@
 # Batch-2 §F / white-box review items (no injectable §A observable)
 
-These wave-2 cells have NO black-box §A observable that a shared runnable cell can
+These multinode cells have NO black-box §A observable that a shared runnable cell can
 assert on. They are per-branch CODE-READ rubric items (confirmed by reading the
 winning branch), with a targeted unit test where a clock can be injected. Cite the
 black-box twin where one exists.
 
 ## TP-33 / TG-18 — backward-clock does not extend a slow-drip (MONOTONIC anchor)
 - **Disposition (A5):** do NOT step the OS clock under a subprocess (not portable/
-  safe on Windows). → §F code-read + `test_wave2_deadline_unit.py` (an injected-`now`
+  safe on Windows). → §F code-read + `test_deadline_unit.py` (an injected-`now`
   unit test of the absolute-reassembly-deadline check).
 - **§F assertion:** the absolute per-reassembly deadline (SPEC §4.4/§11, 60s) is
   anchored on `time.monotonic()`, NEVER `time.time()`/wall-clock; the directory

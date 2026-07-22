@@ -1,4 +1,4 @@
-"""Wave-2 TYPE-X hostile-peer cells (batch 2, §D + Type-X gaps).
+"""Multinode TYPE-X hostile-peer cells (batch 2, §D + Type-X gaps).
 
 A raw TLS + frame client (net_hostile.HostileClient) and an acceptor / PONG-server
 (net_hostile.HostilePongServer) drive crafted/omitted/oversized frames against a
@@ -39,7 +39,7 @@ from net_hostile.hostile_client import HostileClient, HostileConnError, pickle_a
 from net_hostile.hostile_server import (  # noqa: E402
     HostilePongServer, make_snapshot_bytes,
 )
-from _wave2_harness import (  # noqa: E402
+from _harness import (  # noqa: E402
     new_harness, wait_file, peer_spec, CONFIG_PEER, PEER_HOST, READY_TIMEOUT,
     FAST_KNOBS,
 )

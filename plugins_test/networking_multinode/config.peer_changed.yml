@@ -1,4 +1,4 @@
-# Wave-2 cooperative harness — PEER node RESPAWN VARIANT (same identity/hostname
+# Multinode cooperative harness — PEER node RESPAWN VARIANT (same identity/hostname
 # w2b-peer) that exports DIFFERENT content: a SECOND NetFixTarget instance
 # (NetFixTargetB, same source) adds endpoints/subs so content_hash changes and a
 # new endpoint becomes routable. Used by the reboot-different-content (TP-31) and

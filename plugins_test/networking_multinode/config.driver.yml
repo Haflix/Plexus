@@ -1,9 +1,9 @@
-# Wave-2 cooperative harness — DRIVER node (hostname w2a-driver, the lex-lowest
-# so it is the election dialer to its peers). Runs Wave2Driver (the cell driver),
+# Multinode cooperative harness — DRIVER node (hostname w2a-driver, the lex-lowest
+# so it is the election dialer to its peers). Runs MultinodeDriver (the cell driver),
 # NetObsProbe (records its own _core/* events + snapshot), NetCtl (runtime
 # add/remove_peer + sub toggle + reload), and NetFixTarget (a local service so
 # TG-03 has a local sub + TG-08 can be called back). port/keys/peers/knobs are
-# injected at runtime by wave2_node.py.
+# injected at runtime by node.py.
 plugins:
   - name: NetFixTarget
     enabled: true
@@ -14,9 +14,9 @@ plugins:
   - name: NetCtl
     enabled: true
     path: ./plugins_test/NetCtl
-  - name: Wave2Driver
+  - name: MultinodeDriver
     enabled: true
-    path: ./plugins_test/networking_wave2/Wave2Driver
+    path: ./plugins_test/networking_multinode/MultinodeDriver
 
 general:
     hostname: "w2a-driver"
