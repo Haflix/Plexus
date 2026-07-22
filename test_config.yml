@@ -181,7 +181,7 @@ plugins:
     path: ./plugins_test/TestNetPairUnitSuite
 
   # White-box netcore mechanism cells (wraps plexus/netcore/_*_selftest.py as
-  # suite cells); real-socket cells gated behind PLEXUS_NETCORE_SOCKET.
+  # suite cells). All cells run every boot; see the plugin's module docstring.
   - name: TestNetcoreUnitSuite
     enabled: true
     path: ./plugins_test/TestNetcoreUnitSuite

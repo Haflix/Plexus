@@ -1,5 +1,5 @@
-description: In-suite white-box unit cells for the netcore networking rewrite — wraps the per-module netcore self-tests (wire/transport/membership/directory/dispatch) as CaseRecorder cells so the mechanism coverage runs on every boot. No-socket cells always run; real-socket loopback cells are gated behind PLEXUS_NETCORE_SOCKET (same rationale as networking_pair/PLEXUS_PAIR_TEST — kept out of the default boot to avoid Winsock starvation).
-version: 0.2.0
+description: In-suite white-box unit cells for the netcore networking rewrite — wraps the per-module netcore self-tests (wire/transport/membership/directory/dispatch) as CaseRecorder cells so the mechanism coverage runs on every boot. Every cell runs, including the real-socket loopback ones; see the plugin module docstring for why the former gate was removed.
+version: 0.3.0
 remote: false
 arguments:
 dependencies:
