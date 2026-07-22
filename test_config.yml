@@ -56,20 +56,34 @@ plugins:
     enabled: true
     path: ./plugins_test/TestLifecycleVictim
 
-  # B-007 fixtures (BrokenVersion + Sentinel) are NOT enabled in
-  # test_config.yml because B-007 itself breaks startup — the KeyError from
-  # the missing-version plugin aborts get_plugins's for loop, taking down
-  # the entire test framework before any case runs. The B-007 case in
-  # TestLifecycleSuite c.skip()s with a note that the bug requires a
-  # controlled-startup harness (e.g. a separate subprocess invocation with
-  # only these two plugins) to test.
+  # B-007 fixture: plugin_config.yml with NO version field. Stays
+  # enabled:false and is loaded ON DEMAND by lifecycle.B-007 — see B-093.
+  # If B-007 regressed while this booted, the KeyError would abort the load
+  # loop and kill the run before any case reported, so the regression could
+  # never show up as a red cell. On-demand loading makes it one.
   - name: TestLifecycleBrokenVersion
     enabled: false
     path: ./plugins_test/TestLifecycleBrokenVersion
 
+  # Sentinel was the boot-time half of the old B-007 fixture pair: listed
+  # after BrokenVersion, its absence would show the load loop had aborted.
+  # Unused now that the case loads on demand (an on-demand load never
+  # touches get_plugins's loop, so Sentinel could prove nothing there).
+  # Kept on disk for a future B-093 guard rather than deleted.
   - name: TestLifecycleSentinel
     enabled: false
     path: ./plugins_test/TestLifecycleSentinel
+
+  # enabled:false ON PURPOSE — DO NOT FLIP IT (B-093). Its on_load raises,
+  # and get_plugins (core.py:2111) has no per-entry guard while
+  # load_plugin_with_conf re-raises, so enabling this entry aborts the whole
+  # load loop: every plugin listed BELOW it silently never loads and the run
+  # dies with "FATAL: TestLifecycleLoadCrashError" and no test report.
+  # Measured 2026-07-22: 35 entries lost. lifecycle.state_machine.
+  # failed_load_state_visible loads it on demand instead, then pops it.
+  - name: TestLifecycleLoadCrash
+    enabled: false
+    path: ./plugins_test/TestLifecycleLoadCrash
 
   - name: TestRemoteSuite
     enabled: true

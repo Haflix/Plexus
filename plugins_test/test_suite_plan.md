@@ -43,7 +43,8 @@ plugins_test/
   TestLifecycleSuite/            # Phase 4
   TestLifecycleVictim/           # Phase 4 fixture (also instantiated as TestLifecycleVictim2)
   TestLifecycleBrokenVersion/    # Phase 4 static fixture for B-007 (plugin_config.yml without version)
-  TestLifecycleSentinel/         # Phase 4 static fixture for B-007 (asserted via absence)
+  TestLifecycleSentinel/         # Phase 4 static fixture, unused since B-007 moved to an on-demand load
+  TestLifecycleLoadCrash/        # static fixture whose on_load raises (FAILED_LOAD case); never enable at boot
   TestRemoteSuite/               # Phase 5
   TestRemoteTarget/              # Phase 5 fixture; remote: true
   TestRemoteVictim/              # Phase 5 fixture; remote: false (B-001 target)
@@ -511,9 +512,11 @@ cover cross-node verification at the integration level.
 - `on_disable_hangs_secs` (int) (B-009) — must use `await asyncio.sleep(secs)` (NOT `time.sleep` — sync `time.sleep` inside an async coroutine freezes the event loop)
 - Endpoints: `is_db_open()`, `enable_count()`, `disable_count()`, `victim_hang_endpoint(secs)` (for B-005)
 
-**TestLifecycleBrokenVersion** static fixture: `plugin_config.yml` *without* a `version` field. Listed in `config.example.yml` BEFORE `TestLifecycleSentinel` so the B-007 KeyError-aborts-load-loop bug can be observed via Sentinel's absence in `core.plugins`.
+**TestLifecycleBrokenVersion** static fixture: `plugin_config.yml` *without* a `version` field. B-007 is fixed (core.py defaults a missing version to `"0.0.0"`). The fixture stays `enabled: false` and the case loads it ON DEMAND, asserting `load_plugin_with_conf` does not raise — booting it would make a regression fatal before any case reported (B-093), so the regression could never appear as a red cell.
 
-**TestLifecycleSentinel** static fixture: trivial plugin that records `self.loaded=True`. Its presence/absence after startup is the B-007 assertion.
+**TestLifecycleSentinel** static fixture: trivial plugin that records `self.loaded=True`. Was the boot-time half of the B-007 pair (listed after BrokenVersion; its absence would show the load loop had aborted). Currently UNUSED and `enabled: false` — an on-demand load never goes through `get_plugins`'s loop, so Sentinel cannot witness it. Kept for a future B-093 guard.
+
+**TestLifecycleLoadCrash** static fixture: `on_load` raises `TestLifecycleLoadCrashError`. `enabled: false`; loaded on demand by `lifecycle.state_machine.failed_load_state_visible`, which asserts the FAILED_LOAD transition and the `Phase.LOAD` `ErrorRecord`, then pops it. Do NOT enable it at boot (B-093: it would abort the load loop for every entry below it).
 
 **Suite cleanup contract:** every case ends with a `finally` that re-installs the victim into a clean state (re-enables, resets configure flags, closes any opened "DB"). Suite-level `core.plugins` snapshot diff at end of each case (per §5.2).
 
@@ -522,7 +525,7 @@ cover cross-node verification at the integration level.
 | ID | Case | bug_ids | tags |
 |---|---|---|---|
 | `lifecycle.load.valid_config` | normal load → in `core.plugins` | — | basic |
-| `lifecycle.B-007.missing_version_aborts_load_loop` | TestLifecycleBrokenVersion in config BEFORE Sentinel; `c.skip(...)` if order wrong; expected_status=fail, marker="sentinel_loaded" | B-007 | bug_repro |
+| `lifecycle.B-007.missing_version_defaults` | load TestLifecycleBrokenVersion on demand; `load_plugin_with_conf` must not raise, and the plugin lands in `core.plugins` with version `"0.0.0"`; pop it in `finally` | B-007 | bug_repro |
 | `lifecycle.load.malformed_endpoint` | endpoint missing access_name → error_config + plugin not loaded | — | basic |
 | `lifecycle.enable.success` | enabled=True after on_enable | — | basic |
 | `lifecycle.B-004.on_enable_raises_no_undo` | configure on_enable_raises_after_setup; assert `victim.is_db_open()==True` after `_enable_plugin` returns; expected_status=fail, marker="db_was_closed" | B-004 | bug_repro |
@@ -852,7 +855,7 @@ And remove their entries from `config.example.yml`.
 - **Concurrency-test bounds.** Hard timeouts prevent runner death. Bound choices documented per case.
 - **Multi-instance plugin loading** — relied on by Phase 1. The §11.2 smoke test gates this; if it fails, all `multi_instance` cases skip cleanly.
 - **Subprocess on Windows.** §6.5.1 sketch falls back to `signal.signal` for Windows; `terminate()` then `kill()` after 5s.
-- **B-007 fixture order.** Case re-reads `core.yaml_config` and `c.skip(...)` if BrokenVersion not before Sentinel.
+- **B-007 fixture loading.** The case loads BrokenVersion on demand from its (disabled) `config.yml` entry and pops it again; no boot-order coupling remains. Enabling the fixture at boot would turn a regression into a fatal abort with no report (B-093), which is the opposite of a guard.
 - **`expected_status="fail"` flip review.** `runner.review_required` is loud; CI script can fail the build if non-empty.
 - **B-009 plugin_lock starvation.** Recovery requires forcibly marking victim disabled then `pop_plugin`; documented in suite README.
 

@@ -33,12 +33,13 @@ from plexus.plugin_state import Phase, State  # noqa: E402  (C-152)
 from _test_helpers import CaseRecorder  # noqa: E402
 
 
-SUITE_VERSION = "0.3.4"
+SUITE_VERSION = "0.4.0"
 VICTIM = "TestLifecycleVictim"
 VICTIM2 = "TestLifecycleVictim2"
 VICTIM_PATH = "./plugins_test/TestLifecycleVictim"
 SENTINEL = "TestLifecycleSentinel"
 BROKEN_VERSION = "TestLifecycleBrokenVersion"
+LOAD_CRASH = "TestLifecycleLoadCrash"
 
 
 class TestLifecycleSuite(Plugin):
@@ -771,25 +772,61 @@ class TestLifecycleSuite(Plugin):
         )
 
     # ====================================================================
-    # BASIC B-007 — missing version aborts load loop
+    # BASIC B-007 — missing version defaults instead of raising KeyError
     # ====================================================================
 
     async def _basic_b007_missing_version(
         self, rec: CaseRecorder, kw: Dict,
     ) -> None:
         async def body(c):
-            c.skip(
-                "B-007 (missing-version KeyError aborts get_plugins loop) "
-                "cannot be reproduced from inside a running suite: enabling "
-                "TestLifecycleBrokenVersion + Sentinel in test_config.yml "
-                "kills wait_until_ready before any case runs. Repro requires "
-                "a controlled-startup harness (subprocess) — Phase 5 "
-                "scaffold could host this once it lands."
-            )
+            # B-007: a plugin_config.yml with no `version` used to raise
+            # KeyError out of load_plugin_with_conf. Because get_plugins
+            # (core.py:2111) has no per-entry guard and load_plugin_with_conf
+            # re-raises (@async_log_errors, decorators.py:239), that KeyError
+            # aborted the whole boot load loop and every plugin listed after
+            # the offender silently never loaded.
+            #
+            # The fixture is loaded ON DEMAND, and is enabled:false at boot,
+            # ON PURPOSE. Booting it would make a regression FATAL before any
+            # case runs — no test_report.json at all, measured 2026-07-22 —
+            # i.e. a regression that can never surface as a red cell. Loading
+            # it here makes "load_plugin_with_conf does not raise" a normal
+            # falsifiable assertion.
+            #
+            # NOTE the load-loop abort itself is still live for any OTHER
+            # raising plugin (filed as B-093); B-007's fix removed one
+            # trigger, not the failure mode. This case guards the trigger.
+            entry = self._find_yaml_entry(BROKEN_VERSION)
+            if entry is None:
+                raise AssertionError(
+                    f"{BROKEN_VERSION} missing from test_config.yml; the "
+                    f"B-007 regression cannot be evaluated without it"
+                )
+            load_entry = dict(entry)
+            load_entry["enabled"] = True
+            try:
+                # THE assertion. Any raise here is the B-007 failure mode.
+                await self._plexus.load_plugin_with_conf(load_entry)
+
+                broken = self._plexus.plugins.get(BROKEN_VERSION)
+                if broken is None:
+                    raise AssertionError(
+                        f"{BROKEN_VERSION} did not load; a missing version "
+                        f"must warn and default, not drop the plugin"
+                    )
+                # WEAK on its own — Plugin.__init__ already sets
+                # self.version = "0.0.0" (utils.py:1340), so this passes even
+                # if core assigns nothing. Kept only to pin the fallback
+                # VALUE (R4-WW-2 requires a parseable PEP 440 string; the
+                # earlier placeholder literal broke every SpecifierSet check
+                # against it). The falsifiable half is the load above.
+                c.expect(broken.version, "0.0.0")
+            finally:
+                await self._plexus.pop_plugin(BROKEN_VERSION)
 
         await rec.run_case(
-            "lifecycle.B-007.missing_version_aborts_load_loop", body,
-            tags=("bug_repro", "deferred"), bug_ids=("B-007",),
+            "lifecycle.B-007.missing_version_defaults", body,
+            tags=("bug_repro",), bug_ids=("B-007",),
             **kw,
         )
 
@@ -1243,24 +1280,92 @@ class TestLifecycleSuite(Plugin):
                 await self._ensure_victim_clean()
 
         async def body_failed_load_state_visible(c):
-            ps = self._plexus.plugin_states.get(BROKEN_VERSION)
-            if ps is None:
-                c.skip(
-                    f"{BROKEN_VERSION} not present in this harness — "
-                    f"FAILED_LOAD coverage scoped out"
-                )
-                return
-            if ps.state not in (State.FAILED_LOAD, State.UNLOADED):
+            # Previously pointed at BROKEN_VERSION, which no longer fails to
+            # load at all: B-007 is fixed, so a missing version now warns and
+            # defaults (core.py:2785-2794). The case had been skipping
+            # because that fixture was disabled, so the retarget is not a
+            # coverage loss — nothing was being asserted.
+            #
+            # LOAD_CRASH is loaded on demand rather than at boot so no other
+            # suite has to tolerate a FAILED_LOAD entry for the whole run.
+            entry = self._find_yaml_entry(LOAD_CRASH)
+            if entry is None:
                 raise AssertionError(
-                    f"broken plugin {BROKEN_VERSION!r} state is "
-                    f"{ps.state} — expected FAILED_LOAD or UNLOADED"
+                    f"{LOAD_CRASH} missing from test_config.yml; the "
+                    f"FAILED_LOAD transition cannot be evaluated without it"
                 )
-            if ps.state is State.FAILED_LOAD:
+            # A copy with enabled=True: load_plugin_with_conf returns early on
+            # a disabled entry (core.py:2306), and mutating the shared
+            # yaml_config dict would leave the fixture enabled for any later
+            # reload.
+            load_entry = dict(entry)
+            load_entry["enabled"] = True
+            # pop_plugin does NOT clear last_errors, so a Phase.LOAD record
+            # from an earlier invocation of this suite (a filtered re-run in
+            # the same boot, or the TUI calling run() again) survives in
+            # plugin_states. Without this timestamp the assertions below
+            # would pass on the stale record even if the framework recorded
+            # nothing this time.
+            t0 = time.time()
+            try:
+                load_exc = None
+                try:
+                    await self._plexus.load_plugin_with_conf(load_entry)
+                except Exception as exc:
+                    # Expected: on_load's raise is re-raised after being
+                    # recorded. Kept for the failure messages below — if the
+                    # fixture ever stops loading for an unrelated reason
+                    # (rename, import error, moved directory) the real cause
+                    # must not be swallowed.
+                    load_exc = exc
+
+                ps = self._plexus.plugin_states.get(LOAD_CRASH)
+                if ps is None:
+                    raise AssertionError(
+                        f"{LOAD_CRASH} left no plugin_states entry after a "
+                        f"failed load (load raised {load_exc!r})"
+                    )
+                if ps.state is not State.FAILED_LOAD:
+                    raise AssertionError(
+                        f"{LOAD_CRASH} state is {ps.state} after on_load "
+                        f"raised — expected FAILED_LOAD "
+                        f"(load raised {load_exc!r})"
+                    )
+                # FAILED_LOAD means "no instance". core.plugins is the
+                # convenience view; PluginState.instance is what observers of
+                # state_changed actually read, and BUG-015 exists because
+                # those two can disagree — so assert both.
+                c.expect(LOAD_CRASH in self._plexus.plugins, False)
+                c.expect(ps.instance, None)
+
                 err = ps.last_errors.get(Phase.LOAD)
                 if err is None:
                     raise AssertionError(
-                        "FAILED_LOAD without Phase.LOAD error record"
+                        f"FAILED_LOAD without Phase.LOAD error record "
+                        f"(load raised {load_exc!r})"
                     )
+                if err.ts < t0:
+                    raise AssertionError(
+                        f"Phase.LOAD ErrorRecord is stale (ts={err.ts} < "
+                        f"{t0}); nothing was recorded for THIS load"
+                    )
+                # The record must identify the plugin's own exception, not
+                # some wrapper the framework raised on the way out.
+                if not err.exception_type.endswith(
+                        "TestLifecycleLoadCrashError"):
+                    raise AssertionError(
+                        f"Phase.LOAD ErrorRecord names {err.exception_type!r}, "
+                        f"expected the fixture's TestLifecycleLoadCrashError"
+                    )
+                if "deliberate on_load failure" not in err.exception_repr:
+                    raise AssertionError(
+                        f"Phase.LOAD ErrorRecord repr lost the message: "
+                        f"{err.exception_repr!r}"
+                    )
+            finally:
+                # Config still lists the entry, so this leaves UNLOADED
+                # rather than removing it (core.py:3228 config_has_entry).
+                await self._plexus.pop_plugin(LOAD_CRASH)
 
         async def body_state_enum_values_complete(c):
             expected = {

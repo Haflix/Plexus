@@ -1,5 +1,5 @@
-description: Phase 4 static fixture — Sentinel listed AFTER TestLifecycleBrokenVersion to detect B-007's load-loop abort
-version: 0.1.0
+description: Phase 4 static fixture — was the boot-time witness for B-007's load-loop abort; unused since the case moved to an on-demand load, kept for a future B-093 guard
+version: 0.1.1
 remote: True
 arguments:
 endpoints:
