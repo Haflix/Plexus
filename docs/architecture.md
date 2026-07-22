@@ -93,6 +93,13 @@ Constraints:
 
 After `on_load` returns, Plexus overwrites `plugin_name`, `version`, `remote`, `description`, `arguments`, `prefix`, `verbose_notifier`, `endpoints`, `events`, and `subscriptions` from the merged manifest plus `overrides:` block. So `on_load` sees framework defaults; everything outside `on_load` sees the real values.
 
+**A raise in `on_load` aborts startup — by design.** The plugin is transitioned to `FAILED_LOAD` with its `Phase.LOAD` `ErrorRecord` recorded, then the exception propagates out of the boot load loop and the process exits. Plexus does not come up degraded: a plugin that cannot construct is treated as a deployment error, not a runtime condition. Two consequences worth knowing:
+
+- Plugins listed **after** the failing one in `config.yml` never load, so the config order determines what did and did not get as far as loading. Read the log, not the plugin list, to find the cause. The framework logs `Plugin '<name>': on_load raised` (naming the plugin) before the process-level `FATAL` line (which names only the exception).
+- The `FAILED_LOAD` state is therefore mostly observable for **runtime** loads (`_reload_plugin`, on-demand `load_plugin_with_conf`), where the caller catches the raise and the framework keeps running. At boot it exists in `plugin_states` only until the process exits.
+
+Keep `on_load` trivial and unfailable — declare attributes, nothing more. Anything that can fail belongs in `on_enable`, where a failure is contained to the one plugin.
+
 ### `on_enable(self, *args, **kwargs)` — async or sync
 
 Called once the plugin is registered. May be `async def` or plain `def`; Plexus branches on `asyncio.iscoroutinefunction`. Sync versions run on the framework's plugin executor.
@@ -210,7 +217,7 @@ Each plugin tracked in `plx.plugins` (and config-disabled plugins tracked in `pl
 | `ENABLING` | `on_enable` in progress. |
 | `ENABLED` | `on_enable` returned successfully. Endpoints dispatchable. |
 | `DISABLING` | `on_disable` in progress. |
-| `FAILED_LOAD` | `on_load` raised. Instance is `None`. `last_errors[Phase.LOAD]` populated. |
+| `FAILED_LOAD` | `on_load` raised, or the dependency resolver rejected the plugin. Instance is `None`. `last_errors[Phase.LOAD]` populated for the `on_load` case. Reached at boot only transiently — an `on_load` raise aborts startup (see [`on_load`](#on_loadself-args-kwargs--synchronous)); the state is durable for runtime loads and for dependency failures. |
 
 Every state mutation funnels through `plx._transition_plugin(name, new_state)`, which emits `_core/plugin/state_changed` on the internal event bus. Observers must NOT acquire `plugin_lock` / `lifecycle_lock` / `request_lock` during dispatch (sync observer contract — see [`api_reference.md`](./api_reference.md)).
 

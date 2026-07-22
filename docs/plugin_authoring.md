@@ -626,7 +626,7 @@ Each plugin tracked by the framework follows a 6-state machine:
 | `ENABLING` | `on_enable` in progress. |
 | `ENABLED` | `on_enable` returned. Endpoints dispatchable. |
 | `DISABLING` | `on_disable` in progress. |
-| `FAILED_LOAD` | `on_load` raised. No instance. `last_errors[Phase.LOAD]` populated. |
+| `FAILED_LOAD` | `on_load` raised, or a dependency constraint failed. No instance. `last_errors[Phase.LOAD]` populated for the `on_load` case. At boot an `on_load` raise aborts startup outright (plugins listed after it never load), so keep `on_load` unfailable and put anything that can fail in `on_enable`. See [architecture.md](./architecture.md#on_loadself-args-kwargs--synchronous). |
 
 Read state with `plx.plugin_states[name].state`. The state enum lives in
 [`plexus/plugin_state.py`](../plexus/plugin_state.py); import as
