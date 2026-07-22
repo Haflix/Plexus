@@ -77,7 +77,7 @@ from plexus.ratelimiter import (  # noqa: E402
 
 from _test_helpers import CaseRecorder  # noqa: E402
 
-SUITE_VERSION = "0.12.0"
+SUITE_VERSION = "0.13.0"
 SUITE = "TestRateLimitSuite"
 TARGET = "TestRateLimitTarget"
 
@@ -880,7 +880,6 @@ class TestRateLimitSuite(Plugin):
             # Step 4's YAML plumbing lands. Start from a fresh limiter; the
             # sideband + framework_in are restored by run()'s finally.
             px._rate_limiter = RateLimiter()
-            px._rate_limit_config = {}
             px._rate_limit_sub_config = {}
             px._rate_limit_nodes_in_config = {
                 "default": {"max": 2, "window": 1000},

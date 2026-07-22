@@ -25,7 +25,7 @@ from plexus.dependencies import (  # noqa: E402
 from _test_helpers import CaseRecorder  # noqa: E402
 
 
-SUITE_VERSION = "0.1.0"
+SUITE_VERSION = "0.2.0"
 
 
 def _spec(name: str, version: str = "", optional: bool = False) -> DependencySpec:
@@ -89,7 +89,6 @@ class TestDepResolutionUnitSuite(Plugin):
         await self._u16_failed_load_names(rec, kw)
         await self._u17_cycle_wins_precedence(rec, kw)
         await self._u18_invalid_fallback_version(rec, kw)
-        await self._u19_first_failure_wins(rec, kw)
         await self._bug040_collect_all_failures(rec, kw)
         await self._u20_plexus_prerelease(rec, kw)
         await self._u21_plexus_only_deps(rec, kw)
@@ -341,29 +340,15 @@ class TestDepResolutionUnitSuite(Plugin):
             tags=("resolve", "version"), category="resolve", **kw
         )
 
-    async def _u19_first_failure_wins(self, rec, kw):
-        async def body(c):
-            deps = {
-                "A": [],
-                "C": [_spec("Missing1"), _spec("A", ">=99.0")],
-            }
-            r = resolve(deps, {"A": "1", "C": "1"}, "0.41.1")
-            assert "C" in r.failed
-            assert "Missing1" in r.failed["C"], r.failed["C"]
-
-        await rec.run_case(
-            "resolve.plugin.first_failure_wins", body,
-            tags=("resolve",), category="resolve", **kw
-        )
-
     async def _bug040_collect_all_failures(self, rec, kw):
         # BUG-040 (R4-WW-14): resolve() collects ALL failing required deps for a
         # plugin in ONE pass, not just the first ("first-failure-wins"). A plugin
         # with two failing required deps must surface BOTH reasons joined under a
         # "<N> failing deps:" count prefix, so an operator fixes every failing
-        # dep at once instead of restarting N times for N failures. (Distinct
-        # from resolve.plugin.first_failure_wins, which only checks one reason is
-        # present and so does not pin the collect-all behavior.)
+        # dep at once instead of restarting N times for N failures. (This
+        # subsumed the old resolve.plugin.first_failure_wins cell, deleted
+        # 2026-07-22: it used the identical deps dict and asserted a strict
+        # subset of the assertions below.)
         async def body(c):
             deps = {
                 "A": [],

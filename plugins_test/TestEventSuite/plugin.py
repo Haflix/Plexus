@@ -7,16 +7,18 @@ Categories covered (each method below corresponds to one category):
   3.  _basic_dispatch         — Event metadata, payload shapes, cross-plugin
   4.  _basic_matching         — wildcard / tie-break / YAML insertion order
   5.  _basic_access            — C18 access control, requester_id propagation
-  6.  _basic_advert            — cross-node advert lifecycle (auto-skip when
-                                 remote_available=False)
-  7.  _basic_advert_remote     — cross-node snapshot filters
-  8.  _basic_delivery_remote   — receiver-gate delivery semantics
-  9.  _basic_sync              — sync handler dispatch (Q17 + C3)
-  10. _basic_logging           — verbose_notifier DEBUG line emission
-  11. _basic_lifecycle         — subs registered/unregistered, hot-reload
-  12. _basic_request_cleanup   — done-callback eviction (B-073)
-  13. _basic_hard_removal      — Stage D legacy-API hard-removal asserts
-  14. _basic_edge              — edge cases + unexpected_pass re-verification
+  6.  _basic_sync              — sync handler dispatch (Q17 + C3)
+  7.  _basic_logging           — verbose_notifier DEBUG line emission
+  8.  _basic_lifecycle         — subs registered/unregistered, hot-reload
+  9.  _basic_request_cleanup   — done-callback eviction (B-073)
+  10. _basic_hard_removal      — Stage D legacy-API hard-removal asserts
+  11. _basic_edge              — edge cases + unexpected_pass re-verification
+
+The cross-node advert/delivery categories were removed 2026-07-22: every
+cell in them was an unconditional skip, and their behaviour now lives in
+the pull-directory model, covered by plexus/netcore/_directory_selftest.py
+(in the gate via TestNetcoreUnitSuite) and the opt-in networking_multinode
+tree.
 
 The suite owner publishes events; subscriber endpoints come from this
 plugin, TestEventTarget (cross-plugin sub routing), and (on demand)
@@ -39,7 +41,7 @@ from plexus.exceptions import RequestException  # noqa: E402
 from _test_helpers import CaseRecorder  # noqa: E402
 
 
-SUITE_VERSION = "0.2.1"
+SUITE_VERSION = "0.3.0"
 
 TARGET = "TestEventTarget"
 BAD_ACTOR = "TestEventBadActor"
@@ -139,8 +141,6 @@ class TestEventSuite(Plugin):
         await self._basic_dispatch(rec, kw)
         await self._basic_matching(rec, kw)
         await self._basic_access(rec, kw)
-        await self._basic_advert_remote(rec, kw)
-        await self._basic_delivery_remote(rec, kw)
         await self._basic_sync(rec, kw)
         await self._basic_logging(rec, kw)
         await self._basic_lifecycle(rec, kw)
@@ -1057,90 +1057,7 @@ class TestEventSuite(Plugin):
         )
 
     # ====================================================================
-    # 6 + 8. ADVERT TABLE LIFECYCLE + SNAPSHOT — cross-node only
-    # ====================================================================
-
-    async def _basic_advert_remote(self, rec: CaseRecorder, kw: Dict) -> None:
-        async def body_peer_disconnect_cleanup(c):
-            c.skip("advert table introspection requires a peer subprocess")
-
-        async def body_peer_reconnect_resnapshot(c):
-            c.skip("advert table introspection requires a peer subprocess")
-
-        async def body_snapshot_local_only(c):
-            c.skip("snapshot inspection requires a peer subprocess")
-
-        async def body_snapshot_blocked_host(c):
-            c.skip("snapshot inspection requires a peer subprocess")
-
-        async def body_snapshot_disabled_sub(c):
-            c.skip("snapshot inspection requires a peer subprocess")
-
-        async def body_reload_regenerates_uuid(c):
-            c.skip("advert delta inspection requires a peer subprocess")
-
-        await rec.run_case(
-            "event.advert.peer_disconnect_cleanup", body_peer_disconnect_cleanup,
-            hosts=("remote",), tags=("basic", "advert"),
-            **kw,
-        )
-        await rec.run_case(
-            "event.advert.peer_reconnect_resnapshot",
-            body_peer_reconnect_resnapshot,
-            hosts=("remote",), tags=("basic", "advert"),
-            **kw,
-        )
-        await rec.run_case(
-            "event.advert.snapshot_filtering_local_only",
-            body_snapshot_local_only,
-            hosts=("remote",), tags=("basic", "advert"),
-            **kw,
-        )
-        await rec.run_case(
-            "event.advert.snapshot_blocked_host_excluded",
-            body_snapshot_blocked_host,
-            hosts=("remote",), tags=("basic", "advert"),
-            **kw,
-        )
-        await rec.run_case(
-            "event.advert.snapshot_disabled_never_advertised",
-            body_snapshot_disabled_sub,
-            hosts=("remote",), tags=("basic", "advert"),
-            **kw,
-        )
-        await rec.run_case(
-            "event.advert.reload_regenerates_sub_uuid",
-            body_reload_regenerates_uuid,
-            hosts=("remote",), tags=("basic", "advert"),
-            **kw,
-        )
-
-    # ====================================================================
-    # 9. DELIVERY MODEL — RECEIVER GATE (cross-node)
-    # ====================================================================
-
-    async def _basic_delivery_remote(self, rec: CaseRecorder, kw: Dict) -> None:
-        async def body_no_local_sub_silent_drop(c):
-            c.skip("requires peer subprocess to publish at us")
-
-        async def body_excluded_by_host_filter(c):
-            c.skip("requires peer subprocess to publish at us")
-
-        await rec.run_case(
-            "event.delivery.peer_event_no_matching_local_sub_silent_drop",
-            body_no_local_sub_silent_drop,
-            hosts=("remote",), tags=("basic", "delivery"),
-            **kw,
-        )
-        await rec.run_case(
-            "event.delivery.peer_event_excluded_by_local_host_filter_silent_drop",
-            body_excluded_by_host_filter,
-            hosts=("remote",), tags=("basic", "delivery"),
-            **kw,
-        )
-
-    # ====================================================================
-    # 10. SYNC SUBSCRIBER QUEUE (Q17 + C3)
+    # 6. SYNC SUBSCRIBER QUEUE (Q17 + C3)
     # ====================================================================
 
     async def _basic_sync(self, rec: CaseRecorder, kw: Dict) -> None:
@@ -1222,54 +1139,6 @@ class TestEventSuite(Plugin):
             finally:
                 await self._ensure_unloaded(BAD_ACTOR)
 
-        async def body_request_event_sees_handler_exception(c):
-            loaded = await self._ensure_loaded(BAD_ACTOR)
-            if not loaded:
-                c.skip("TestEventBadActor not registered in test_config.yml")
-                return
-            try:
-                sub_id = await self._plexus.subscribe_event(
-                    "test_event/smoke/request",
-                    self.plugin_name,
-                    self.plugin_uuid,
-                    target_plugin=BAD_ACTOR,
-                    target_access_name="handle_raising_async",
-                )
-                try:
-                    # The pre-existing smoke_request_sub on the suite still
-                    # matches the same topic. request_event iterates find_all
-                    # in YAML insertion order and the suite's smoke_request_sub
-                    # comes BEFORE the runtime-added bad_actor sub
-                    # (runtime subs are appended). request_event would
-                    # therefore hit the suite's working handler, NOT the
-                    # bad actor. To hit the bad actor first the suite
-                    # would have to UNsubscribe its own. Skip — covered
-                    # via the publish_event variant.
-                    c.skip(
-                        "request_event YAML-order tie-break makes the suite's "
-                        "good handler win over the runtime bad-actor sub; "
-                        "exception path is exercised via publish above"
-                    )
-                finally:
-                    try:
-                        await self._plexus.unsubscribe_event(sub_id)
-                    except Exception:
-                        pass
-            finally:
-                await self._ensure_unloaded(BAD_ACTOR)
-
-        async def body_workers_1_serializes(c):
-            # Cannot reconfigure the live SyncDispatcher's worker pool
-            # without restarting Plexus; the framework reads
-            # general.sync_dispatcher_workers at init. Skip with note.
-            c.skip(
-                "live SyncDispatcher.workers is fixed at Plexus init; "
-                "covered by spawning two long_sync handlers and observing "
-                "thread-pool concurrency in a dedicated harness"
-            )
-
-        async def body_shutdown_drains_30s(c):
-            c.skip("requires Plexus.close() in middle of suite")
 
         await rec.run_case(
             "event.sync.dispatcher_basic", body_dispatcher_basic,
@@ -1286,23 +1155,6 @@ class TestEventSuite(Plugin):
             tags=("basic", "sync", "error"),
             hard_timeout_s=20.0,
             **kw,
-        )
-        await rec.run_case(
-            "event.sync.request_event_sees_handler_exception",
-            body_request_event_sees_handler_exception,
-            tags=("basic", "sync", "error"),
-            hard_timeout_s=20.0,
-            **kw,
-        )
-        await rec.run_case(
-            "event.sync.workers_1_serializes",
-            body_workers_1_serializes,
-            tags=("basic", "sync"), **kw,
-        )
-        await rec.run_case(
-            "event.sync.shutdown_drains_30s",
-            body_shutdown_drains_30s,
-            tags=("basic", "sync"), **kw,
         )
 
     # ====================================================================
@@ -1352,23 +1204,10 @@ class TestEventSuite(Plugin):
                 return
             c.expect(len(verbose_lines) >= 1, True)
 
-        async def body_verbose_false_silent(c):
-            # Need to load a SECOND publisher plugin with verbose_notifier:
-            # false to actually verify the FALSE path. Without that fixture
-            # we'd be testing the wrong code path. Skip with explanation.
-            c.skip(
-                "verbose=False evidence requires a separate publisher "
-                "plugin instance configured with verbose_notifier:false"
-            )
 
         await rec.run_case(
             "event.logging.verbose_true_emits_debug",
             body_verbose_true_emits_debug,
-            tags=("basic", "logging"), **kw,
-        )
-        await rec.run_case(
-            "event.logging.verbose_false_silent",
-            body_verbose_false_silent,
             tags=("basic", "logging"), **kw,
         )
 
@@ -1485,42 +1324,6 @@ class TestEventSuite(Plugin):
             finally:
                 await self._ensure_unloaded(BAD_ACTOR)
 
-        async def body_hot_reload_drop_window(c):
-            c.skip(
-                "hot-reload event-drop window covered by lifecycle.B-037; "
-                "additional racy verification deferred to dedicated harness"
-            )
-
-        async def body_target_plugin_uuid_orphaning(c):
-            # Subscribe with an explicit target_plugin_uuid that doesn't
-            # match any live plugin. publish_event should not crash.
-            sub_id = await self.subscribe(
-                "test_event/lifecycle/orphan_topic",
-                target_access_name="handle_loopback",
-                target_plugin=self.plugin_name,
-                target_plugin_uuid="0" * 32,  # bogus uuid
-            )
-            try:
-                # Need a declared event for that topic. Add one via runtime?
-                # Not supported for events — only via YAML. Use an existing
-                # event that won't ordinarily match this topic. Skip;
-                # the orphan path is exercised by reload_replaces_subs
-                # for the uuid-changes case.
-                c.skip(
-                    "orphan target_plugin_uuid path covered by reload "
-                    "lifecycle case; explicit standalone test deferred"
-                )
-            finally:
-                try:
-                    await self.unsubscribe(sub_id)
-                except Exception:
-                    pass
-
-        async def body_mid_fanout_reload(c):
-            c.skip(
-                "mid-fanout reload race covered by lifecycle.B-037; "
-                "extra coverage deferred"
-            )
 
         await rec.run_case(
             "event.lifecycle.subs_registered_on_enable_start",
@@ -1544,25 +1347,6 @@ class TestEventSuite(Plugin):
             body_reload_replaces_subs,
             tags=("basic", "lifecycle"),
             hard_timeout_s=20.0,
-            **kw,
-        )
-        await rec.run_case(
-            "event.lifecycle.hot_reload_drop_window",
-            body_hot_reload_drop_window,
-            tags=("basic", "lifecycle", "race"),
-            slow=True,
-            **kw,
-        )
-        await rec.run_case(
-            "event.lifecycle.target_plugin_uuid_orphaning",
-            body_target_plugin_uuid_orphaning,
-            tags=("basic", "lifecycle"), **kw,
-        )
-        await rec.run_case(
-            "event.lifecycle.mid_fanout_reload",
-            body_mid_fanout_reload,
-            tags=("basic", "lifecycle", "race"),
-            slow=True,
             **kw,
         )
 
@@ -1800,14 +1584,6 @@ class TestEventSuite(Plugin):
             finally:
                 await self._ensure_unloaded(BAD_ACTOR)
 
-        async def body_empty_subscriptions_block(c):
-            # Plugin with no subscriptions: still loads cleanly. Use the
-            # smoke pub/sub pair fixtures? No — both have subscriptions.
-            # Skip with note (no current fixture covers this).
-            c.skip(
-                "no current test fixture has empty subscriptions:; "
-                "covered implicitly by plugins that omit the section"
-            )
 
         async def body_extra_keys_static_warn(c):
             self._reset_self_mailboxes()
@@ -1834,12 +1610,6 @@ class TestEventSuite(Plugin):
             body_empty_events_publish_raises,
             tags=("basic", "edge"),
             hard_timeout_s=20.0,
-            **kw,
-        )
-        await rec.run_case(
-            "event.edge.empty_subscriptions_block",
-            body_empty_subscriptions_block,
-            tags=("basic", "edge"),
             **kw,
         )
         await rec.run_case(

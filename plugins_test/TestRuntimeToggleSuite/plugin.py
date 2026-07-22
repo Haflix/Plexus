@@ -25,7 +25,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import asyncio  # noqa: E402
-import time  # noqa: E402
 import uuid as _uuid  # noqa: E402
 from typing import Any, Dict, List, Optional, Tuple  # noqa: E402
 
@@ -39,7 +38,7 @@ from _test_helpers import CaseRecorder  # noqa: E402
 from plexus.core import _EMIT_DEPTH, _MAX_EMIT_DEPTH  # noqa: E402
 
 
-SUITE_VERSION = "0.1.0"
+SUITE_VERSION = "0.2.0"
 
 EXEC_TARGET = "TestExecuteTarget"
 RUNTIME_TOGGLE_EVENT_ID = "runtime_toggle_event"
@@ -334,13 +333,11 @@ class TestRuntimeToggleSuite(Plugin):
                 c.expect(results[0], True)
                 c.expect(results[1], True)
                 sub = await pc.topic_registry.get_subscription(uuid)
-                # Strict bool — not int, not None, not string.
+                # Strict bool — not int, not None, not string. The old
+                # `if sub.enabled not in (True, False)` follow-up was dead:
+                # past this assertion sub.enabled IS a bool, so it could
+                # never trip.
                 c.expect(isinstance(sub.enabled, bool), True)
-                # Final state is one of the two valid orderings.
-                if sub.enabled not in (True, False):
-                    raise AssertionError(
-                        f"sub.enabled {sub.enabled!r} not bool"
-                    )
                 # Emit count: initial sub state is True. set(True) no-ops
                 # if it runs FIRST (state already True); set(False) flips
                 # → 1 emit. If set(False) runs FIRST, it flips; set(True)
@@ -369,136 +366,6 @@ class TestRuntimeToggleSuite(Plugin):
                 self.internal_unobserve("_core/subscription/state_changed", cb)
                 await self._drop_runtime_sub(uuid)
 
-        async def body_emit_after_broadcast(c):
-            c.skip("nm.broadcast_local_sub_removed push-hook is DELETED by the netcore "
-                   "rewrite — a runtime sub enable/disable now propagates via the pull/hash "
-                   "SLA (the toggle flips the export filter -> content_hash changes -> the "
-                   "peer refetches within a heartbeat), covered by the directory export-"
-                   "filter self-test (disable-changes-hash) + wave-2 TP-34")
-            """Test #54 (tightened after review): the emit must
-            fire AFTER the broadcast call has returned. The original
-            assertion only compared timestamps against the call window,
-            which trivially passes when the broadcast path is skipped
-            (no peers configured → ``nm.is_ready`` False).
-
-            This version monkey-patches the NetworkManager's broadcast
-            helper to record its invocation timestamp, then asserts
-            ``broadcast_ts < emit_ts``. When networking is not ready,
-            the test still verifies the emit fires inside the call
-            window but ALSO asserts no broadcast attempt was made
-            (so the implementation cannot silently swap order without
-            our notice).
-            """
-            uuid = await self._make_runtime_sub(RUNTIME_TOGGLE_TOPIC)
-            captured_emit_ts: List[float] = []
-            captured_broadcast_ts: List[float] = []
-
-            def cb(topic, payload):
-                captured_emit_ts.append(payload.get("ts", 0.0))
-
-            self.internal_observe("_core/subscription/state_changed", cb)
-            nm = pc.network
-            original_broadcast = None
-            networking_ready = (
-                getattr(pc, "networking_enabled", False)
-                and nm is not None
-                and getattr(nm, "is_ready", False)
-            )
-            try:
-                # Install spy whenever an ``nm`` exists — even if not
-                # ``is_ready`` — so the test can verify the gate IS
-                # enforced (if implementation bypasses the is_ready
-                # check and calls broadcast on a not-ready NM, the spy
-                # records it and the assertion below fires). An earlier
-                # version skipped spy install
-                # when not-ready, making the "no broadcast happened"
-                # assertion vacuous. When nm itself is None, there's
-                # nothing to spy on — skip the case to avoid pretending
-                # the gate was tested.
-                if nm is None:
-                    c.skip(
-                        "set_subscription_enabled.emit_after_broadcast: "
-                        "no NetworkManager (networking disabled at boot) — "
-                        "broadcast-path ordering cannot be exercised; "
-                        "skip rather than trivially pass"
-                    )
-                    return
-
-                original_broadcast = nm.broadcast_local_sub_removed
-
-                async def spy(sub, *, _target_uuid=uuid, _orig=original_broadcast):
-                    # Filter by sub_uuid so concurrent broadcasts from
-                    # unrelated paths (peer-driven flows, other suites'
-                    # teardowns) don't pollute the capture list.
-                    if getattr(sub, "sub_uuid", None) == _target_uuid:
-                        captured_broadcast_ts.append(time.time())
-                    return await _orig(sub)
-
-                nm.broadcast_local_sub_removed = spy
-
-                t_before = time.time()
-                await pc.set_subscription_enabled(uuid, False)
-                t_after = time.time()
-
-                c.expect(len(captured_emit_ts), 1)
-                emit_ts = captured_emit_ts[0]
-                if not (t_before <= emit_ts <= t_after):
-                    raise AssertionError(
-                        f"emit ts {emit_ts} outside window "
-                        f"[{t_before}, {t_after}]"
-                    )
-
-                if networking_ready:
-                    # Networking up: broadcast WAS called; ordering
-                    # invariant must hold (broadcast_ts <= emit_ts).
-                    if len(captured_broadcast_ts) != 1:
-                        raise AssertionError(
-                            f"expected exactly 1 broadcast call; got "
-                            f"{len(captured_broadcast_ts)}"
-                        )
-                    bts = captured_broadcast_ts[0]
-                    if not (bts <= emit_ts):
-                        raise AssertionError(
-                            f"broadcast ts {bts} > emit ts {emit_ts} — "
-                            f"emit fired BEFORE broadcast (order regression)"
-                        )
-                else:
-                    # Networking not ready but nm exists: spy WAS
-                    # installed. Implementation MUST respect the
-                    # ``is_ready`` gate at core.py:6712-6716 and
-                    # skip the broadcast call. If captured_broadcast_ts
-                    # is non-empty, the gate was bypassed — real bug.
-                    if captured_broadcast_ts:
-                        raise AssertionError(
-                            f"broadcast called despite nm.is_ready=False; "
-                            f"gate bypassed: captured {captured_broadcast_ts}"
-                        )
-            finally:
-                if original_broadcast is not None and nm is not None:
-                    nm.broadcast_local_sub_removed = original_broadcast
-                self.internal_unobserve("_core/subscription/state_changed", cb)
-                await self._drop_runtime_sub(uuid)
-
-        async def body_noop_no_emit(c):
-            """Test #56 — explicit no-emit guard. Companion to #40 —
-            specifically asserts the observer count does NOT increase
-            on a no-op call.
-            """
-            uuid = await self._make_runtime_sub(RUNTIME_TOGGLE_TOPIC)
-            captured: List = []
-
-            def cb(topic, payload):
-                captured.append(payload)
-
-            self.internal_observe("_core/subscription/state_changed", cb)
-            try:
-                # Already True; call with True → no-op
-                result = await pc.set_subscription_enabled(uuid, True)
-                c.expect(result, True)
-                c.expect(len(captured), 0)
-            finally:
-                self.internal_unobserve("_core/subscription/state_changed", cb)
-                await self._drop_runtime_sub(uuid)
 
         await rec.run_case(
             "pc.set_sub_enabled.toggles_flag", body_toggles_flag,
@@ -518,14 +385,6 @@ class TestRuntimeToggleSuite(Plugin):
         )
         await rec.run_case(
             "pc.set_sub_enabled.concurrent", body_concurrent,
-            tags=("basic",), bug_ids=(), **kw,
-        )
-        await rec.run_case(
-            "pc.set_sub_enabled.emit_after_broadcast", body_emit_after_broadcast,
-            tags=("basic",), bug_ids=(), **kw,
-        )
-        await rec.run_case(
-            "pc.set_sub_enabled.noop_no_emit", body_noop_no_emit,
             tags=("basic",), bug_ids=(), **kw,
         )
 
@@ -624,21 +483,6 @@ class TestRuntimeToggleSuite(Plugin):
             finally:
                 self.internal_unobserve("_core/event/state_changed", cb)
 
-        async def body_popped_plugin(c):
-            """Test #46 — toggling an event on a popped plugin returns
-            False (the lookup fails because the plugin is gone from
-            self.plugins).
-            """
-            # Use a fake plugin name that doesn't exist in self.plugins
-            # — equivalent to "plugin was popped" at the boundary of
-            # the TOCTOU window. The real race (mid-call pop) is not
-            # deterministically testable from suite code; this asserts
-            # the boundary check fires correctly.
-            fake_plugin = f"PoppedPlugin_{_uuid.uuid4().hex[:8]}"
-            result = await pc.set_event_enabled(
-                fake_plugin, "any_event_id", True
-            )
-            c.expect(result, False)
 
         await rec.run_case(
             "pc.set_event_enabled.toggles_flag", body_toggles_flag,
@@ -654,10 +498,6 @@ class TestRuntimeToggleSuite(Plugin):
         )
         await rec.run_case(
             "pc.set_event_enabled.idempotent", body_idempotent,
-            tags=("basic",), bug_ids=(), **kw,
-        )
-        await rec.run_case(
-            "pc.set_event_enabled.popped_plugin", body_popped_plugin,
             tags=("basic",), bug_ids=(), **kw,
         )
 

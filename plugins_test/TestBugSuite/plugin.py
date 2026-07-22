@@ -37,7 +37,7 @@ from plexus.networking import PeerSpec  # noqa: E402
 from _test_helpers import CaseRecorder  # noqa: E402
 
 
-SUITE_VERSION = "0.7.0"
+SUITE_VERSION = "0.8.0"
 
 
 TARGET = "TestEventTarget"
@@ -105,132 +105,7 @@ class TestBugSuite(Plugin):
         await self._b_addressed_in_pr3(rec, kw)
         await self._b_active(rec, kw)
         await self._b_security(rec, kw)
-        await self._b_fixed_audit(rec, kw)
         return rec.to_dict()
-
-    async def _b_fixed_audit(self, rec: CaseRecorder, kw: Dict) -> None:
-        """Green regression guards for bugs FOUND + FIXED in the 2026-06-21
-        core-review audit cycle (promoted from the gitignored audit dir so the
-        fix is regression-protected in the committed suite)."""
-        category = "fixed_audit"
-
-        # ---- B-081 (audit BUG-028) -----------------------------------
-        async def body_b_081_sync_gen_close_worker_thread(c):
-            c.skip("old-NM _drive_sync_gen_stream internals retired by netcore; the "
-                   "close-vs-next serialization is covered by netcore dispatch §F#20 + selftest")
-            # BUG-028 / B-081: the sync-generator branch of
-            # _handle_request_event_stream used to close the generator in a
-            # finally on the event-loop thread; on a stream timeout that close
-            # raced the still-running next() on a worker thread ("generator
-            # already executing") and the generator's cleanup was lost. The fix
-            # (NetworkManager._drive_sync_gen_stream) closes on the SAME worker
-            # thread as next(), serialized by a lock. This guard drives the REAL
-            # helper with a generator that blocks inside next() when the timeout
-            # fires, and asserts: no close ever raced a live next(), and the
-            # generator IS closed on a worker thread. If the fix is reverted,
-            # the instrumented generator records race=True and this case fails.
-            import threading as _th
-            import time as _tm
-            from concurrent.futures import ThreadPoolExecutor as _TPE
-
-            grec: Dict[str, Any] = {}
-
-            class _GW:
-                def __init__(self, gen):
-                    self._gen = gen
-
-                def __iter__(self):
-                    return self
-
-                def __next__(self):
-                    grec["next_running"] = True
-                    try:
-                        return self._gen.__next__()
-                    finally:
-                        grec["next_running"] = False
-
-                def send(self, v):
-                    return self._gen.send(v)
-
-                def throw(self, *a):
-                    return self._gen.throw(*a)
-
-                def close(self):
-                    grec.setdefault("close_calls", []).append(
-                        {"thread": _th.current_thread().name,
-                         "while_next_running": grec.get("next_running", False)}
-                    )
-                    try:
-                        self._gen.close()
-                    except ValueError as e:
-                        if "already executing" in str(e):
-                            grec["race"] = True
-                        raise
-
-            def _mk_gen():
-                def g():
-                    try:
-                        for i in range(4):
-                            if i == 1:
-                                _tm.sleep(1.0)  # block inside next() so timeout fires mid-next
-                            yield i
-                    finally:
-                        grec["cleanup_ran"] = True
-                        grec["cleanup_thread"] = _th.current_thread().name
-                return _GW(g())
-
-            nm = self._plexus.network
-            if nm is None:
-                c.skip("networking not enabled")
-                return
-
-            executor = _TPE(max_workers=2)
-            sentinel = object()
-            received: List[int] = []
-
-            async def on_chunk(item):
-                received.append(item)
-
-            gen = _mk_gen()
-            timed_out = False
-            try:
-                await asyncio.wait_for(
-                    nm._drive_sync_gen_stream(executor, gen, on_chunk, sentinel),
-                    timeout=0.3,
-                )
-            except asyncio.TimeoutError:
-                timed_out = True
-
-            # let the blocked next() return (~1.0s) so the worker-side close runs
-            for _ in range(150):
-                if grec.get("cleanup_ran") or grec.get("race"):
-                    break
-                await asyncio.sleep(0.02)
-            executor.shutdown(wait=False)
-
-            c.expect(timed_out, True)
-            c.expect(received, [0])
-            assert not grec.get("race"), (
-                f"B-081/BUG-028 regressed: gen.close() raced a live next(); "
-                f"close_calls={grec.get('close_calls')}"
-            )
-            for cc in grec.get("close_calls", []):
-                assert not cc["while_next_running"], (
-                    f"B-081/BUG-028 regressed: close ran while next() in flight: {cc}"
-                )
-            assert grec.get("cleanup_ran"), "generator cleanup never ran"
-            assert str(grec.get("cleanup_thread", "")).startswith("ThreadPoolExecutor"), (
-                f"cleanup ran on {grec.get('cleanup_thread')!r}, expected a worker thread"
-            )
-
-        await rec.run_case(
-            "bug.B-081.sync_gen_close_worker_thread",
-            body_b_081_sync_gen_close_worker_thread,
-            category=category,
-            tags=("bug_repro", "networking", "sync_gen", "BUG-028"),
-            bug_ids=("B-081",),
-            **kw,
-        )
 
     # ------------------------------------------------------------------
     # Helpers
@@ -950,31 +825,6 @@ class TestBugSuite(Plugin):
                 default=None,
             )
 
-        # ---- B-054 ---------------------------------------------------
-        async def body_b_054_request_event_stream_bypasses_request(c):
-            # B-054: request_event_stream bypasses Request lifecycle —
-            # stream-dispatch entries aren't tracked in core.requests.
-            # Repro: verify that during a streaming dispatch, no
-            # corresponding entry shows up in requests. Implementation-
-            # bound: skip if requests dict isn't accessible or the
-            # streaming primitive isn't routable here.
-            core = self._plexus
-            requests = getattr(core, "requests", None)
-            if requests is None:
-                c.skip(
-                    "STAGE_F_FIXME: core.requests not accessible from "
-                    "suite context — repro path implementation-bound"
-                )
-                return
-            # No clean way to drive a streaming request and snapshot
-            # the requests dict mid-flight without race-prone timing.
-            # Defer to fixture work.
-            c.skip(
-                "STAGE_F_FIXME: request_event_stream lifecycle repro "
-                "needs mid-flight snapshot of core.requests; race-prone "
-                "without dedicated harness fixture"
-            )
-
         # ---- B-064 ---------------------------------------------------
         async def body_b_064_subscribe_no_async_log_errors(c):
             # B-064: preventive — Plugin.subscribe must NOT have
@@ -1059,14 +909,6 @@ class TestBugSuite(Plugin):
             tags=("bug_repro", "active"), bug_ids=("B-051",),
             **kw,
         )
-        # B-054: skip pending fixture work.
-        await rec.run_case(
-            "bug.B-054.request_event_stream_bypasses_request",
-            body_b_054_request_event_stream_bypasses_request,
-            category=category,
-            tags=("bug_repro", "active", "deferred"), bug_ids=("B-054",),
-            **kw,
-        )
         # B-064: preventive — body uses c.expect (default
         # expected_status="pass"); pass = decorator absent (good).
         await rec.run_case(
@@ -1086,7 +928,6 @@ class TestBugSuite(Plugin):
             await self.publish_event("b047_probe_event")
         except Exception:
             pass
-
 
 
     # ==================================================================
@@ -1117,10 +958,6 @@ class TestBugSuite(Plugin):
     # ==================================================================
     async def _b_security(self, rec: CaseRecorder, kw: Dict) -> None:
         category = "security"
-
-
-
-
 
 
         # ==============================================================
@@ -1555,6 +1392,5 @@ class TestBugSuite(Plugin):
                 tags=("regression_guard", "security", "b091"), bug_ids=("B-091",),
                 hard_timeout_s=timeout, **kw,
             )
-
 
 

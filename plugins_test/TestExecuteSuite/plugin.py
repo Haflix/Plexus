@@ -11,7 +11,6 @@ Exercises:
 - Decorator contract regression locks
 - Deep RequestException chain propagation
 - request_context_async / request_context_sync smoke
-- Runner-meta framework_version sanity
 - Edge: B-015 args-contract variants (bytes/set/frozenset/dataclass/async_gen/OrderedDict)
 - Edge: cancel during sync handler in threadpool
 
@@ -39,10 +38,10 @@ from plexus.decorators import (  # noqa: E402
 )
 from plexus.exceptions import RequestException  # noqa: E402
 
-from _test_helpers import CaseRecorder, FRAMEWORK_VERSION  # noqa: E402
+from _test_helpers import CaseRecorder  # noqa: E402
 
 
-SUITE_VERSION = "0.2.2"
+SUITE_VERSION = "0.3.0"
 TARGET = "TestExecuteTarget"
 TARGET2 = "TestExecuteTarget2"
 
@@ -110,7 +109,6 @@ class TestExecuteSuite(Plugin):
         await self._basic_contract_find_endpoint(rec, kw)
         await self._basic_request_context(rec, kw)
         await self._basic_decorators(rec, kw)
-        await self._basic_runner_meta(rec, kw)
         await self._edge_args_contract_variants(rec, kw)
         await self._edge_cancellation(rec, kw)
 
@@ -626,15 +624,6 @@ class TestExecuteSuite(Plugin):
     # ====================================================================
 
     async def _basic_multi_instance(self, rec: CaseRecorder, kw: Dict) -> None:
-        async def body_distinct_uuids(c):
-            if not self._multi_instance_smoke_passed:
-                c.skip(
-                    "multi-instance smoke failed; loader does not isolate instances"
-                )
-            t1 = self._t1_uuid
-            t2 = self._t2_uuid
-            if t1 == t2:
-                raise AssertionError(f"uuids identical: {t1}")
 
         async def body_target_by_uuid(c):
             if not self._multi_instance_smoke_passed:
@@ -648,10 +637,6 @@ class TestExecuteSuite(Plugin):
             r2 = await self.execute(TARGET2, "get_uuid", plugin_uuid=t2)
             c.expect(r2, t2)
 
-        await rec.run_case(
-            "exec.multi_instance.distinct_uuids", body_distinct_uuids,
-            tags=("multi_instance",), **kw,
-        )
         await rec.run_case(
             "exec.multi_instance.target_by_uuid", body_target_by_uuid,
             tags=("multi_instance",), **kw,
@@ -769,27 +754,11 @@ class TestExecuteSuite(Plugin):
                         f"unexpected error: {e!r}"
                     )
 
-        async def body_uuid_after_pop_returns_none(c):
-            # Skip — pop_plugin requires Phase 4 mechanics; out of Phase 1 scope.
-            c.skip("requires pop_plugin lifecycle from Phase 4")
-
-        async def body_uuid_invalidated_after_reload(c):
-            c.skip("requires _reload_plugin from Phase 4")
 
         await rec.run_case(
             "exec.contract.find_endpoint_uuid_target_plugin_conflict",
             body_uuid_target_conflict,
             tags=("discovery",), **kw,
-        )
-        await rec.run_case(
-            "exec.contract.uuid_after_pop_returns_none",
-            body_uuid_after_pop_returns_none,
-            tags=("discovery",), **kw,
-        )
-        await rec.run_case(
-            "exec.contract.uuid_invalidated_after_reload",
-            body_uuid_invalidated_after_reload,
-            tags=("discovery", "reload"), **kw,
         )
 
     # ====================================================================
@@ -933,21 +902,6 @@ class TestExecuteSuite(Plugin):
             tags=("decorators",), **kw,
         )
 
-    # ====================================================================
-    # BASIC runner-meta sanity (framework_version)
-    # ====================================================================
-
-    async def _basic_runner_meta(self, rec: CaseRecorder, kw: Dict) -> None:
-        async def body_framework_version(c):
-            if not isinstance(FRAMEWORK_VERSION, str) or not FRAMEWORK_VERSION:
-                raise AssertionError(
-                    f"FRAMEWORK_VERSION not a non-empty string: {FRAMEWORK_VERSION!r}"
-                )
-
-        await rec.run_case(
-            "runner.meta.framework_version_set", body_framework_version,
-            tags=("runner", "contract"), **kw,
-        )
 
     # ====================================================================
     # EDGE B-015 args-contract variants

@@ -10,8 +10,11 @@ Exercises:
 - Stream-level timeout (gen never yields)
 - Request-entry reaped on normal completion
 - Calling execute_stream on a non-generator endpoint
-- B-041 sync-chain-through-stream (deferred — observation-only design TBD)
 - Edge: cancellation between yields
+
+B-041 (sync chain through stream) had a permanently-skipped placeholder
+here; it was deleted 2026-07-22. The bug is marked fixed in the tracker
+but has NO regression guard - see B-041 in _private/bugs/bugs.jsonl.
 """
 
 import sys
@@ -29,7 +32,7 @@ from plexus.exceptions import RequestException  # noqa: E402
 from _test_helpers import CaseRecorder  # noqa: E402
 
 
-SUITE_VERSION = "0.1.0"
+SUITE_VERSION = "0.2.0"
 TARGET = "TestStreamTarget"
 EXEC_TARGET = "TestExecuteTarget"  # for the non-generator endpoint test
 
@@ -79,7 +82,6 @@ class TestStreamSuite(Plugin):
         await self._basic_sync_iter(rec, kw)
         await self._basic_timeout(rec, kw)
         await self._basic_contract(rec, kw)
-        await self._basic_b041_skip(rec, kw)
         await self._edge_cancellation_between_yields(rec, kw)
 
         return rec.to_dict()
@@ -411,23 +413,6 @@ class TestStreamSuite(Plugin):
             hosts=("local", "remote"), tags=("error", "regression_lock"), **kw,
         )
 
-    # ====================================================================
-    # BASIC B-041 — deferred (skip with reason)
-    # ====================================================================
-
-    async def _basic_b041_skip(self, rec: CaseRecorder, kw: Dict) -> None:
-        async def body_b041(c):
-            c.skip(
-                "B-041 case design TBD: needs concrete sync→stream→sync cycle "
-                "fixture. Direct chain observation duplicates B-039; deadlock "
-                "observation requires saturating the threadpool."
-            )
-
-        await rec.run_case(
-            "stream.B-041.sync_chain_through_stream", body_b041,
-            tags=("bug_repro",), bug_ids=("B-041",),
-            **kw,
-        )
 
     # ====================================================================
     # EDGE cancellation between yields
