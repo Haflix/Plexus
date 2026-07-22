@@ -1,18 +1,19 @@
-"""TestBugSuite — PR3 Stage F bughunt repro suite + PR4 Stage K B-066 regressions.
+"""TestBugSuite — PR3 Stage F bughunt repro suite + netcore security guards.
 
-One case per open `bugtracker.md` entry plus the surviving PR4 Stage K B-066
-regression cases (see B-091 for the coverage gap they represent). Verdicts are recorded by
-the parent post-run (annotated on bugtracker.md). NO bug fixes here —
-only repros that prove which bugs are real vs fixed-by-construction.
+One case per open bug-tracker entry (`_private/bugs/bugs.jsonl`). Verdicts
+are recorded by the parent post-run. NO bug fixes here — only repros that
+prove which bugs are real vs fixed-by-construction.
 
 Categories (one method per):
   _b_legacy_removed     — API surface deleted in Stage D — assert .gone
   _b_addressed_in_pr3   — PR3 added behavior that should fix the bug
   _b_active             — still-broken — repro and let recorder mark
-  _b_security           — PR4 Stage K B-066 regression guards
+  _b_security           — netcore inbound-authorization guards (B-090/B-091)
 
-See PLAN.md (alongside this file in the worktree) for the per-bug spec
-table and pattern recipes.
+The PR4 Stage K "B-066" raw-wire cells were deleted 2026-07-22 (they had
+been silently skipping since the netcore rewrite). See the _b_security
+header for which of their properties were re-covered and which were
+dropped without replacement.
 """
 
 import sys
@@ -22,12 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import asyncio  # noqa: E402
 import time  # noqa: E402
 import inspect  # noqa: E402
-import logging  # noqa: E402
-import os  # noqa: E402
-import pickle  # noqa: E402
 import shutil  # noqa: E402
-import ssl  # noqa: E402
-import struct  # noqa: E402
 import tempfile  # noqa: E402
 import uuid  # noqa: E402
 from typing import Any, Dict, List, Optional  # noqa: E402
@@ -38,184 +34,10 @@ from plexus.exceptions import RequestException  # noqa: E402
 
 from plexus.networking import PeerSpec  # noqa: E402
 
-# The old MSG_* wire constants were DELETED with networking.py's god-class (the SPEC
-# networking rewrite replaces the [len][type][payload] protocol with netcore's framed
-# CHUNK protocol). The B-066 raw-wire cells below are guarded by `c.skip("networking not
-# enabled")` and only reach these when networking is on (i.e. the retired socket harness).
-# Kept as module-local constants (NOT re-added to the shim) so the module imports; the
-# raw-wire cells are being retired in favour of the netcore Type-X hostile-frame harness.
-MSG_EXECUTE = 1
-MSG_PING = 4
-MSG_RESULT = 10
-MSG_STREAM_CHUNK = 11
-MSG_ERROR = 12
-MSG_END_STREAM = 13
-MSG_REQUEST_EVENT = 16
-from plexus.serialization import generate_keypair, Serializable  # noqa: E402
-
 from _test_helpers import CaseRecorder  # noqa: E402
 
 
-SUITE_VERSION = "0.6.0"
-
-
-# ──────────────────────────────────────────────────────────────────────
-# PR4 Stage K B-066 — module-level helpers + payload classes.
-#
-# Pickle resolves classes/callables by (module, qualname). For payloads
-# that traverse the wire, the class definition MUST be at module scope
-# so the receiver-side find_class can resolve them. Plexus loads
-# this file via spec_from_file_location(name="TestBugSuite", ...) so
-# __module__ is "TestBugSuite" (not the dotted file path).
-# ──────────────────────────────────────────────────────────────────────
-
-
-def _b066_sentinel_create(sentinel_dir: str) -> None:
-    """Module-level callable used as Test 1's __reduce__ target. A
-    receiver still vulnerable to pre-/post-auth pickle RCE would invoke
-    this. K-1 SafeUnpickler rejects in find_class — defense.
-    """
-    (Path(sentinel_dir) / "PWNED").write_bytes(b"pwned")
-
-
-class _B066PrePwnPickle:
-    """Test 1 payload. __reduce__ returns module-level callable."""
-
-    def __init__(self, sentinel_dir: str) -> None:
-        self.sentinel_dir = sentinel_dir
-
-    def __reduce__(self):
-        return (_b066_sentinel_create, (self.sentinel_dir,))
-
-
-class _B066NotRegistered:
-    """Test 2 payload. Plain class NOT inheriting Serializable.
-    pickle.dumps succeeds; receiver's safe_loads rejects on find_class.
-    """
-
-    def __init__(self, value: str = "test") -> None:
-        self.value = value
-
-
-class _B066RegisteredButPwn(Serializable):
-    """Test 2b payload. Inherits Serializable (CLASS lookup passes via
-    SERIALIZABLE_REGISTRY) BUT __reduce__ returns a non-allowlisted
-    callable — SafeUnpickler rejects on the *callable* lookup.
-    """
-
-    def __init__(self, sentinel_dir: str) -> None:
-        self.sentinel_dir = sentinel_dir
-
-    def __reduce__(self):
-        return (_b066_sentinel_create, (self.sentinel_dir,))
-
-
-class _B066LogCapture:
-    """Inline log handler that buffers records on a logger to a list.
-    Use as:
-        cap = _B066LogCapture("networking", logging.DEBUG)
-        cap.attach()
-        try:
-            ...
-        finally:
-            cap.detach()
-    """
-
-    def __init__(self, logger_name: str = "networking",
-                 min_level: int = logging.DEBUG) -> None:
-        self.logger_name = logger_name
-        self.min_level = min_level
-        self.records: List[logging.LogRecord] = []
-        self._handler: Optional[logging.Handler] = None
-        self._saved_level: int = logging.NOTSET
-        self._attached: bool = False
-
-    def attach(self) -> None:
-        h = logging.Handler()
-        h.setLevel(self.min_level)
-        h.emit = lambda record: self.records.append(record)
-        lg = logging.getLogger(self.logger_name)
-        self._saved_level = lg.level
-        if lg.level == logging.NOTSET or lg.level > self.min_level:
-            lg.setLevel(self.min_level)
-        lg.addHandler(h)
-        self._handler = h
-        self._attached = True
-
-    def detach(self) -> None:
-        # Only restore logger level if
-        # attach() actually ran. A `finally`-block detach() called after
-        # an exception during attach setup must not silently reset the
-        # logger to NOTSET (which would suppress WARNING messages later
-        # security tests rely on).
-        if not self._attached:
-            return
-        lg = logging.getLogger(self.logger_name)
-        if self._handler is not None:
-            lg.removeHandler(self._handler)
-            self._handler = None
-        lg.setLevel(self._saved_level)
-        self._attached = False
-
-    def has_message(self, substring: str, min_level: int = 0) -> bool:
-        for r in self.records:
-            if r.levelno < min_level:
-                continue
-            if substring in r.getMessage():
-                return True
-        return False
-
-
-async def _b066_send_msg(writer: asyncio.StreamWriter, msg_type: int,
-                         data: Any) -> None:
-    """Wire-frame send matching networking._send_message format.
-    Sender uses raw pickle.dumps — receiver runs the bytes through
-    safe_loads, which is the code under test.
-    """
-    payload = pickle.dumps(data)
-    msg_length = len(payload) + 1
-    header = struct.pack(">IB", msg_length, msg_type)
-    writer.write(header + payload)
-    await writer.drain()
-
-
-async def _b066_recv_msg(reader: asyncio.StreamReader, *,
-                         timeout: float = 5.0):
-    """Wire-frame receive. Returns (msg_type, data).
-
-    Raises asyncio.IncompleteReadError if peer closed mid-frame, or
-    asyncio.TimeoutError if no full frame arrives within `timeout` (one
-    overall bound, not per-segment).
-    """
-    async def _inner():
-        length_bytes = await reader.readexactly(4)
-        msg_length = struct.unpack(">I", length_bytes)[0]
-        msg_type = (await reader.readexactly(1))[0]
-        payload_length = msg_length - 1
-        if payload_length > 0:
-            payload = await reader.readexactly(payload_length)
-            data = pickle.loads(payload)
-        else:
-            data = None
-        return msg_type, data
-
-    return await asyncio.wait_for(_inner(), timeout)
-
-# Plexus loads this file via spec_from_file_location + exec_module
-# without auto-registering in sys.modules. pickle.dumps validates that
-# obj.__module__ resolves via sys.modules to an importable module
-# containing the class — without this registration, pickling our payload
-# classes raises PicklingError ("attribute lookup _B066NotRegistered on
-# TestBugSuite failed"). Register an empty proxy module here so import-
-# system probes find a placeholder; the proxy is populated with the
-# final `globals()` snapshot at the BOTTOM of this file (after every
-# module-level symbol — including TestBugSuite — is defined). Anything
-# pickle resolves needs to be added to the file BEFORE the populate
-# call at file bottom; the populate-at-end pattern means new helpers
-# defined anywhere above that call are picked up automatically.
-import types as _b066_types
-_b066_proxy_mod = _b066_types.ModuleType(__name__)
-sys.modules[__name__] = _b066_proxy_mod
+SUITE_VERSION = "0.7.0"
 
 
 TARGET = "TestEventTarget"
@@ -409,92 +231,6 @@ class TestBugSuite(Plugin):
             bug_ids=("B-081",),
             **kw,
         )
-
-    # ──────────────────────────────────────────────────────────────────
-    # PR4 Stage K B-066 — instance-level test fixtures.
-    # ──────────────────────────────────────────────────────────────────
-    _b066_peer_seq: int = 0
-
-    async def _b066_make_test_peer(
-        self,
-        *,
-        system_caller: bool = False,
-        register_in_maps: bool = True,
-        add_to_trust_store: bool = True,
-        fake_port: Optional[int] = None,
-        hostname: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        # RETIRED (netcore rewrite): the B-066 raw-wire harness drives the deleted
-        # [len][type][payload] MSG_* protocol + old-NM peer maps (`register_in_maps`,
-        # trust-store pokes). Those behaviors are covered by the netcore self-tests
-        # (mTLS+SPKI, anti-spoof, framing) + the wave-2 hostile-frame harness. Raising
-        # the recorder's skip signal here neutralizes every B-066/B-018b wire cell that
-        # builds a test peer, without editing each one.
-        from _test_helpers import _SkipSignal as _SS
-        raise _SS()
-        nm = self._plexus.network  # noqa: E501  (unreachable — retained for diff clarity)
-        # Every test peer uses a UNIQUE subject CN. If
-        # two self-signed CA certs in the trust store share Subject DN,
-        # OpenSSL's chain-builder picks the FIRST match by name and
-        # validates the presented cert's signature against the WRONG
-        # public key — handshake fails for everything but the originally
-        # presented cert. Unique hostname == unique Subject DN.
-        type(self)._b066_peer_seq += 1
-        seq = type(self)._b066_peer_seq
-        if hostname is None:
-            hostname = f"b066_test_peer_{seq:03d}"
-        keys_dir = tempfile.mkdtemp(prefix="b066_test_")
-        cert_path, key_path, fp, cert_pem = generate_keypair(keys_dir, hostname)
-        spec = None
-        if fake_port is None:
-            fake_port = 19999 + seq
-        if register_in_maps:
-            spec = PeerSpec(
-                hostname=hostname,
-                ip="127.0.0.1",
-                port=fake_port,
-                cert_pem=cert_pem,
-                fingerprint=fp,
-                system_caller=system_caller,
-            )
-            nm.peers.append(spec)
-            nm.peers_by_fingerprint[fp] = spec
-            nm.peers_by_endpoint[("127.0.0.1", fake_port)] = spec
-        if add_to_trust_store:
-            nm.ssl_context.load_verify_locations(cadata=cert_pem)
-        return {
-            "keys_dir": keys_dir,
-            "cert_path": str(cert_path),
-            "key_path": str(key_path),
-            "fingerprint": fp,
-            "cert_pem": cert_pem,
-            "spec": spec,
-            "fake_port": fake_port,
-        }
-
-    def _b066_cleanup_test_peer(self, peer_info: Dict[str, Any]) -> None:
-        nm = self._plexus.network
-        spec = peer_info.get("spec")
-        if spec is not None:
-            nm.peers_by_fingerprint.pop(spec.fingerprint, None)
-            nm.peers_by_endpoint.pop((spec.ip, spec.port), None)
-            nm.peers = [p for p in nm.peers if p.fingerprint != spec.fingerprint]
-        shutil.rmtree(peer_info["keys_dir"], ignore_errors=True)
-
-    def _b066_make_client_ssl_context(
-        self, peer_info: Dict[str, Any], *, trust_parent: bool = True,
-    ) -> ssl.SSLContext:
-        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        ctx.minimum_version = ssl.TLSVersion.TLSv1_3
-        ctx.verify_mode = ssl.CERT_REQUIRED
-        ctx.check_hostname = False
-        ctx.load_cert_chain(peer_info["cert_path"], peer_info["key_path"])
-        if trust_parent:
-            nm = self._plexus.network
-            ctx.load_verify_locations(
-                cadata=Path(nm.cert_path).read_text(encoding="utf-8")
-            )
-        return ctx
 
     # ------------------------------------------------------------------
     # Helpers
@@ -978,58 +714,6 @@ class TestBugSuite(Plugin):
     async def _b_active(self, rec: CaseRecorder, kw: Dict) -> None:
         category = "active"
 
-        # ---- B-018b --------------------------------------------------
-        async def body_b_018b_uuid_spoof_denied(c):
-            # B-018b consequence guard (real 2-node; replaces the old
-            # source-grep canary execute_system_rewrite_alive, which only
-            # checked that a benign local convenience rewrite still existed
-            # in execute()'s source and could never run an actual spoof).
-            #
-            # A remote peer that spoofs author_id = a real LOCAL plugin uuid
-            # must NOT gain local-plugin access. _apply_b018b_guard Part 2
-            # (networking.py, runs before execute()) rewrites the spoofed
-            # author_id to a remote-peer sentinel, so find_endpoint
-            # (core.py is_local_plugin check) treats the call as REMOTE.
-            # TestEventTarget is remote:false, so get_state is denied
-            # ("Endpoint get_state not found"). Without the rewrite the
-            # spoofed uuid would match a local plugin, take the local-access
-            # path, and reach the endpoint — the original B-018b bypass.
-            # author="remote" (not "system") isolates the author_id rewrite
-            # from the system_caller gate covered by the denial/grant cases.
-            peer = await self._b066_make_test_peer(system_caller=False)
-            writer = None
-            try:
-                client_ctx = self._b066_make_client_ssl_context(peer)
-                reader, writer = await asyncio.wait_for(
-                    asyncio.open_connection(
-                        "127.0.0.1",
-                        self._plexus.network.port,
-                        ssl=client_ctx,
-                    ),
-                    timeout=5.0,
-                )
-                await _b066_send_msg(writer, MSG_EXECUTE, {
-                    "plugin": "TestEventTarget",
-                    "method": "get_state",
-                    "args": None,
-                    "author": "remote",
-                    "author_id": self.plugin_uuid,  # spoof a real local uuid
-                    "author_host": peer["spec"].hostname,
-                    "request_id": "b018b-uuid-spoof-denied",
-                })
-                msg_type, data = await _b066_recv_msg(reader, timeout=5.0)
-                # Denied: rewritten -> remote request -> remote:false endpoint.
-                c.expect(msg_type, MSG_ERROR)
-                c.expect("not found" in str(data).lower(), True)
-            finally:
-                if writer is not None:
-                    try:
-                        writer.close()
-                        await writer.wait_closed()
-                    except Exception:
-                        pass
-                self._b066_cleanup_test_peer(peer)
-
         # ---- B-021 ---------------------------------------------------
         async def body_b_021_request_event_fallthrough_or_fail(c):
             # B-021 (regression): two subs on the SAME topic
@@ -1301,19 +985,6 @@ class TestBugSuite(Plugin):
             c.expect("async_log_errors" in src, False)
 
         # -- run_case calls --------------------------------------------
-        # B-018b consequence guard (positive): a spoofed author_id=<local uuid>
-        # is rewritten by _apply_b018b_guard and then DENIED local access to a
-        # remote:false endpoint. Replaces the retired source-grep canary
-        # execute_system_rewrite_alive. Real 2-node coverage of the actual
-        # security property, alongside the B-066 denial/grant cases.
-        await rec.run_case(
-            "bug.B-018b.uuid_spoof_denied_local_endpoint",
-            body_b_018b_uuid_spoof_denied,
-            category=category,
-            tags=("bug_repro", "security", "b066"), bug_ids=("B-018",),
-            hard_timeout_s=10.0,
-            **kw,
-        )
         # B-021: live regression guard (was skipped pending a fixture).
         await rec.run_case(
             "bug.B-021.request_event_fallthrough_or_fail",
@@ -1419,10 +1090,30 @@ class TestBugSuite(Plugin):
 
 
     # ==================================================================
-    # _b_security — PR4 Stage K B-066 regression guards (Tests 1, 1b, 2,
-    # 2b, 3, 4, 5). Each test impersonates a peer locally inside the
-    # parent's NetworkManager and exercises one mTLS pinning / SafeUnpickler
-    # / B-018b guard code path.
+    # _b_security — netcore inbound-authorization guards: B-090 (topic
+    # streams) + B-091 (execute path, system_caller, reject replies).
+    #
+    # The PR4 Stage K "B-066" cells that used to live here were deleted
+    # 2026-07-22. They drove a hand-rolled TLS peer speaking the retired
+    # [len][type][payload] MSG_* protocol, and every one of them had been
+    # silently skipping since the netcore rewrite via a blanket
+    # `raise _SkipSignal()` in their shared fixture, so they asserted
+    # nothing on any boot. Three of their properties are re-covered by the
+    # B-091 block below; the rest were checked one by one before deletion.
+    #
+    # DROPPED WITHOUT REPLACEMENT — no gate cell asserts these today:
+    #   * pre-auth pickle RCE. Now unreachable BY CONSTRUCTION rather than
+    #     by a guard: authorize_inbound runs before deserialize_value
+    #     (transport.py:494 vs :533) and unknown-cid CHUNKs are discarded
+    #     (:602-605). Nothing asserts that ORDERING, so reversing it would
+    #     keep the gate green.
+    #   * SPKI pin enforcement. Unreachable defence-in-depth:
+    #     Membership._cadata_for builds the trust store from the same
+    #     roster resolve_pin reads, so an unpinned cert dies at CA
+    #     verification before _authenticate ever runs.
+    # Post-auth disallowed-class unpickling IS still covered, outside this
+    # file, by _wire_selftest.py:189-202 (in the gate via
+    # TestNetcoreUnitSuite). Full audit: B-091 in _private/bugs/bugs.jsonl.
     # ==================================================================
     async def _b_security(self, rec: CaseRecorder, kw: Dict) -> None:
         category = "security"
@@ -1431,155 +1122,6 @@ class TestBugSuite(Plugin):
 
 
 
-
-        async def body_b_066_execute_hostname_drift_errors(c):
-            # C-106 follow-up regression guard: an EXECUTE whose wire
-            # author_host does NOT match the cert-pinned hostname must get an
-            # anti-spoof MSG_ERROR, not a silent drop. Before the fix the
-            # EXECUTE / EXECUTE_STREAM drift gates returned with no wire
-            # response, so the caller hung on its own receive until timeout
-            # (the original failure mode of the denial case (deleted 2026-07-22; covered by _dispatch_selftest)). author is
-            # "remote" (not "system") so the drift gate is exercised in
-            # isolation, ahead of the B-018b system_caller check.
-            peer = await self._b066_make_test_peer(system_caller=False)
-            writer = None
-            try:
-                client_ctx = self._b066_make_client_ssl_context(peer)
-                reader, writer = await asyncio.wait_for(
-                    asyncio.open_connection(
-                        "127.0.0.1",
-                        self._plexus.network.port,
-                        ssl=client_ctx,
-                    ),
-                    timeout=5.0,
-                )
-                await _b066_send_msg(writer, MSG_EXECUTE, {
-                    "plugin": "TestEventTarget",
-                    "method": "get_state",
-                    "args": None,
-                    "author": "remote",
-                    "author_id": "remote",
-                    "author_host": peer["spec"].hostname + "-DRIFT",
-                    "request_id": "b066-drift-execute",
-                })
-                msg_type, data = await _b066_recv_msg(reader, timeout=5.0)
-                c.expect(msg_type, MSG_ERROR)
-                c.expect("anti-spoof" in str(data), True)
-            finally:
-                if writer is not None:
-                    try:
-                        writer.close()
-                        await writer.wait_closed()
-                    except Exception:
-                        pass
-                self._b066_cleanup_test_peer(peer)
-
-        # ---- Test 4 — system_caller=True grant + sub-tests -------
-        async def body_b_066_system_caller_privilege_grant(c):
-            peer = await self._b066_make_test_peer(system_caller=True)
-            writer = None
-            try:
-                client_ctx = self._b066_make_client_ssl_context(peer)
-                reader, writer = await asyncio.wait_for(
-                    asyncio.open_connection(
-                        "127.0.0.1",
-                        self._plexus.network.port,
-                        ssl=client_ctx,
-                    ),
-                    timeout=5.0,
-                )
-
-                async def _round_trip(*, author, author_id):
-                    await _b066_send_msg(writer, MSG_REQUEST_EVENT, {
-                        "topic": "test_b066/echo_author_id",
-                        "payload": None,
-                        "author": author,
-                        "author_id": author_id,
-                        "author_host": peer["spec"].hostname,
-                        "timestamp": 0.0,
-                        "timeout": 5.0,
-                    })
-                    mt1, d1 = await _b066_recv_msg(reader, timeout=5.0)
-                    if mt1 != MSG_STREAM_CHUNK:
-                        raise AssertionError(
-                            f"expected MSG_STREAM_CHUNK ({MSG_STREAM_CHUNK}), "
-                            f"got msg_type={mt1} data={d1!r}"
-                        )
-                    mt2, _ = await _b066_recv_msg(reader, timeout=5.0)
-                    if mt2 != MSG_END_STREAM:
-                        raise AssertionError(
-                            f"expected MSG_END_STREAM ({MSG_END_STREAM}) "
-                            f"trailing the chunk, got msg_type={mt2}"
-                        )
-                    return d1
-
-                # 4-main — preserved author + pass-through author_id
-                result = await _round_trip(
-                    author="system", author_id="non-uuid-pass-through"
-                )
-                if result != {
-                    "author": "system",
-                    "author_id": "non-uuid-pass-through",
-                }:
-                    raise AssertionError(
-                        f"Test 4-main: expected author='system' + "
-                        f"pass-through author_id, got {result!r}"
-                    )
-
-                # 4a — privileged peer + author_id matches local UUID
-                local_uuid = self.plugin_uuid
-                result_4a = await _round_trip(
-                    author="system", author_id=local_uuid
-                )
-                if not (
-                    result_4a["author"] == "system"
-                    and result_4a["author_id"].startswith("remote-peer:")
-                ):
-                    raise AssertionError(
-                        f"Test 4a (privileged + spoofed UUID): expected "
-                        f"author='system' AND author_id startswith "
-                        f"'remote-peer:', got {result_4a!r}"
-                    )
-
-                # 4b — privileged peer + author_id NOT matching anything
-                result_4b = await _round_trip(
-                    author="system",
-                    author_id="aaaa-bbbb-cccc-dddd-not-a-real-uuid",
-                )
-                if result_4b != {
-                    "author": "system",
-                    "author_id": "aaaa-bbbb-cccc-dddd-not-a-real-uuid",
-                }:
-                    raise AssertionError(
-                        f"Test 4b (privileged + non-spoofed): expected "
-                        f"author='system' + pass-through author_id, "
-                        f"got {result_4b!r}"
-                    )
-            finally:
-                if writer is not None:
-                    try:
-                        writer.close()
-                        await writer.wait_closed()
-                    except Exception:
-                        pass
-                self._b066_cleanup_test_peer(peer)
-
-
-        # -- run_case calls -------------------------------------------
-        await rec.run_case(
-            "bug.B-066.execute_hostname_drift_errors",
-            body_b_066_execute_hostname_drift_errors,
-            category=category,
-            tags=("bug_repro", "security", "b066"), bug_ids=("B-066",),
-            hard_timeout_s=10.0, **kw,
-        )
-        await rec.run_case(
-            "bug.B-066.system_caller_privilege_grant",
-            body_b_066_system_caller_privilege_grant,
-            category=category,
-            tags=("bug_repro", "security", "b066"), bug_ids=("B-066",),
-            hard_timeout_s=10.0, **kw,
-        )
 
         # ==============================================================
         # B-090 — inbound request_event_stream must resolve access as the
@@ -1598,6 +1140,9 @@ class TestBugSuite(Plugin):
         from plexus.netcore.manager import NetworkManager
         from plexus.netcore.types import CallerCtx, PeerIdentity
 
+        # NOTE: these three are ALSO used by the B-091 cells further down.
+        # Deleting this block breaks them (loudly, with NameError - never a
+        # silent green, since a cell body raising is recorded as an error).
         b090_reg = NetworkManager._RematchRegistry(self._plexus)
         b090_identity = PeerIdentity("b090-peer", False)
 
@@ -1614,7 +1159,9 @@ class TestBugSuite(Plugin):
             """
             target = self._plexus.plugins.get("TestEventTarget")
             if target is None:
-                c.skip("TestEventTarget not loaded")
+                # NOT a skip: the fixture is enabled in test_config.yml, so a
+                # missing one is a broken suite, not an absent capability.
+                raise AssertionError("TestEventTarget not loaded - fixture missing")
             topic = f"b090/{target_access_name}"
             sid = await self._plexus.subscribe_event(
                 topic, self.plugin_name, self.plugin_uuid,
@@ -1666,7 +1213,7 @@ class TestBugSuite(Plugin):
         async def body_b_090_private_reachable_by_owner(c):
             target = self._plexus.plugins.get("TestEventTarget")
             if target is None:
-                c.skip("TestEventTarget not loaded")
+                raise AssertionError("TestEventTarget not loaded - fixture missing")
             topic = "b090/priv_reachable"
             sid = await self._plexus.subscribe_event(
                 topic, "TestEventTarget", target.plugin_uuid,
@@ -1713,9 +1260,301 @@ class TestBugSuite(Plugin):
                 hard_timeout_s=15.0, **kw,
             )
 
+        # ==============================================================
+        # B-091 - the three security properties whose only coverage in the
+        # GATE was a set of skip-gated B-066 cells, plus a fourth (4) that the
+        # deleted set never covered at all.
+        #
+        # Each old cell drove a hand-rolled TLS peer speaking the PRE-netcore
+        # wire protocol (MSG_EXECUTE et al), which no longer exists. These
+        # replacements assert the same properties against the seams that
+        # decide them today: two over a real two-node mTLS pair built from the
+        # netcore self-test harness, four against the live core's re-match
+        # registry.
+        #
+        # 1. system_caller is granted from THIS node's authenticated peer
+        #    record, never from the wire. The record-level storage is covered
+        #    (_membership_selftest.py:175-179) and the DENY direction is
+        #    covered (_dispatch_selftest.py:280-285, and e2e at :430). What no
+        #    test asserted is that a GRANTED peer's claim SURVIVES end to end
+        #    to the callee registry, because every existing test builds
+        #    system_caller=False. An implementation that downgraded EVERY
+        #    caller passed the entire suite.
+        # 2. A remote peer that spoofs author_id = a real LOCAL plugin uuid
+        #    must not gain local-plugin access (B-018b). The old mechanism
+        #    (_apply_b018b_guard) was deleted in the netcore rewrite, so the
+        #    property now rests entirely on _match_execute's pre-gate: the
+        #    spoofed author_id is forwarded verbatim into core.execute
+        #    (manager.py:611), and find_endpoint's local branch hands over a
+        #    non-accessible endpoint to a requester_id that equals the owning
+        #    plugin's uuid (core.py:5247-5253). The pre-gate is what stops the
+        #    call from ever getting there; execute_private_endpoint_denied
+        #    asserts exactly that, with a control proving find_endpoint would
+        #    otherwise hand the endpoint over.
+        # 3. A frame rejected at authorize time must reach the peer as ERROR
+        #    rather than being dropped. _dispatch_selftest proves the reject
+        #    DECISION, and _transport_selftest's FakeDispatch accepts
+        #    everything (_transport_selftest.py:121-122), so the pre-cid-open
+        #    reply branch at transport.py:495-499 is entered by no GATE test.
+        #    networking_multinode/test_hostile.py:183 (TP72) does drive it,
+        #    but it is opt-in behind PLEXUS_PAIR_TEST and asserts only the
+        #    observability event, never the reply.
+        #
+        # 4. (NOT one of the deleted properties, and a DIFFERENT wire field
+        #    from 2: the selector's plugin_uuid rather than the caller's
+        #    author_id.) Instance exactness, manager.py:594. _match_execute is
+        #    NOT untested - TestNetPairUnitSuite's A1 cells exercise it
+        #    positively - but that fake uses an empty plugin_uuid and an
+        #    uuid-less selector, so the uuid branch is never entered there,
+        #    and _dispatch_selftest's e2e checks it only against its own fake
+        #    registry's hardcoded uuid, never _match_execute.
+        # ==============================================================
+        from plexus.netcore.dispatch import NoEndpointError
+        from plexus.netcore.types import ExecuteSelector
+        from plexus.exceptions import NetworkRequestException
+        async def _b091_pair(a_is_system_caller: bool):
+            """Bring up a real mTLS pair a<->b. b's roster entry for a carries
+            the system_caller grant under test. Returns (na, nb, cleanup)."""
+            # The two-node harness is the netcore self-tests' own. Reusing it
+            # keeps one definition of "a real mTLS node pair" rather than a
+            # second copy here that could drift from the transport it stands
+            # in for. Note the coupling that buys: the two e2e cells assert on
+            # the "sys"/"author"/"echoed" keys owned by that module's
+            # EndToEndRegistry fake.
+            #
+            # Imported HERE, not at method scope: _dispatch_selftest calls
+            # itself a throwaway dev aid and lives under the protected plexus/
+            # package. An ImportError at method scope would escape _b_security
+            # rather than a case body, and TestRunner would discard every
+            # already-recorded TestBugSuite case to report one broken import.
+            # Inside the helper, a vanished harness fails exactly the two
+            # cells that need it.
+            from plexus.netcore import _dispatch_selftest as ds
 
-# Populate the sys.modules proxy with the final module globals — see the
-# header comment near `_b066_proxy_mod = ...` for the rationale. Placing
-# this at the bottom of the file means every module-level symbol defined
-# above is visible to pickle's `find_class` resolution.
-_b066_proxy_mod.__dict__.update(globals())
+            tmp = tempfile.mkdtemp(prefix="b091_")
+            nodes = []
+
+            async def cleanup():
+                try:
+                    # BaseException, not Exception: on the hard-timeout path
+                    # the body is cancelled, and a CancelledError escaping the
+                    # first stop would otherwise strand every later one. Bound
+                    # methods, not pre-built coroutines, so nothing is left
+                    # un-awaited. 2s each: this runs INSIDE the case's
+                    # hard_timeout_s budget, which asyncio.wait_for does not
+                    # bound (it cancels the body then awaits it to completion).
+                    for n in nodes:
+                        for stop in (n.mem.stop, n.transport.stop):
+                            try:
+                                await asyncio.wait_for(stop(), 2)
+                            except BaseException as exc:
+                                # a genuinely failed stop strands a listener
+                                # for the rest of the boot, and the only other
+                                # thing that would notice is the whole-run
+                                # socket census. Make it visible.
+                                self._logger.warning(
+                                    "B-091 teardown: %s failed: %r", stop, exc)
+                finally:
+                    shutil.rmtree(tmp, ignore_errors=True)
+
+            try:
+                # inside the try: _make_node starts a listener before it
+                # returns, so a failure in the SECOND call must still tear
+                # down the first. This suite runs in-process with the live
+                # Plexus, where a stranded listener outlives the whole boot.
+                na = await ds._make_node(tmp, "a")
+                nodes.append(na)
+                nb = await ds._make_node(tmp, "b")
+                nodes.append(nb)
+                na.mem.add_peer(PeerSpec("b", "127.0.0.1", nb.port, nb.pem, nb.fp))
+                # THE grant under test: it lives in the CALLEE's roster entry
+                # for the caller, which is the whole point of the property.
+                nb.mem.add_peer(PeerSpec("a", "127.0.0.1", na.port, na.pem, na.fp,
+                                            system_caller=a_is_system_caller))
+                await na.mem.start()
+                await nb.mem.start()
+                if not await ds._wait(lambda: na.mem.reachable("b"), timeout=8):
+                    raise AssertionError("link a->b did not come up")
+            except BaseException:
+                await cleanup()
+                raise
+            return na, nb, cleanup
+
+        # ---- 1. GRANT: an authenticated peer whose record grants
+        # system_caller keeps its author="system" claim end to end.
+        async def body_b_091_system_caller_grant_e2e(c):
+            na, _nb, cleanup = await _b091_pair(True)
+            try:
+                r = await na.dispatch.execute_remote(
+                    "b", ExecuteSelector("plug", "echo"), {"x": 1},
+                    CallerCtx("system", "aid", "a", "r1"), 10.0, deadline=10.0,
+                )
+                # The exact positive counterpart of _dispatch_selftest.py:430,
+                # which asserts sys=False / author="aid" for an UNGRANTED peer.
+                # Both directions are needed: without this cell an impl that
+                # downgrades every caller passes; without that one an impl that
+                # grants every caller passes.
+                c.expect(r["sys"], True)
+                c.expect(r["author"], "system")
+            finally:
+                await cleanup()
+
+        # ---- 3. A frame rejected at authorize time must come back as an
+        # ERROR the caller can observe, and must not tear down the link.
+        async def body_b_091_hostname_drift_error_reply_e2e(c):
+            na, _nb, cleanup = await _b091_pair(False)
+            try:
+                loop = asyncio.get_running_loop()
+                # author_host disagrees with the TLS-authenticated hostname.
+                # The real Dispatch.authorize_inbound rejects (dispatch.py:353-360)
+                # BEFORE the cid is opened, so the reply comes from the
+                # transport.py:495-499 branch no gate test enters.
+                t0 = loop.time()
+                raised = None
+                try:
+                    await na.dispatch.execute_remote(
+                        "b", ExecuteSelector("plug", "echo"), {"x": 1},
+                        CallerCtx("peer", "aid", "drift-host", "r1"), 10.0,
+                        deadline=10.0,
+                    )
+                except Exception as exc:
+                    raised = exc
+                elapsed = loop.time() - t0
+                # recorded on the case so a future flake is diagnosable from
+                # test_report.json without re-running: expect() only keeps the
+                # last actual/expected pair, which would lose the timing.
+                c.set_marker("reject_reply_elapsed=%.3fs" % elapsed)
+                c.expect(isinstance(raised, NetworkRequestException), True)
+                # THE discriminator. `deadline` is a RELATIVE duration
+                # (transport.py:996-1000), so a silently DROPPED reject also
+                # ends in NetworkRequestException -- via Timeout, mapped at
+                # dispatch.py:170-172 to the very same type -- just 10s later.
+                # Without this bound the cell passes on a silent drop, which is
+                # precisely the regression it exists to catch.
+                c.expect(elapsed < 2.0, True)
+
+                # The link must survive the rejection: an honest call after it
+                # still round-trips on the SAME link.
+                ok = await na.dispatch.execute_remote(
+                    "b", ExecuteSelector("plug", "echo"), {"x": 2},
+                    CallerCtx("peer", "aid", "a", "r2"), 10.0, deadline=10.0,
+                )
+                c.expect(ok["echoed"], {"x": 2})
+            finally:
+                await cleanup()
+
+        # ---- 2. execute-path denial, against the LIVE core. These reuse the
+        # B-090 registry/caller helpers above: same live core, same synthetic
+        # peer, and a second copy would only drift.
+
+        # A plugin that is not remote-reachable at all stays unreachable, so
+        # the pre-gate's remote arm is load-bearing on its own.
+        async def body_b_091_execute_nonremote_plugin_denied(c):
+            target = self._plexus.plugins.get("TestEventTarget")
+            if target is None:
+                # NOT a skip: this fixture is enabled in test_config.yml, so a
+                # missing one is a broken suite, not an absent capability.
+                raise AssertionError("TestEventTarget not loaded - fixture missing")
+            sel = ExecuteSelector("TestEventTarget", "get_state")
+            # The endpoint must EXIST, or _match_execute returns None from the
+            # `ep is None` arm (manager.py:590-592) and this cell passes while
+            # asserting nothing about the remote arm.
+            c.expect("get_state" in target.endpoints, True)
+            # Denied by manager.py:596 (TestEventTarget is remote:false).
+            # NB the caller identity is deliberately NOT the interesting part
+            # here -- _match_execute never reads caller.author_id, so this cell
+            # pins the remote arm and nothing more. The author_id property is
+            # the next cell's job.
+            c.expect_exception(NoEndpointError)
+            await b090_reg.execute(sel, {}, b090_identity,
+                                   _b090_caller("some-remote-caller"))
+
+        # THE B-018b replacement: a remote peer claiming to BE the target
+        # plugin must not reach that plugin's private endpoint.
+        async def body_b_091_execute_private_endpoint_denied(c):
+            target = self._plexus.plugins.get("TestExecuteTarget")
+            if target is None:
+                raise AssertionError("TestExecuteTarget not loaded - fixture missing")
+            sel = ExecuteSelector("TestExecuteTarget", "ea_private",
+                                  target.plugin_uuid)
+            # Self-check, matching the sibling denial cells: if the plugin or
+            # the endpoint ever flipped to remote:false, _match_execute would
+            # deny at :596 instead of :598 and the accessible-arm assertion
+            # below would silently evaporate.
+            c.expect(bool(getattr(target, "remote", False)), True)
+            c.expect(target.endpoints["ea_private"].get("remote"), True)
+            # CONTROL first: with the spoofed requester_id, find_endpoint
+            # itself WOULD hand over ea_private, because the spoof flips the
+            # request off the remote branch (core.py:5237) onto the local one,
+            # where the self-call escape at core.py:5249 sees
+            # plugin.plugin_uuid == requester_id. So the denial below is not
+            # over-determined: _match_execute's accessible arm is the ONLY
+            # thing standing in front of this endpoint.
+            plug, _ep, _node = await self._plexus.find_endpoint(
+                "ea_private", hosts="local", plugin_uuid=target.plugin_uuid,
+                requester_id=target.plugin_uuid, target_plugin="TestExecuteTarget")
+            c.expect(plug is target, True)
+
+            # THE ATTACK: same spoofed author_id, through the real inbound
+            # path. Denied by manager.py:598 before core.execute is reached.
+            c.expect_exception(NoEndpointError)
+            await b090_reg.execute(sel, {}, b090_identity,
+                                   _b090_caller(target.plugin_uuid))
+
+        # Instance exactness (F#14), a DIFFERENT wire field: the selector's
+        # plugin_uuid rather than the caller's author_id. Guards against a
+        # stale uuid (e.g. one cached across a hot reload) reaching whatever
+        # instance now answers to that name.
+        async def body_b_091_execute_uuid_spoof_denied(c):
+            target = self._plexus.plugins.get("TestExecuteTarget")
+            if target is None:
+                raise AssertionError("TestExecuteTarget not loaded - fixture missing")
+            sel = ExecuteSelector("TestExecuteTarget", "ea_add",
+                                  "not-the-live-uuid-0000")
+            # Without this, a renamed/removed ea_add (or a target flipped to
+            # remote:false) would deny from a DIFFERENT arm and leave the uuid
+            # branch untested while the cell stayed green.
+            c.expect("ea_add" in target.endpoints, True)
+            c.expect_exception(NoEndpointError)
+            await b090_reg.execute(sel, {}, b090_identity,
+                                   _b090_caller("some-remote-caller"))
+
+        # Positive control. Without it the three denial cells above are all
+        # satisfied by a _match_execute that returns None unconditionally.
+        async def body_b_091_execute_honest_call_allowed(c):
+            target = self._plexus.plugins.get("TestExecuteTarget")
+            if target is None:
+                raise AssertionError("TestExecuteTarget not loaded - fixture missing")
+            sel = ExecuteSelector("TestExecuteTarget", "ea_add",
+                                  target.plugin_uuid)
+            result = await b090_reg.execute(
+                sel, {"a": 2, "b": 3}, b090_identity,
+                _b090_caller("some-remote-caller"))
+            c.expect(result, 5)
+
+        for cid, body, timeout in (
+            ("bug.B-091.system_caller_grant_e2e",
+             body_b_091_system_caller_grant_e2e, 30.0),
+            # 45s, not 30s: under a silent-drop regression this cell spends
+            # ~10s in the dropped-reject timeout plus ~10s in the honest call,
+            # and must still reach its elapsed-bound ASSERTION. A 30s budget
+            # would report the far less diagnostic "exceeded hard timeout".
+            ("bug.B-091.hostname_drift_error_reply_e2e",
+             body_b_091_hostname_drift_error_reply_e2e, 45.0),
+            ("bug.B-091.execute_nonremote_plugin_denied",
+             body_b_091_execute_nonremote_plugin_denied, 15.0),
+            ("bug.B-091.execute_private_endpoint_denied",
+             body_b_091_execute_private_endpoint_denied, 15.0),
+            ("bug.B-091.execute_uuid_spoof_denied",
+             body_b_091_execute_uuid_spoof_denied, 15.0),
+            ("bug.B-091.execute_honest_call_allowed",
+             body_b_091_execute_honest_call_allowed, 15.0),
+        ):
+            await rec.run_case(
+                cid, body, category=category,
+                tags=("regression_guard", "security", "b091"), bug_ids=("B-091",),
+                hard_timeout_s=timeout, **kw,
+            )
+
+
+

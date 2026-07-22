@@ -717,9 +717,14 @@ class TestRemoteSuite(Plugin):
 
 
         # B-018 spoof cases retired 2026-06-14: the spoofer harness was removed
-        # in PR3 Stage D so these were permanent skips. B-018b is now covered
-        # end-to-end by the B-066 suite (system_caller denial/grant) plus
-        # bug.B-018b.uuid_spoof_denied_local_endpoint in TestBugSuite.
+        # in PR3 Stage D so these were permanent skips.
+        #
+        # Citation updated 2026-07-22: this used to point at the B-066 suite
+        # and bug.B-018b.uuid_spoof_denied_local_endpoint, both of which have
+        # since been deleted (they were silently skipping). B-018b is now
+        # covered by bug.B-091.execute_private_endpoint_denied (the author_id
+        # spoof proper), .execute_nonremote_plugin_denied and
+        # .execute_uuid_spoof_denied in TestBugSuite.
 
         async def body_b019_count_per_node(c):
             # TP-04 (B-019): publish_event's scheduled-count must be per matching
