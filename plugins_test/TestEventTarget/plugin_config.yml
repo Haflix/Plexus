@@ -1,5 +1,5 @@
 description: PR3 Stage E target — passive subscriber for cross-plugin event tests
-version: "0.2.0"
+version: "0.3.0"
 remote: false
 arguments:
 events:
@@ -112,6 +112,20 @@ endpoints:
     description: Async generator handler for request_event_stream
     arguments:
       - name: event
+  priv_stream:
+    internal_name: priv_stream
+    remote: false
+    accessible_by_other_plugins: false
+    description: B-090 fixture — PRIVATE async generator (must be unreachable from a remote peer)
+    arguments:
+      - name: value
+  open_stream:
+    internal_name: open_stream
+    remote: false
+    accessible_by_other_plugins: true
+    description: B-090 control — accessible async generator on a non-remote plugin
+    arguments:
+      - name: value
   handle_hostname_topic:
     internal_name: handle_hostname_topic
     remote: false

@@ -1,7 +1,7 @@
 """TestBugSuite — PR3 Stage F bughunt repro suite + PR4 Stage K B-066 regressions.
 
-One case per open `bugtracker.md` entry plus 7 PR4 Stage K B-066
-regression cases (Test 1, 1b, 2, 2b, 3, 4, 5). Verdicts are recorded by
+One case per open `bugtracker.md` entry plus the surviving PR4 Stage K B-066
+regression cases (see B-091 for the coverage gap they represent). Verdicts are recorded by
 the parent post-run (annotated on bugtracker.md). NO bug fixes here —
 only repros that prove which bugs are real vs fixed-by-construction.
 
@@ -9,8 +9,6 @@ Categories (one method per):
   _b_legacy_removed     — API surface deleted in Stage D — assert .gone
   _b_addressed_in_pr3   — PR3 added behavior that should fix the bug
   _b_active             — still-broken — repro and let recorder mark
-  _b_deferred           — test infeasible without fixture work — skip
-  _b_already_covered    — repro lives in another suite — skip-and-cite
   _b_security           — PR4 Stage K B-066 regression guards
 
 See PLAN.md (alongside this file in the worktree) for the per-bug spec
@@ -31,6 +29,7 @@ import shutil  # noqa: E402
 import ssl  # noqa: E402
 import struct  # noqa: E402
 import tempfile  # noqa: E402
+import uuid  # noqa: E402
 from typing import Any, Dict, List, Optional  # noqa: E402
 
 from plexus.utils import Plugin  # noqa: E402
@@ -57,7 +56,7 @@ from plexus.serialization import generate_keypair, Serializable  # noqa: E402
 from _test_helpers import CaseRecorder  # noqa: E402
 
 
-SUITE_VERSION = "0.4.3"
+SUITE_VERSION = "0.6.0"
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -283,8 +282,6 @@ class TestBugSuite(Plugin):
         await self._b_legacy_removed(rec, kw)
         await self._b_addressed_in_pr3(rec, kw)
         await self._b_active(rec, kw)
-        await self._b_deferred(rec, kw)
-        await self._b_already_covered(rec, kw)
         await self._b_security(rec, kw)
         await self._b_fixed_audit(rec, kw)
         return rec.to_dict()
@@ -1419,351 +1416,7 @@ class TestBugSuite(Plugin):
         except Exception:
             pass
 
-    # ==================================================================
-    # _b_deferred — Recipe E (skip with STAGE_F_FIXME)
-    # ==================================================================
-    async def _b_deferred(self, rec: CaseRecorder, kw: Dict) -> None:
-        category = "deferred"
 
-        async def body_b_026_deferred(c):
-            c.skip(
-                "STAGE_F_FIXME: B-026 references request_topic_remote "
-                "(removed in Stage D) AND requires a writer mock that "
-                "fails on _send_end_stream after a successful chunk "
-                "drain. Practical fix is the API removal itself; no "
-                "current fixture supports the writer-failure case."
-            )
-
-        async def body_b_034_deferred(c):
-            c.skip(
-                "STAGE_F_FIXME: hot-reload subscription window race. "
-                "Stage B lifecycle wrappers shrunk the gap but the "
-                "race still exists. Bugtracker pre-marks this as "
-                "TIMING-RACE (5 ms sleep doesn't reliably hit). "
-                "TestLifecycleSuite already carries B-037 cycle-race "
-                "coverage; defer here."
-            )
-
-        async def body_b_049_deferred(c):
-            c.skip(
-                "STAGE_F_FIXME: enable_plugin no on_enable timeout. "
-                "Repro needs a controlled-startup harness — calling "
-                "enable_plugin from inside a running suite would "
-                "deadlock on plugin_lock. Same harness pattern as "
-                "B-007 in TestLifecycleSuite."
-            )
-
-        async def body_b_050_deferred(c):
-            c.skip(
-                "STAGE_F_FIXME: close() try/finally masking. Needs a "
-                "fixture with on_disable raising AND _unregister "
-                "mocked to raise; no current fixture supports this."
-            )
-
-        async def body_b_055_deferred(c):
-            c.skip(
-                "STAGE_F_FIXME: aclose().result() no timeout. Needs "
-                "worker thread plus early-break orchestration; not "
-                "covered by current fixtures."
-            )
-
-        async def body_b_057_deferred(c):
-            c.skip(
-                "STAGE_F_FIXME: C6 placeholder-drift INFO log — "
-                "bugtracker explicitly marks this deferred polish."
-            )
-
-        async def body_b_058_deferred(c):
-            c.skip(
-                "STAGE_F_FIXME: _warn_redundant_host_combos not called "
-                "for sub filters. Log-capture-based test; no shared "
-                "log-capture fixture in repo (logging.handlers."
-                "MemoryHandler is brittle)."
-            )
-
-        async def body_b_060_deferred(c):
-            c.skip(
-                "STAGE_F_FIXME: no DEBUG/ERROR log when fan-out "
-                "target_plugin missing. Log-capture-based test; same "
-                "fixture-gap as B-058."
-            )
-
-        async def body_b_061_deferred(c):
-            c.skip(
-                "STAGE_F_FIXME: no DEBUG log when find_endpoint denies "
-                "access. Log-capture-based test; same fixture-gap as "
-                "B-058."
-            )
-
-        async def body_b_062_deferred(c):
-            c.skip(
-                "STAGE_F_FIXME: no ERROR log when sync handler raises "
-                "during fan-out. Log-capture-based test; same fixture-"
-                "gap as B-058."
-            )
-
-        async def body_b_063_deferred(c):
-            c.skip(
-                "STAGE_F_FIXME: unknown override sub-key DEBUG vs "
-                "WARNING — touches PR2 apply_overrides (out of PR3 "
-                "scope)."
-            )
-
-        await rec.run_case(
-            "bug.B-026.deferred_writer_mock", body_b_026_deferred,
-            category=category,
-            tags=("bug_repro", "deferred"), bug_ids=("B-026",), **kw,
-        )
-        await rec.run_case(
-            "bug.B-034.deferred_reload_window_race", body_b_034_deferred,
-            category=category,
-            tags=("bug_repro", "deferred"), bug_ids=("B-034",), **kw,
-        )
-        await rec.run_case(
-            "bug.B-049.deferred_enable_no_timeout", body_b_049_deferred,
-            category=category,
-            tags=("bug_repro", "deferred"), bug_ids=("B-049",), **kw,
-        )
-        await rec.run_case(
-            "bug.B-050.deferred_close_try_finally_mask", body_b_050_deferred,
-            category=category,
-            tags=("bug_repro", "deferred"), bug_ids=("B-050",), **kw,
-        )
-        await rec.run_case(
-            "bug.B-055.deferred_aclose_no_timeout", body_b_055_deferred,
-            category=category,
-            tags=("bug_repro", "deferred"), bug_ids=("B-055",), **kw,
-        )
-        await rec.run_case(
-            "bug.B-057.deferred_placeholder_drift_info_log",
-            body_b_057_deferred,
-            category=category,
-            tags=("bug_repro", "deferred"), bug_ids=("B-057",), **kw,
-        )
-        await rec.run_case(
-            "bug.B-058.deferred_redundant_host_combos_log",
-            body_b_058_deferred,
-            category=category,
-            tags=("bug_repro", "deferred"), bug_ids=("B-058",), **kw,
-        )
-        await rec.run_case(
-            "bug.B-060.deferred_fanout_target_missing_log",
-            body_b_060_deferred,
-            category=category,
-            tags=("bug_repro", "deferred"), bug_ids=("B-060",), **kw,
-        )
-        await rec.run_case(
-            "bug.B-061.deferred_find_endpoint_denies_log",
-            body_b_061_deferred,
-            category=category,
-            tags=("bug_repro", "deferred"), bug_ids=("B-061",), **kw,
-        )
-        await rec.run_case(
-            "bug.B-062.deferred_sync_handler_raises_log",
-            body_b_062_deferred,
-            category=category,
-            tags=("bug_repro", "deferred"), bug_ids=("B-062",), **kw,
-        )
-        await rec.run_case(
-            "bug.B-063.deferred_unknown_override_subkey_log",
-            body_b_063_deferred,
-            category=category,
-            tags=("bug_repro", "deferred"), bug_ids=("B-063",), **kw,
-        )
-
-    # ==================================================================
-    # _b_already_covered — Recipe D (skip-and-cite)
-    # ==================================================================
-    async def _b_already_covered(self, rec: CaseRecorder, kw: Dict) -> None:
-        category = "already_covered"
-
-        async def body_b_002_covered(c):
-            c.skip(
-                "covered by TestStreamSuite (bug_ids=('B-002',)); "
-                "verdict tracks there"
-            )
-
-        async def body_b_004_covered(c):
-            c.skip(
-                "covered by TestLifecycleSuite (bug_ids=('B-004',)); "
-                "verdict tracks there"
-            )
-
-        async def body_b_005_covered(c):
-            c.skip(
-                "covered by TestLifecycleSuite (bug_ids=('B-005',)); "
-                "verdict tracks there"
-            )
-
-        # B-073: B-006 skip-stub deleted. The actual
-        # B-006 case in TestLifecycleSuite was deleted (the B-073 fix
-        # killed running_loop, removing the failure mode the case
-        # guarded against). No upstream case to defer to.
-
-        async def body_b_007_covered(c):
-            c.skip(
-                "covered by TestLifecycleSuite (bug_ids=('B-007',)) "
-                "as DEFERRED — verdict tracks there"
-            )
-
-        async def body_b_008_covered(c):
-            c.skip(
-                "covered by TestLifecycleSuite (bug_ids=('B-008',)); "
-                "verdict tracks there"
-            )
-
-        async def body_b_009_covered(c):
-            c.skip(
-                "covered by TestLifecycleSuite (bug_ids=('B-009',)); "
-                "verdict tracks there"
-            )
-
-        async def body_b_010_covered(c):
-            c.skip(
-                "covered by TestLifecycleSuite (bug_ids=('B-010',)); "
-                "verdict tracks there"
-            )
-
-        async def body_b_013_covered(c):
-            c.skip(
-                "covered by TestExecuteSuite (bug_ids=('B-013',)); "
-                "verdict tracks there"
-            )
-
-        async def body_b_015_covered(c):
-            c.skip(
-                "covered by TestExecuteSuite (bug_ids=('B-015',)); "
-                "verdict tracks there"
-            )
-
-        async def body_b_016_covered(c):
-            c.skip(
-                "covered by TestLifecycleSuite (bug_ids=('B-016',)); "
-                "verdict tracks there"
-            )
-
-        async def body_b_017_covered(c):
-            c.skip(
-                "covered by TestExecuteSuite (bug_ids=('B-017',)); "
-                "verdict tracks there"
-            )
-
-        async def body_b_037_covered(c):
-            c.skip(
-                "covered by TestLifecycleSuite (bug_ids=('B-037',)); "
-                "verdict tracks there"
-            )
-
-        async def body_b_040_covered(c):
-            c.skip(
-                "covered by TestEventSuite (bug_ids=('B-040',)); "
-                "verdict tracks there"
-            )
-
-        async def body_b_041_covered(c):
-            c.skip(
-                "covered by TestStreamSuite (bug_ids=('B-041',)); "
-                "verdict tracks there"
-            )
-
-        async def body_b_043_covered(c):
-            c.skip(
-                "covered by TestLifecycleSuite (bug_ids=('B-043',)); "
-                "verdict tracks there"
-            )
-
-        await rec.run_case(
-            "bug.B-002.covered_by_test_stream_suite", body_b_002_covered,
-            category=category,
-            tags=("bug_repro", "covered_elsewhere"), bug_ids=("B-002",),
-            **kw,
-        )
-        await rec.run_case(
-            "bug.B-004.covered_by_test_lifecycle_suite", body_b_004_covered,
-            category=category,
-            tags=("bug_repro", "covered_elsewhere"), bug_ids=("B-004",),
-            **kw,
-        )
-        await rec.run_case(
-            "bug.B-005.covered_by_test_lifecycle_suite", body_b_005_covered,
-            category=category,
-            tags=("bug_repro", "covered_elsewhere"), bug_ids=("B-005",),
-            **kw,
-        )
-        # B-073: bug.B-006.covered_by_test_lifecycle_suite
-        # registration removed alongside the body stub above.
-        await rec.run_case(
-            "bug.B-007.covered_by_test_lifecycle_suite", body_b_007_covered,
-            category=category,
-            tags=("bug_repro", "covered_elsewhere"), bug_ids=("B-007",),
-            **kw,
-        )
-        await rec.run_case(
-            "bug.B-008.covered_by_test_lifecycle_suite", body_b_008_covered,
-            category=category,
-            tags=("bug_repro", "covered_elsewhere"), bug_ids=("B-008",),
-            **kw,
-        )
-        await rec.run_case(
-            "bug.B-009.covered_by_test_lifecycle_suite", body_b_009_covered,
-            category=category,
-            tags=("bug_repro", "covered_elsewhere"), bug_ids=("B-009",),
-            **kw,
-        )
-        await rec.run_case(
-            "bug.B-010.covered_by_test_lifecycle_suite", body_b_010_covered,
-            category=category,
-            tags=("bug_repro", "covered_elsewhere"), bug_ids=("B-010",),
-            **kw,
-        )
-        await rec.run_case(
-            "bug.B-013.covered_by_test_execute_suite", body_b_013_covered,
-            category=category,
-            tags=("bug_repro", "covered_elsewhere"), bug_ids=("B-013",),
-            **kw,
-        )
-        await rec.run_case(
-            "bug.B-015.covered_by_test_execute_suite", body_b_015_covered,
-            category=category,
-            tags=("bug_repro", "covered_elsewhere"), bug_ids=("B-015",),
-            **kw,
-        )
-        await rec.run_case(
-            "bug.B-016.covered_by_test_lifecycle_suite", body_b_016_covered,
-            category=category,
-            tags=("bug_repro", "covered_elsewhere"), bug_ids=("B-016",),
-            **kw,
-        )
-        await rec.run_case(
-            "bug.B-017.covered_by_test_execute_suite", body_b_017_covered,
-            category=category,
-            tags=("bug_repro", "covered_elsewhere"), bug_ids=("B-017",),
-            **kw,
-        )
-        await rec.run_case(
-            "bug.B-037.covered_by_test_lifecycle_suite", body_b_037_covered,
-            category=category,
-            tags=("bug_repro", "covered_elsewhere"), bug_ids=("B-037",),
-            **kw,
-        )
-        await rec.run_case(
-            "bug.B-040.covered_by_test_event_suite", body_b_040_covered,
-            category=category,
-            tags=("bug_repro", "covered_elsewhere"), bug_ids=("B-040",),
-            **kw,
-        )
-        await rec.run_case(
-            "bug.B-041.covered_by_test_stream_suite", body_b_041_covered,
-            category=category,
-            tags=("bug_repro", "covered_elsewhere"), bug_ids=("B-041",),
-            **kw,
-        )
-        await rec.run_case(
-            "bug.B-043.covered_by_test_lifecycle_suite", body_b_043_covered,
-            category=category,
-            tags=("bug_repro", "covered_elsewhere"), bug_ids=("B-043",),
-            **kw,
-        )
 
     # ==================================================================
     # _b_security — PR4 Stage K B-066 regression guards (Tests 1, 1b, 2,
@@ -1774,241 +1427,10 @@ class TestBugSuite(Plugin):
     async def _b_security(self, rec: CaseRecorder, kw: Dict) -> None:
         category = "security"
 
-        # ---- Test 1 — pre-auth pickle RCE (handshake-rejected) -----
-        async def body_b_066_pre_auth_pickle_rce(c):
-            # The malicious peer's cert is NOT in the parent's trust store
-            # (add_to_trust_store=False) and not pinned (register_in_maps=
-            # False). The server rejects at TLS handshake. In TLS 1.3 the
-            # client's asyncio.open_connection may NOT raise — the alert
-            # arrives only when reading. Either path is acceptable; the
-            # security property is that the malicious payload's __reduce__
-            # never invokes the sentinel callable on the receiver.
-            sentinel_dir = tempfile.mkdtemp(prefix="b066_test1_sentinel_")
-            peer = await self._b066_make_test_peer(
-                register_in_maps=False, add_to_trust_store=False
-            )
-            writer = None
-            try:
-                client_ctx = self._b066_make_client_ssl_context(peer)
-                try:
-                    reader, writer = await asyncio.wait_for(
-                        asyncio.open_connection(
-                            "127.0.0.1",
-                            self._plexus.network.port,
-                            ssl=client_ctx,
-                        ),
-                        timeout=5.0,
-                    )
-                except (OSError, asyncio.TimeoutError):
-                    # TLS handshake was rejected at the asyncio layer.
-                    # The malicious payload was never on the wire.
-                    pass
-                else:
-                    # asyncio returned a transport but the server-side
-                    # rejected mid-handshake — exercise the worst case
-                    # by attempting to ship the malicious pickle anyway,
-                    # and verify the receiver did NOT execute it.
-                    try:
-                        await _b066_send_msg(writer, MSG_EXECUTE, {
-                            "plugin": "TestEventTarget",
-                            "method": "echo_author_id",
-                            "args": (_B066PrePwnPickle(sentinel_dir),),
-                            "author": "remote",
-                            "author_id": "remote",
-                            "author_host": "b066_test1_peer",
-                        })
-                    except Exception:
-                        pass
-                    try:
-                        await asyncio.wait_for(reader.read(1), timeout=2.0)
-                    except Exception:
-                        pass
-                # Definitive security assertion: sentinel never fired.
-                c.expect(os.listdir(sentinel_dir), [])
-            finally:
-                if writer is not None:
-                    try:
-                        writer.close()
-                        await writer.wait_closed()
-                    except Exception:
-                        pass
-                shutil.rmtree(sentinel_dir, ignore_errors=True)
-                self._b066_cleanup_test_peer(peer)
 
-        # ---- Test 1b — handshake passes, pin check fails -----------
-        async def body_b_066_handshake_passes_pin_fails(c):
-            peer = await self._b066_make_test_peer(
-                register_in_maps=False, add_to_trust_store=True
-            )
-            cap = _B066LogCapture("networking", logging.DEBUG)
-            cap.attach()
-            writer = None
-            try:
-                client_ctx = self._b066_make_client_ssl_context(peer)
-                reader, writer = await asyncio.wait_for(
-                    asyncio.open_connection(
-                        "127.0.0.1",
-                        self._plexus.network.port,
-                        ssl=client_ctx,
-                    ),
-                    timeout=5.0,
-                )
-                got = await asyncio.wait_for(reader.read(1), timeout=5.0)
-                c.expect(got, b"")
-                c.expect(
-                    cap.has_message(
-                        "[B066] unpinned peer", min_level=logging.DEBUG
-                    ),
-                    True,
-                )
-            finally:
-                if writer is not None:
-                    try:
-                        writer.close()
-                        await writer.wait_closed()
-                    except Exception:
-                        pass
-                cap.detach()
-                self._b066_cleanup_test_peer(peer)
 
-        # ---- Test 2 — post-auth disallowed-class injection ---------
-        async def body_b_066_post_auth_disallowed_class(c):
-            peer = await self._b066_make_test_peer(system_caller=False)
-            cap = _B066LogCapture("networking", logging.WARNING)
-            cap.attach()
-            writer = None
-            try:
-                client_ctx = self._b066_make_client_ssl_context(peer)
-                reader, writer = await asyncio.wait_for(
-                    asyncio.open_connection(
-                        "127.0.0.1",
-                        self._plexus.network.port,
-                        ssl=client_ctx,
-                    ),
-                    timeout=5.0,
-                )
-                await _b066_send_msg(writer, MSG_EXECUTE, {
-                    "plugin": "TestEventTarget",
-                    "method": "echo_author_id",
-                    "args": (_B066NotRegistered("malicious"),),
-                    "author": "remote",
-                    "author_id": "remote",
-                    "author_host": "b066_test_peer",
-                    "request_id": "b066-test2",
-                })
-                got = await asyncio.wait_for(reader.read(1), timeout=5.0)
-                c.expect(got, b"")
-                c.expect(
-                    cap.has_message(
-                        "[B066] disallowed-class deserialization",
-                        min_level=logging.WARNING,
-                    ),
-                    True,
-                )
-            finally:
-                if writer is not None:
-                    try:
-                        writer.close()
-                        await writer.wait_closed()
-                    except Exception:
-                        pass
-                cap.detach()
-                self._b066_cleanup_test_peer(peer)
 
-        # ---- Test 2b — post-auth __reduce__ payload ---------------
-        async def body_b_066_post_auth_reduce_payload(c):
-            sentinel_dir = tempfile.mkdtemp(prefix="b066_test2b_sentinel_")
-            peer = await self._b066_make_test_peer(system_caller=False)
-            writer = None
-            try:
-                client_ctx = self._b066_make_client_ssl_context(peer)
-                reader, writer = await asyncio.wait_for(
-                    asyncio.open_connection(
-                        "127.0.0.1",
-                        self._plexus.network.port,
-                        ssl=client_ctx,
-                    ),
-                    timeout=5.0,
-                )
-                # The send may itself raise on Windows if the server
-                # already RST'd the previous TLS handshake's tail-end —
-                # the security guarantee is that the sentinel never
-                # fires, regardless of where the path aborts.
-                try:
-                    await _b066_send_msg(writer, MSG_EXECUTE, {
-                        "plugin": "TestEventTarget",
-                        "method": "echo_author_id",
-                        "args": (_B066RegisteredButPwn(sentinel_dir),),
-                        "author": "remote",
-                        "author_id": "remote",
-                        "author_host": "b066_test_peer",
-                        "request_id": "b066-test2b",
-                    })
-                    try:
-                        got = await asyncio.wait_for(
-                            reader.read(1), timeout=5.0
-                        )
-                    except (ConnectionError, OSError):
-                        got = b""
-                except (ConnectionError, OSError):
-                    got = b""
-                c.expect(got, b"")
-                c.expect((Path(sentinel_dir) / "PWNED").exists(), False)
-            finally:
-                if writer is not None:
-                    try:
-                        writer.close()
-                        await writer.wait_closed()
-                    except Exception:
-                        pass
-                shutil.rmtree(sentinel_dir, ignore_errors=True)
-                self._b066_cleanup_test_peer(peer)
 
-        # ---- Test 3 — system_caller=False denial + alive --------
-        async def body_b_066_system_caller_privilege_denial(c):
-            peer = await self._b066_make_test_peer(system_caller=False)
-            writer = None
-            try:
-                client_ctx = self._b066_make_client_ssl_context(peer)
-                reader, writer = await asyncio.wait_for(
-                    asyncio.open_connection(
-                        "127.0.0.1",
-                        self._plexus.network.port,
-                        ssl=client_ctx,
-                    ),
-                    timeout=5.0,
-                )
-                # Action 1 — denial. author_host MUST match the peer's pinned
-                # hostname; otherwise the C-106 anti-spoof drift gate fires
-                # first and we never reach the B-018b system_caller denial this
-                # case is meant to exercise. (The grant case below already
-                # uses peer["spec"].hostname for the same reason.)
-                await _b066_send_msg(writer, MSG_EXECUTE, {
-                    "plugin": "TestEventTarget",
-                    "method": "get_state",
-                    "args": None,
-                    "author": "system",
-                    "author_id": "system",
-                    "author_host": peer["spec"].hostname,
-                    "request_id": "b066-test3-deny",
-                })
-                msg_type, data = await _b066_recv_msg(reader, timeout=5.0)
-                c.expect(msg_type, MSG_ERROR)
-                c.expect("system_caller=false" in str(data), True)
-
-                # Action 2 — connection still alive: ping + result.
-                await _b066_send_msg(writer, MSG_PING, {})
-                msg_type2, data2 = await _b066_recv_msg(reader, timeout=5.0)
-                c.expect(msg_type2, MSG_RESULT)
-                c.expect(data2, {"status": "ok"})
-            finally:
-                if writer is not None:
-                    try:
-                        writer.close()
-                        await writer.wait_closed()
-                    except Exception:
-                        pass
-                self._b066_cleanup_test_peer(peer)
 
         async def body_b_066_execute_hostname_drift_errors(c):
             # C-106 follow-up regression guard: an EXECUTE whose wire
@@ -2016,7 +1438,7 @@ class TestBugSuite(Plugin):
             # anti-spoof MSG_ERROR, not a silent drop. Before the fix the
             # EXECUTE / EXECUTE_STREAM drift gates returned with no wire
             # response, so the caller hung on its own receive until timeout
-            # (the original failure mode of the denial case above). author is
+            # (the original failure mode of the denial case (deleted 2026-07-22; covered by _dispatch_selftest)). author is
             # "remote" (not "system") so the drift gate is exercised in
             # isolation, ahead of the B-018b system_caller check.
             peer = await self._b066_make_test_peer(system_caller=False)
@@ -2142,112 +1564,8 @@ class TestBugSuite(Plugin):
                         pass
                 self._b066_cleanup_test_peer(peer)
 
-        # ---- Test 5 — client-side pin rejects unpinned server ----
-        async def body_b_066_client_side_pin_rejects_unpinned_server(c):
-            c.skip("old-NM cert_path / raw client-context internals retired by the netcore "
-                   "rewrite; the SPKI-pin client-side rejection of an unpinned server is "
-                   "covered by the netcore transport/membership self-tests (S3b)")
-            nm = self._plexus.network
-            actual_keys_dir = tempfile.mkdtemp(prefix="b066_test5_actual_")
-            expected_keys_dir = tempfile.mkdtemp(prefix="b066_test5_expected_")
-            actual_cert_path, actual_key_path, actual_fp, actual_cert_pem = \
-                generate_keypair(actual_keys_dir, "b066_test5_actual")
-            _, _, expected_fp, _ = generate_keypair(
-                expected_keys_dir, "b066_test5_expected"
-            )
-
-            server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-            server_ctx.minimum_version = ssl.TLSVersion.TLSv1_3
-            server_ctx.verify_mode = ssl.CERT_REQUIRED
-            server_ctx.check_hostname = False
-            server_ctx.load_cert_chain(actual_cert_path, actual_key_path)
-            server_ctx.load_verify_locations(
-                cadata=Path(nm.cert_path).read_text(encoding="utf-8")
-            )
-
-            async def _accept(reader, writer):
-                try:
-                    await reader.read(1)
-                except Exception:
-                    pass
-                try:
-                    writer.close()
-                except Exception:
-                    pass
-
-            srv = await asyncio.start_server(
-                _accept, "127.0.0.1", 0, ssl=server_ctx
-            )
-            test_port = srv.sockets[0].getsockname()[1]
-
-            bad_spec = PeerSpec(
-                hostname="b066_test5_server",
-                ip="127.0.0.1",
-                port=test_port,
-                cert_pem=actual_cert_pem,
-                fingerprint=expected_fp,
-                system_caller=False,
-            )
-            orig_peers = nm.peers
-            orig_pbf = nm.peers_by_fingerprint
-            orig_pbe = nm.peers_by_endpoint
-            nm.peers = [bad_spec]
-            nm.peers_by_fingerprint = {expected_fp: bad_spec}
-            nm.peers_by_endpoint = {("127.0.0.1", test_port): bad_spec}
-
-            try:
-                c.expect_exception(
-                    ConnectionError, match=r"not in peers config"
-                )
-                await nm._create_connection("127.0.0.1")
-            finally:
-                nm.peers = orig_peers
-                nm.peers_by_fingerprint = orig_pbf
-                nm.peers_by_endpoint = orig_pbe
-                srv.close()
-                try:
-                    await srv.wait_closed()
-                except Exception:
-                    pass
-                shutil.rmtree(actual_keys_dir, ignore_errors=True)
-                shutil.rmtree(expected_keys_dir, ignore_errors=True)
 
         # -- run_case calls -------------------------------------------
-        await rec.run_case(
-            "bug.B-066.pre_auth_pickle_rce",
-            body_b_066_pre_auth_pickle_rce,
-            category=category,
-            tags=("bug_repro", "security", "b066"), bug_ids=("B-066",),
-            hard_timeout_s=10.0, **kw,
-        )
-        await rec.run_case(
-            "bug.B-066.handshake_passes_pin_fails",
-            body_b_066_handshake_passes_pin_fails,
-            category=category,
-            tags=("bug_repro", "security", "b066"), bug_ids=("B-066",),
-            hard_timeout_s=10.0, **kw,
-        )
-        await rec.run_case(
-            "bug.B-066.post_auth_disallowed_class",
-            body_b_066_post_auth_disallowed_class,
-            category=category,
-            tags=("bug_repro", "security", "b066"), bug_ids=("B-066",),
-            hard_timeout_s=10.0, **kw,
-        )
-        await rec.run_case(
-            "bug.B-066.post_auth_reduce_payload",
-            body_b_066_post_auth_reduce_payload,
-            category=category,
-            tags=("bug_repro", "security", "b066"), bug_ids=("B-066",),
-            hard_timeout_s=10.0, **kw,
-        )
-        await rec.run_case(
-            "bug.B-066.system_caller_privilege_denial",
-            body_b_066_system_caller_privilege_denial,
-            category=category,
-            tags=("bug_repro", "security", "b066"), bug_ids=("B-066",),
-            hard_timeout_s=10.0, **kw,
-        )
         await rec.run_case(
             "bug.B-066.execute_hostname_drift_errors",
             body_b_066_execute_hostname_drift_errors,
@@ -2262,13 +1580,138 @@ class TestBugSuite(Plugin):
             tags=("bug_repro", "security", "b066"), bug_ids=("B-066",),
             hard_timeout_s=10.0, **kw,
         )
-        await rec.run_case(
-            "bug.B-066.client_side_pin_rejects_unpinned_server",
-            body_b_066_client_side_pin_rejects_unpinned_server,
-            category=category,
-            tags=("bug_repro", "security", "b066"), bug_ids=("B-066",),
-            hard_timeout_s=10.0, **kw,
-        )
+
+        # ==============================================================
+        # B-090 — inbound request_event_stream must resolve access as the
+        # local SUB OWNER, never as the wire-supplied author_id.
+        #
+        # These drive NetworkManager._RematchRegistry directly with a
+        # synthetic PeerIdentity/CallerCtx. No sockets, no subprocess: the
+        # bug lives entirely in which uuid reaches find_endpoint, so an
+        # in-process cell pins it exactly and runs on every boot.
+        #
+        # B-090 is a REGRESSION of B-018b, whose guard (_apply_b018b_guard)
+        # was removed with the old NetworkManager in the netcore rewrite.
+        # The rewrite replaced one global guard with per-path gates and
+        # missed the topic-stream path.
+        # ==============================================================
+        from plexus.netcore.manager import NetworkManager
+        from plexus.netcore.types import CallerCtx, PeerIdentity
+
+        b090_reg = NetworkManager._RematchRegistry(self._plexus)
+        b090_identity = PeerIdentity("b090-peer", False)
+
+        def _b090_caller(author_id: str):
+            return CallerCtx(author="evil-peer", author_id=author_id,
+                             author_host="b090-peer",
+                             request_uuid=str(uuid.uuid4()))
+
+        async def _b090_sub(c, target_access_name: str) -> tuple:
+            """Subscribe TestBugSuite (owner) -> TestEventTarget (target).
+
+            hosts="any" so the sub accepts a remote publisher, which is the
+            precondition the bug needs and is also the common default.
+            """
+            target = self._plexus.plugins.get("TestEventTarget")
+            if target is None:
+                c.skip("TestEventTarget not loaded")
+            topic = f"b090/{target_access_name}"
+            sid = await self._plexus.subscribe_event(
+                topic, self.plugin_name, self.plugin_uuid,
+                target_access_name=target_access_name,
+                target_plugin="TestEventTarget",
+                target_plugin_uuid=target.plugin_uuid,
+                hosts="any",
+            )
+            return topic, sid, target
+
+        # ---- ATTACK: spoofed author_id must NOT reach a private endpoint
+        async def body_b_090_stream_spoof_denied_private(c):
+            from plexus.exceptions import RequestException
+            topic, sid, target = await _b090_sub(c, "priv_stream")
+            try:
+                # The spoof: claim to BE the target plugin. Pre-fix this
+                # cleared find_endpoint's accessible_by_other_plugins check
+                # (core.py:5249, `plugin.plugin_uuid != requester_id`).
+                # match= is load-bearing: NoLocalSubException SUBCLASSES
+                # RequestException, so a bare expect_exception would also be
+                # satisfied by the sub failing to wire up -- a green cell
+                # asserting nothing. "not found" is the endpoint-denial text.
+                c.expect_exception(RequestException, match="not found")
+                async for _ in b090_reg.request_event_stream(
+                        topic, {"value": 1}, b090_identity,
+                        _b090_caller(target.plugin_uuid)):
+                    pass
+            finally:
+                await self._plexus.unsubscribe_event(sid)
+
+        # ---- CONTROL: honest caller, accessible target, still works.
+        # This is the cell that fails if the fix over-restricts (i.e. if it
+        # copies the execute path's `plugin.remote AND ep.remote` gate):
+        # TestEventTarget is remote:false and open_stream is remote:false.
+        async def body_b_090_stream_honest_caller_allowed(c):
+            topic, sid, _target = await _b090_sub(c, "open_stream")
+            try:
+                items = [x async for x in b090_reg.request_event_stream(
+                    topic, {"value": 1}, b090_identity,
+                    _b090_caller("not-a-plugin-uuid-0000"))]
+                c.expect(len(items), 3)
+            finally:
+                await self._plexus.unsubscribe_event(sid)
+
+        # ---- REACHABILITY: priv_stream must actually be streamable, or the
+        # denial cell above proves nothing (it would pass identically if the
+        # endpoint simply did not exist). Owner == target here, so the
+        # self-call escape at core.py:5249 legitimately allows it.
+        async def body_b_090_private_reachable_by_owner(c):
+            target = self._plexus.plugins.get("TestEventTarget")
+            if target is None:
+                c.skip("TestEventTarget not loaded")
+            topic = "b090/priv_reachable"
+            sid = await self._plexus.subscribe_event(
+                topic, "TestEventTarget", target.plugin_uuid,
+                target_access_name="priv_stream",
+                target_plugin="TestEventTarget",
+                target_plugin_uuid=target.plugin_uuid,
+                hosts="any",
+            )
+            try:
+                items = [x async for x in b090_reg.request_event_stream(
+                    topic, {"value": 1}, b090_identity,
+                    _b090_caller("not-a-plugin-uuid-0000"))]
+                c.expect(len(items), 3)
+            finally:
+                await self._plexus.unsubscribe_event(sid)
+
+        # ---- PARITY: the non-stream sibling must deny the same spoof the
+        # same way, so the stream variant grants no more than request_event.
+        async def body_b_090_request_event_parity(c):
+            from plexus.exceptions import RequestException
+            topic, sid, target = await _b090_sub(c, "priv_stream")
+            try:
+                # Same reasoning as the attack cell. Measured: request_event denies
+                # with the SAME "Endpoint ... not found" text as the stream path,
+                # which is itself the parity being asserted -- both variants refuse
+                # the spoof the same way, at the same gate.
+                c.expect_exception(RequestException, match="not found")
+                await b090_reg.request_event(
+                    topic, {"value": 1}, b090_identity,
+                    _b090_caller(target.plugin_uuid),
+                )
+            finally:
+                await self._plexus.unsubscribe_event(sid)
+
+        for cid, body in (
+            ("bug.B-090.stream_spoof_denied_private", body_b_090_stream_spoof_denied_private),
+            ("bug.B-090.stream_honest_caller_allowed", body_b_090_stream_honest_caller_allowed),
+            ("bug.B-090.private_reachable_by_owner", body_b_090_private_reachable_by_owner),
+            ("bug.B-090.request_event_parity", body_b_090_request_event_parity),
+        ):
+            await rec.run_case(
+                cid, body, category=category,
+                tags=("regression_guard", "security", "b090"), bug_ids=("B-090",),
+                hard_timeout_s=15.0, **kw,
+            )
 
 
 # Populate the sys.modules proxy with the final module globals — see the

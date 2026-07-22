@@ -678,7 +678,7 @@ class NetworkManager:
             return self._req_stream(topic, payload, identity, caller)
 
         async def _req_stream(self, topic, payload, identity, caller):
-            from ..exceptions import NoLocalSubException
+            from ..exceptions import NoLocalSubException, RequestException
             from ..utils import Event
             subs = await self._accepting_subs(topic, identity, caller)
             if not subs:
@@ -689,19 +689,50 @@ class NetworkManager:
             sub_id = getattr(sub, "declared_id", None)
             if sub_id is None:
                 sub_id = getattr(sub, "sub_uuid", None)
+
+            # B-090: the ACCESS identity is the local sub OWNER, never the wire
+            # author_id. Without this stamp, _process_request_stream falls back to
+            # `request.requester_id or request.author_id` (core.py:6459) and hands
+            # find_endpoint an attacker-controlled uuid: a pinned peer could name any
+            # local plugin uuid to take the LOCAL branch (core.py:5187), skipping the
+            # remote gate, and by naming the TARGET's own uuid also clear
+            # accessible_by_other_plugins. This mirrors what _fanout_sub already does
+            # for the unary topic paths (events.py:1216 "C18") and what the local
+            # request_event_stream does (events.py:2033), so the stream variant grants
+            # exactly what the non-stream variant grants -- no more, no less. The wire
+            # author/author_id stay on the Request and on the Event below: they are
+            # provenance, not authority. The hook runs before the producer is spawned
+            # (core.py:4929-4936), so there is no race with the reader.
+            def _stamp_requester(request):
+                request.requester_id = sub.plugin_uuid
+
+            # _create_gen_request_gated (not create_gen_request) keeps the capability
+            # gate and the OUT rate admit. Hosts are passed pre-normalized, exactly as
+            # execute_stream would after _validate_host_args.
+            request = await self._core._create_gen_request_gated(
+                target_plugin, target_method, payload,
+                getattr(sub, "target_plugin_uuid", None),
+                "local", None, caller.author, caller.author_id,
+                None, identity.hostname, None,
+                _post_construct_hook=_stamp_requester,
+            )
             first = True
-            async for item in self._core.execute_stream(
-                    target_plugin, target_method, args=payload,
-                    plugin_uuid=getattr(sub, "target_plugin_uuid", None),
-                    hosts="local", author=caller.author, author_id=caller.author_id,
-                    author_host=identity.hostname):
-                if first:
-                    yield Event(topic=topic, payload=item, author=caller.author,
-                                author_id=caller.author_id, author_host=identity.hostname,
-                                subscription_id=sub_id, timestamp=_time.time())
-                    first = False
-                else:
-                    yield item
+            try:
+                async for item, error, _ in request.get_queue_stream():
+                    if error:
+                        # Preserve a RequestException SUBTYPE by re-raising the OBJECT.
+                        raise item if isinstance(item, RequestException) else RequestException(item)
+                    if first:
+                        yield Event(topic=topic, payload=item, author=caller.author,
+                                    author_id=caller.author_id, author_host=identity.hostname,
+                                    subscription_id=sub_id, timestamp=_time.time())
+                        first = False
+                    else:
+                        yield item
+            finally:
+                # Mandatory: without it an abandoned/cancelled remote stream leaks the
+                # GeneratorRequest (same reason as execute_stream's finally).
+                await request.set_collected()
 
     class _RateSeam:
         """Inbound rate charge (§8.2) — delegates to the core's canonical

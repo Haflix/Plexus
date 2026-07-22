@@ -50,7 +50,7 @@ from plexus.decorators import async_log_errors, log_errors  # noqa: E402
 from _test_helpers import CaseRecorder  # noqa: E402
 
 
-SUITE_VERSION = "0.5.0"
+SUITE_VERSION = "0.7.0"
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 SUBNODE_SCRIPT = REPO_ROOT / "plugins_test" / "_remote_node" / "run_node.py"
@@ -715,120 +715,6 @@ class TestRemoteSuite(Plugin):
                     f"expected 1 chunk before the hang, got {len(chunks)}"
                 )
 
-        # ── B-071: per-peer wire counter coverage ─────────────────────
-        # Sanity checks that peer_stats actually tracks bytes/messages
-        # for both unary execute_remote and streaming paths, and that
-        # _drop_peer_advert_state resets per O7 (current-session only).
-
-        async def body_wire_counter_execute(c):
-            c.skip("old-NM advert/liveness internals retired by the netcore rewrite; behavior covered by netcore self-tests + wave-2")
-            """B-071: peer_stats[hostname] increments after execute_remote.
-            We verify msgs_sent ≥ 1 and bytes_sent > 0 because the unary
-            path issues at least one MSG_EXECUTE frame + receives one
-            MSG_STREAM_CHUNK + MSG_END_STREAM."""
-            nm = self._plexus.network
-            stats_before = dict(nm.peer_stats.get(peer_host, {
-                "bytes_sent": 0, "bytes_recv": 0,
-                "msgs_sent": 0, "msgs_recv": 0,
-            }))
-            r = await self.execute(
-                "TestRemoteTarget", "r_open", {"value": "wirecount"},
-                hosts=c.hosts,
-            )
-            c.expect(r, "wirecount")
-            stats_after = nm.peer_stats.get(peer_host)
-            if stats_after is None:
-                c.set_marker("peer_stats_missing")
-                raise AssertionError(
-                    f"peer_stats[{peer_host!r}] missing after execute_remote"
-                )
-            if stats_after["msgs_sent"] <= stats_before["msgs_sent"]:
-                c.set_marker("msgs_sent_not_incremented")
-                raise AssertionError(
-                    f"msgs_sent did not increment: {stats_before['msgs_sent']} "
-                    f"→ {stats_after['msgs_sent']}"
-                )
-            if stats_after["bytes_sent"] <= stats_before["bytes_sent"]:
-                c.set_marker("bytes_sent_not_incremented")
-                raise AssertionError(
-                    f"bytes_sent did not increment: {stats_before['bytes_sent']} "
-                    f"→ {stats_after['bytes_sent']}"
-                )
-            if stats_after["msgs_recv"] <= stats_before["msgs_recv"]:
-                c.set_marker("msgs_recv_not_incremented")
-                raise AssertionError(
-                    f"msgs_recv did not increment: {stats_before['msgs_recv']} "
-                    f"→ {stats_after['msgs_recv']}"
-                )
-
-        async def body_wire_counter_stream(c):
-            c.skip("old-NM advert/liveness internals retired by the netcore rewrite; behavior covered by netcore self-tests + wave-2")
-            """B-071: streaming path increments per-chunk + per-ITEM_END
-            marker. Verifies that the stream-path coverage (chunk paths
-            + no-payload ITEM_END counters) actually fires — the bulk of
-            real-world traffic flows through these sites."""
-            nm = self._plexus.network
-            stats_before = dict(nm.peer_stats.get(peer_host, {
-                "bytes_sent": 0, "bytes_recv": 0,
-                "msgs_sent": 0, "msgs_recv": 0,
-            }))
-            chunks = []
-            async for chunk in self.request_event_stream(
-                "r_request_stream_basic", payload={},
-                hosts="remote", timeout=10.0,
-            ):
-                chunks.append(chunk)
-            c.expect(len(chunks), 3)
-            stats_after = nm.peer_stats.get(peer_host)
-            if stats_after is None:
-                c.set_marker("peer_stats_missing")
-                raise AssertionError(
-                    f"peer_stats[{peer_host!r}] missing after stream"
-                )
-            recv_delta = stats_after["msgs_recv"] - stats_before["msgs_recv"]
-            if recv_delta < 3:
-                c.set_marker("stream_recv_undercount")
-                raise AssertionError(
-                    f"streaming msgs_recv delta {recv_delta} < 3 — likely "
-                    f"the no-payload ITEM_END counters are not firing"
-                )
-
-        async def body_wire_counter_reset(c):
-            c.skip("old-NM advert/liveness internals retired by the netcore rewrite; behavior covered by netcore self-tests + wave-2")
-            """B-071: peer_stats entry is removed when a peer is declared
-            dead via _drop_peer_advert_state. We invoke the helper
-            directly (mirrors what heartbeat does on dead-peer detection),
-            then verify the entry is gone and a fresh subsequent stamp
-            recreates a zeroed entry."""
-            nm = self._plexus.network
-            # Ensure we have a stats entry to drop
-            await self.execute(
-                "TestRemoteTarget", "r_open", {"value": "before_drop"},
-                hosts=c.hosts,
-            )
-            if peer_host not in nm.peer_stats:
-                c.set_marker("no_stats_to_drop")
-                raise AssertionError(
-                    f"peer_stats[{peer_host!r}] missing before drop"
-                )
-            await nm._drop_peer_advert_state(peer_host)
-            if peer_host in nm.peer_stats:
-                c.set_marker("stats_not_cleared")
-                raise AssertionError(
-                    f"peer_stats[{peer_host!r}] still present after "
-                    f"_drop_peer_advert_state"
-                )
-            # Subsequent traffic should recreate a fresh entry (next
-            # connection acquired from pool will re-handshake or use a
-            # surviving pooled writer; either way, the next _send_message
-            # whose writer is stamped will pre-create a zeroed entry via
-            # the handshake-time setdefault on the next reconnect).
-            #
-            # Note: with a surviving pooled writer (already stamped, but
-            # peer_stats entry just popped), _count_sent will see
-            # stats=None and SKIP the increment per the documented race
-            # semantic. That's the correct behavior — we don't recreate
-            # stale state for a peer that was just declared dead.
 
         # B-018 spoof cases retired 2026-06-14: the spoofer harness was removed
         # in PR3 Stage D so these were permanent skips. B-018b is now covered
@@ -837,21 +723,18 @@ class TestRemoteSuite(Plugin):
 
         async def body_b019_count_per_node(c):
             # TP-04 (B-019): publish_event's scheduled-count must be per matching
-            # SUBSCRIPTION, not per node. RELOCATED to the socket pair harness
-            # (wave-2 group). This case needs the parent to KNOW the subnode's
-            # test/r/multi subs to fan out to them (an advert/directory dependency),
-            # but the in-process-subnode topology here routes remote traffic via
-            # on-demand endpoint probes / node-broadcast, so _inbound_adverts is
-            # empty at this point — worse, a sibling case (body_wire_counter_reset,
-            # B-071) calls nm._drop_peer_advert_state(peer) mid-suite and the
-            # advert does not re-propagate within the window. Per-sub fan-out count
-            # over the wire is exactly the advert/directory-propagation class the
-            # networking_pair socket harness owns (cf. B-082); build it there.
+            # SUBSCRIPTION, not per node. RELOCATED to the multinode harness. This
+            # case needs the parent to KNOW the subnode's test/r/multi subs to fan
+            # out to them (a directory-propagation dependency), but the in-process
+            # subnode topology here routes remote traffic via on-demand endpoint
+            # probes / node-broadcast, so the directory is empty at this point.
+            # Per-sub fan-out count over the wire is exactly the
+            # directory-propagation class the multinode harness owns (cf. B-082).
             c.skip(
-                "TP-04/B-019 per-sub fan-out count is advert/directory-propagation "
-                "dependent; the in-process-subnode topology's _inbound_adverts is "
-                "empty here (sibling _drop_peer_advert_state, probe-based routing) — "
-                "relocated to the networking_pair socket harness (wave-2)."
+                "TP-04/B-019 per-sub fan-out count is directory-propagation "
+                "dependent; the in-process-subnode topology's directory is empty "
+                "here (probe-based routing) — relocated to "
+                "plugins_test/networking_multinode/."
             )
 
         async def body_b021_first_sub_not_remote_eligible(c):
@@ -1561,22 +1444,9 @@ class TestRemoteSuite(Plugin):
              body_request_event_stream_timeout_type,
              ("basic", "request_event_stream", "regression_guard", "slow"),
              ("B-045",)),
-            # B-024: must run BEFORE the wire_counter.reset_on_drop case below,
-            # which drops the peer and clears its adverts (the huge-item stream
-            # needs the subnode's advert present to route over the wire).
             ("remote.B-024.huge_item", body_b024_huge_item,
              ("request_event_stream", "regression_guard", "slow"), ("B-024",)),
             # End Stage N additions
-            # B-071: per-peer wire counters
-            ("remote.wire_counter.execute",
-             body_wire_counter_execute,
-             ("basic", "wire_counter"), ("B-071",)),
-            ("remote.wire_counter.stream",
-             body_wire_counter_stream,
-             ("basic", "wire_counter", "request_event_stream"), ("B-071",)),
-            ("remote.wire_counter.reset_on_drop",
-             body_wire_counter_reset,
-             ("basic", "wire_counter"), ("B-071",)),
             ("remote.B-019.publish_event_count_per_node_not_per_sub",
              body_b019_count_per_node,
              ("bug_repro",), ("B-019",)),

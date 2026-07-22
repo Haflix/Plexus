@@ -107,6 +107,23 @@ class TestEventTarget(Plugin):
         for i in range(3):
             yield {"chunk": i, "topic": event.topic}
 
+    async def priv_stream(self, value=None):
+        # B-090 fixture: a PRIVATE async-generator endpoint
+        # (accessible_by_other_plugins: false). Before B-090 was fixed there was
+        # no private generator anywhere in plugins_test, so no test could express
+        # the attack: a remote peer spoofing author_id = this plugin's own uuid
+        # cleared the accessible_by_other_plugins check and streamed from here.
+        for i in range(3):
+            yield {"secret_chunk": i, "value": value}
+
+    async def open_stream(self, value=None):
+        # B-090 control fixture: same shape as priv_stream but
+        # accessible_by_other_plugins: true, and deliberately remote: false.
+        # A fix that copied the execute path's `plugin.remote AND ep.remote`
+        # gate would wrongly deny this one, so it is the over-restriction guard.
+        for i in range(3):
+            yield {"chunk": i, "value": value}
+
     async def handle_hostname_topic(self, event):
         self._record("hostname_topic", event)
 
