@@ -50,12 +50,15 @@ from plexus.decorators import async_log_errors, log_errors  # noqa: E402
 from _test_helpers import CaseRecorder  # noqa: E402
 
 
-SUITE_VERSION = "0.4.1"
+SUITE_VERSION = "0.5.0"
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 SUBNODE_SCRIPT = REPO_ROOT / "plugins_test" / "_remote_node" / "run_node.py"
 SUBNODE_CONFIG = "plugins_test/_remote_node/config.subnode.yml"
-SUBNODE_PORT_DEFAULT = 2511
+# test_application.py probes a free port per run and exports it (before this
+# module is imported), so a stale node holding the previous port cannot make the
+# next run fail to bind. The literal is only a standalone/smoke fallback.
+SUBNODE_PORT_DEFAULT = int(os.environ.get("AIO_TEST_SUBNODE_PORT", 2511))
 
 UNAVAILABLE_REASON = (
     "Phase 5 subprocess peer not available — local-only test run "
@@ -154,6 +157,13 @@ class TestRemoteSuite(Plugin):
 
     async def _spawn_subnode(self) -> None:
         """Spawn the peer subprocess and wait for the ready-file."""
+        # Prepared OUTSIDE the try below on purpose: everything inside it is
+        # swallowed into a warning that leaves _remote_available False, which
+        # turns all 40 remote cases into skips while the gate still exits 0. A
+        # log-directory problem must not be able to silently disable the remote
+        # suite, so it is allowed to raise here instead.
+        log_path = REPO_ROOT / "test_outputs" / "subnode.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
         try:
             tmp_dir = Path(tempfile.gettempdir()) / "aio_test_subnode"
             tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -191,13 +201,24 @@ class TestRemoteSuite(Plugin):
                 )
             self._logger.info(f"TestRemoteSuite: spawning subnode: {cmd}")
             child_env = dict(os.environ)
-            self._subproc = subprocess.Popen(
-                cmd,
-                cwd=str(REPO_ROOT),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=child_env,
-            )
+            # The subnode is a full Plexus node and logs continuously. Piping its
+            # stdout/stderr without draining them deadlocks the child once the
+            # ~64KB pipe buffer fills, and leaks the pipe handles per boot. Send
+            # both streams to a log file instead (same shape as the multinode
+            # harness) so the output stays inspectable without a reader task.
+            # The `with` block closes the parent's handle as soon as Popen
+            # returns OR raises, so no handle can leak on any path. That is safe
+            # because Popen gives the child an inheritable DUPLICATE of the
+            # handle, which is unaffected by the parent closing its own copy.
+            with open(log_path, "w", encoding="utf-8") as logf:
+                self._subproc = subprocess.Popen(
+                    cmd,
+                    cwd=str(REPO_ROOT),
+                    stdin=subprocess.DEVNULL,
+                    stdout=logf,
+                    stderr=subprocess.STDOUT,
+                    env=child_env,
+                )
 
             deadline = time.perf_counter() + 15.0
             while time.perf_counter() < deadline:
@@ -278,6 +299,27 @@ class TestRemoteSuite(Plugin):
     # ====================================================================
 
     async def _enumerate_cases(self, rec: CaseRecorder, kw: Dict) -> None:
+        # Guard cell: every other case in this suite is hosts=("remote",), so if
+        # the subnode never came up the recorder turns all of them into SKIPS and
+        # the runner still exits 0 -- a green gate with zero cross-node coverage.
+        # _spawn_subnode reaches that state on three paths that only log a
+        # warning: the child exiting early, no ready-file within 15s, and its
+        # blanket except. This cell is hosts=("local",) so it can never be
+        # auto-skipped, and it FAILS when networking is enabled but no peer
+        # arrived, turning a silent 40-case skip into a visible failure.
+        async def body_subnode_up(c):
+            if not getattr(self._plexus, "networking_enabled", False):
+                c.skip("networking disabled in this config — no peer expected")
+            c.expect(self._remote_available, True)
+
+        await rec.run_case(
+            "remote.subnode.up",
+            body_subnode_up,
+            hosts=("local",),
+            tags=("infra", "regression_guard"),
+            **kw,
+        )
+
         peer_host = (
             self._peer_info.get("hostname") if self._peer_info else "test-subnode"
         )

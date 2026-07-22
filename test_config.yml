@@ -275,7 +275,11 @@ networking:
     # No fields here for keys_dir / peers — those are runtime-injected
     # so a stale config can never be honored standalone.
     enabled: true
-    port: 2510
+    port: 2510                         # fallback only — test_application.py
+                                       # probes a free port per run and
+                                       # overrides this, so an orphaned node
+                                       # holding the old port cannot block the
+                                       # next run from binding.
     hostname: aio-test-parent          # explicit so subnode peers entry matches
     discover_nodes: true
     direct_discoverable: true

@@ -17,8 +17,11 @@ import asyncio
 import json
 import os
 import shutil
+import socket
+import subprocess
 import sys
 import tempfile
+from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -47,12 +50,96 @@ CONFIG_PATH = "test_config.yml"
 DUMP_PATH = "test_outputs/test_report.json"
 RUNNER_PLUGIN = "TestRunner"
 
-# Subnode endpoint default (kept in sync with TestRemoteSuite.SUBNODE_PORT_DEFAULT
-# and the smoke harness). Test_application.py provisions a subnode peer entry
-# in the parent's networking.peers under this address.
-SUBNODE_PORT = 2511
 SUBNODE_HOSTNAME = "test-subnode"
 PARENT_HOSTNAME = "aio-test-parent"
+
+# Live sockets this process may gain across a run before the run is reported as
+# leaking. The census counts only sockets OWNED BY THIS PID, so a healthy run
+# ends at roughly zero net: every socket the suite opens is closed by teardown,
+# and sockets draining through TIME_WAIT are owned by no process and therefore
+# not counted. A handful of slack absorbs sockets still closing at exit.
+SOCKET_LEAK_THRESHOLD = 16
+
+
+def _free_ports(n: int) -> List[int]:
+    """Bind-probe `n` distinct free TCP ports, on 0.0.0.0 like the real listener.
+
+    All probe sockets are held open simultaneously and released only once every
+    port has been taken, so two probes cannot be handed the same port -- which
+    would make the subnode fail to bind and silently turn every remote case
+    into a skip.
+
+    The parent and subnode listeners used to be hard-coded to 2510/2511, so a
+    run failed to bind (WSAEADDRINUSE) whenever something still held the port:
+    an orphaned subnode, or a prior connection on that port still in TIME_WAIT.
+    Note this fixes the PORT collision only -- two concurrent runs still share
+    test_outputs/subnode.log and test_outputs/test_report.json and would
+    clobber each other there.
+    """
+    socks = [socket.socket(socket.AF_INET, socket.SOCK_STREAM) for _ in range(n)]
+    try:
+        for s in socks:
+            # Probe the same address the real listeners bind (Transport uses
+            # 0.0.0.0), so a port free on loopback but taken on another
+            # interface cannot pass the probe and then fail the real bind.
+            s.bind(("0.0.0.0", 0))
+        return [s.getsockname()[1] for s in socks]
+    finally:
+        for s in socks:
+            s.close()
+
+
+PARENT_PORT, SUBNODE_PORT = _free_ports(2)
+assert PARENT_PORT != SUBNODE_PORT, "port probe handed out a duplicate port"
+
+
+def _socket_census() -> Optional[Dict[str, Counter]]:
+    """IPv4 TCP sockets, split into two counts that answer different questions.
+
+    ``own`` -- sockets owned by THIS process, bucketed by connection state.
+    This is the LEAK signal, and it is deliberately PID-scoped: a machine-wide
+    count is unusable as an invariant because any other program opening
+    connections during a multi-minute run moves it in both directions, so it
+    can equally fail a clean run and mask a real leak.
+
+    ``machine`` -- every socket on the box, same buckets. This exists because
+    PID-scoping alone is BLIND to the failure it is supposed to police:
+    Windows socket starvation is TIME_WAIT / ephemeral-port accumulation, and
+    TIME_WAIT sockets are owned by no process (netstat reports PID 0), so they
+    never appear in ``own``. The machine-wide TIME_WAIT total is the only
+    starvation signal available here. It is REPORTED, never used to fail a
+    run, since it is not attributable to this process.
+
+    Deliberately locale-agnostic: state names differ per Windows UI language
+    (TIME_WAIT prints as WARTEND on a German install), so the buckets are
+    whatever netstat prints and only the DELTA between two censuses is read.
+
+    Returns None when netstat could not be run OR produced output this parser
+    recognised nothing in -- an unmeasured run must not be reportable as a
+    clean one. Note ``-p tcp`` is IPv4-only on Windows; IPv6 sockets are not
+    counted (netcore binds 0.0.0.0 and the selftests bind 127.0.0.1).
+    """
+    try:
+        proc = subprocess.run(
+            ["netstat", "-ano", "-p", "tcp"],
+            capture_output=True, text=True, timeout=30,
+        )
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    pid = str(os.getpid())
+    own, machine = Counter(), Counter()
+    for line in proc.stdout.splitlines():
+        parts = line.split()
+        # Proto | Local Address | Foreign Address | State | PID
+        if len(parts) >= 5 and parts[0].upper() == "TCP":
+            machine[parts[3]] += 1
+            if parts[4] == pid:
+                own[parts[3]] += 1
+    if not machine:
+        return None  # netstat ran but nothing parsed; treat as unmeasured
+    return {"own": own, "machine": machine}
 
 
 def _print_summary(report: Dict[str, Any]) -> None:
@@ -178,6 +265,8 @@ def _patch_networking_for_mtls(pc: "Plexus", mtls: Dict[str, str]) -> None:
     """
     nw_cfg = pc.yaml_config.setdefault("networking", {})
     nw_cfg["keys_dir"] = mtls["parent_keys_dir"]
+    # Override test_config.yml's static port with this run's probed one.
+    nw_cfg["port"] = PARENT_PORT
     nw_cfg["peers"] = [
         {
             "hostname": SUBNODE_HOSTNAME,
@@ -196,7 +285,8 @@ def _set_subnode_env_for_test_remote_suite(mtls: Dict[str, str]) -> None:
     os.environ["AIO_TEST_SUB_KEYS_DIR"] = mtls["sub_keys_dir"]
     os.environ["AIO_TEST_PARENT_CERT_PEM_FILE"] = mtls["parent_cert_pem_file"]
     os.environ["AIO_TEST_PARENT_HOSTNAME"] = PARENT_HOSTNAME
-    os.environ["AIO_TEST_PARENT_PORT"] = "2510"
+    os.environ["AIO_TEST_PARENT_PORT"] = str(PARENT_PORT)
+    os.environ["AIO_TEST_SUBNODE_PORT"] = str(SUBNODE_PORT)
 
 
 def _cleanup_test_mtls_identities(mtls: Dict[str, str]) -> None:
@@ -220,11 +310,81 @@ def _cleanup_test_mtls_identities(mtls: Dict[str, str]) -> None:
         "AIO_TEST_PARENT_CERT_PEM_FILE",
         "AIO_TEST_PARENT_HOSTNAME",
         "AIO_TEST_PARENT_PORT",
+        "AIO_TEST_SUBNODE_PORT",
     ):
         os.environ.pop(key, None)
 
 
+_socket_leak: Optional[int] = None
+
+
+def _report_socket_census(
+    before: Optional[Dict[str, Counter]], started_at: Optional[str]
+) -> None:
+    """Print the run's socket deltas and record them into the JSON report.
+
+    Sets the module-level ``_socket_leak`` when THIS PROCESS's growth exceeds
+    SOCKET_LEAK_THRESHOLD, which __main__ turns into a non-zero exit. The
+    machine-wide delta is printed alongside but never fails a run: it is not
+    attributable to this process. It is here because it is the only visibility
+    into TIME_WAIT accumulation, which is the actual Windows socket-starvation
+    mechanism and is invisible to the PID-scoped count.
+
+    This exists so "the suite leaks sockets" is a measured claim rather than
+    folklore: the starvation claim that gated 11 netcore cells was never
+    reproduced, because nothing ever counted.
+    """
+    global _socket_leak
+    after = _socket_census()
+    if before is None or after is None:
+        print("\nSocket census: UNMEASURED (netstat unavailable or unparsed)")
+        return
+
+    def _delta(a: Counter, b: Counter) -> Dict[str, int]:
+        d = {k: b[k] - a[k] for k in set(a) | set(b)}
+        return {k: v for k, v in sorted(d.items()) if v}
+
+    own_delta = _delta(before["own"], after["own"])
+    machine_delta = _delta(before["machine"], after["machine"])
+    net = sum(after["own"].values()) - sum(before["own"].values())
+    machine_net = sum(after["machine"].values()) - sum(before["machine"].values())
+
+    print(f"\nSocket census: net {net:+d} held by this process "
+          f"{own_delta or '(no change)'}")
+    print(f"               net {machine_net:+d} machine-wide (informational) "
+          f"{machine_delta or '(no change)'}")
+    try:
+        dump = Path(DUMP_PATH)
+        report = json.loads(dump.read_text(encoding="utf-8"))
+        # Only stamp the report this run actually produced. The census fires from
+        # a finally block, so a run that died before TestRunner dumped would
+        # otherwise decorate the PREVIOUS run's report and make it look current.
+        if started_at is not None and report.get("started_at") == started_at:
+            report["socket_census"] = {
+                "own_before": sum(before["own"].values()),
+                "own_after": sum(after["own"].values()),
+                "own_net": net,
+                "own_by_state": own_delta,
+                "machine_net": machine_net,
+                "machine_by_state": machine_delta,
+                "threshold": SOCKET_LEAK_THRESHOLD,
+            }
+            dump.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    except Exception as e:
+        print(f"(could not record socket census in report: {e})", file=sys.stderr)
+
+    if net > SOCKET_LEAK_THRESHOLD:
+        _socket_leak = net
+        print(
+            f"ERROR: this process ended holding {net} more sockets than it "
+            f"started with (threshold {SOCKET_LEAK_THRESHOLD}). Check for an "
+            f"undrained peer link or a transport that was never stopped.",
+            file=sys.stderr,
+        )
+
+
 async def run_tests() -> int:
+    census_before = _socket_census()
     mtls = _provision_test_mtls_identities()
     try:
         _set_subnode_env_for_test_remote_suite(mtls)
@@ -240,6 +400,7 @@ async def run_tests() -> int:
         _cleanup_test_mtls_identities(mtls)
         raise
 
+    run_started_at: Optional[str] = None
     try:
         report = await pc.execute(
             RUNNER_PLUGIN,
@@ -287,12 +448,14 @@ async def run_tests() -> int:
             )
             return 3
 
+        run_started_at = report.get("started_at")
         _print_summary(report)
         print(f"Full report: {Path(DUMP_PATH).resolve()}")
         return _exit_code(report)
     finally:
         await pc.graceful_shutdown()
         _cleanup_test_mtls_identities(mtls)
+        _report_socket_census(census_before, run_started_at)
 
 
 if __name__ == "__main__":
@@ -307,4 +470,6 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"FATAL: {type(e).__name__}: {e}", file=sys.stderr)
         rc = 4
+    if rc == 0 and _socket_leak is not None:
+        rc = 5
     sys.exit(rc)
