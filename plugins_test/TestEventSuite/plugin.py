@@ -41,7 +41,7 @@ from plexus.exceptions import RequestException  # noqa: E402
 from _test_helpers import CaseRecorder  # noqa: E402
 
 
-SUITE_VERSION = "0.5.0"
+SUITE_VERSION = "0.6.0"
 
 TARGET = "TestEventTarget"
 BAD_ACTOR = "TestEventBadActor"
@@ -143,6 +143,7 @@ class TestEventSuite(Plugin):
         await self._basic_access(rec, kw)
         await self._basic_sync(rec, kw)
         await self._basic_logging(rec, kw)
+        await self._basic_silent_failure_logs(rec, kw)
         await self._basic_lifecycle(rec, kw)
         await self._basic_request_cleanup(rec, kw)
         await self._basic_hard_removal(rec, kw)
@@ -1118,10 +1119,27 @@ class TestEventSuite(Plugin):
                     target_access_name="handle_raising_sync",
                 )
                 try:
-                    count = await self.publish_event(
-                        "smoke_publish", payload={"x": 1},
-                    )
-                    await self._settle(0.3)
+                    # B-062: publish_event fan-out discards the error result, so
+                    # a swallowed subscriber crash is otherwise invisible.
+                    # Capture the core logger to assert it is now surfaced at
+                    # ERROR. RuntimeError is a non-RequestException, so the
+                    # B-062 gate (kind=="publish_event" and not RequestException)
+                    # fires. Capture must wrap the settle so the async fan-out's
+                    # ERROR is recorded before the handler is detached.
+                    cap = _LogCapture()
+                    cap.setLevel(logging.DEBUG)
+                    core_logger = self._plexus._logger
+                    prev_lvl = core_logger.level
+                    core_logger.setLevel(logging.DEBUG)
+                    core_logger.addHandler(cap)
+                    try:
+                        count = await self.publish_event(
+                            "smoke_publish", payload={"x": 1},
+                        )
+                        await self._settle(0.3)
+                    finally:
+                        core_logger.removeHandler(cap)
+                        core_logger.setLevel(prev_lvl)
                     # publish_event returns survivor count even when a
                     # handler raises — the smoke_publish_sub on the suite
                     # plus the runtime-added sub on the bad actor: 2.
@@ -1132,6 +1150,16 @@ class TestEventSuite(Plugin):
                     log = await self.execute(BAD_ACTOR, "get_call_log")
                     fired = [e for e in log if e.get("handler") == "raising_sync"]
                     c.expect(len(fired), 1)
+                    # B-062 regression: the swallowed crash is logged at ERROR,
+                    # naming the subscriber and carrying the exception message.
+                    b062 = [
+                        r for r in cap.records
+                        if r.levelno == logging.ERROR
+                        and "publish_event subscriber" in r.getMessage()
+                        and "crashed" in r.getMessage()
+                        and "sync_handler_boom" in r.getMessage()
+                    ]
+                    c.expect(len(b062) >= 1, True)
                 finally:
                     try:
                         await self._plexus.unsubscribe_event(sub_id)
@@ -1256,6 +1284,85 @@ class TestEventSuite(Plugin):
             "event.logging.verbose_true_emits_debug",
             body_verbose_true_emits_debug,
             tags=("basic", "logging"), **kw,
+        )
+
+    async def _basic_silent_failure_logs(
+        self, rec: CaseRecorder, kw: Dict
+    ) -> None:
+        async def body_b061_denied_access_logged(c):
+            # B-061: a cross-plugin execute to a private endpoint
+            # (accessible_by_other_plugins: false) is denied by find_endpoint,
+            # which previously left no trace. Assert the DEBUG "candidate
+            # denied" line now appears (naming the endpoint).
+            cap = _LogCapture()
+            cap.setLevel(logging.DEBUG)
+            core_logger = self._plexus._logger
+            prev_lvl = core_logger.level
+            core_logger.setLevel(logging.DEBUG)
+            core_logger.addHandler(cap)
+            try:
+                try:
+                    await self.execute(TARGET, "priv_endpoint", None)
+                except RequestException:
+                    pass  # denial resolves to "endpoint not found"; expected
+            finally:
+                core_logger.removeHandler(cap)
+                core_logger.setLevel(prev_lvl)
+            denied = [
+                r for r in cap.records
+                if r.levelno == logging.DEBUG
+                and "candidate" in r.getMessage()
+                and "denied" in r.getMessage()
+                and "priv_endpoint" in r.getMessage()
+            ]
+            c.expect(len(denied) >= 1, True)
+
+        async def body_b060_missing_endpoint_logged(c):
+            # B-060: a publish_event fan-out whose subscriber target endpoint
+            # does not exist fails silently (the error result is discarded).
+            # Route a runtime sub at a nonexistent endpoint, publish, and assert
+            # the DEBUG "not found" line (tagged kind=publish_event) appears.
+            sub_id = await self._plexus.subscribe_event(
+                "test_event/smoke/publish",
+                self.plugin_name,
+                self.plugin_uuid,
+                target_plugin=self.plugin_name,
+                target_access_name="b060_nonexistent_endpoint",
+            )
+            cap = _LogCapture()
+            cap.setLevel(logging.DEBUG)
+            core_logger = self._plexus._logger
+            prev_lvl = core_logger.level
+            core_logger.setLevel(logging.DEBUG)
+            core_logger.addHandler(cap)
+            try:
+                await self.publish_event("smoke_publish", payload={"x": 1})
+                await self._settle(0.3)
+            finally:
+                core_logger.removeHandler(cap)
+                core_logger.setLevel(prev_lvl)
+                try:
+                    await self._plexus.unsubscribe_event(sub_id)
+                except Exception:
+                    pass
+            missing = [
+                r for r in cap.records
+                if r.levelno == logging.DEBUG
+                and "not found" in r.getMessage()
+                and "b060_nonexistent_endpoint" in r.getMessage()
+                and "publish_event" in r.getMessage()
+            ]
+            c.expect(len(missing) >= 1, True)
+
+        await rec.run_case(
+            "event.logging.B-061.denied_access_logged",
+            body_b061_denied_access_logged,
+            tags=("basic", "logging", "access"), bug_ids=("B-061",), **kw,
+        )
+        await rec.run_case(
+            "event.logging.B-060.missing_endpoint_logged",
+            body_b060_missing_endpoint_logged,
+            tags=("basic", "logging"), bug_ids=("B-060",), **kw,
         )
 
     # ====================================================================

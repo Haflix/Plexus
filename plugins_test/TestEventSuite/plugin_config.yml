@@ -1,5 +1,5 @@
 description: PR3 event API suite — comprehensive PLAN J coverage (Stage E)
-version: "0.5.0"
+version: "0.6.0"
 remote: false
 verbose_notifier: true
 prefix: "PSuite"

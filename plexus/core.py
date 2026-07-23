@@ -5232,7 +5232,18 @@ class Plexus(EventMixin):
                             not endpoint.get("accessible_by_other_plugins", False)
                             and plugin.plugin_uuid != requester_id
                         ):
-                            pass
+                            # B-061: a denied cross-plugin access otherwise leaves
+                            # no trace. "candidate" because this is inside the
+                            # plugin loop; an unfiltered lookup may deny one
+                            # candidate before resolving (in practice callers pass
+                            # target_plugin, so the loop yields one candidate).
+                            self._logger.debug(
+                                f"find_endpoint: candidate '{plugin.plugin_name}' "
+                                f"denied for access_name '{access_name}': endpoint is "
+                                f"not accessible_by_other_plugins and requester "
+                                f"{requester_id} is not its owner "
+                                f"({plugin.plugin_uuid})"
+                            )
                         else:
                             return plugin, endpoint, None
 
@@ -5382,6 +5393,14 @@ class Plexus(EventMixin):
             )
 
             if not plugin:
+                # B-060: on a fire-and-forget publish_event fan-out the error
+                # result is discarded, so a subscriber whose target endpoint is
+                # missing fails silently. Trace it (kind makes the fan-out case
+                # greppable). Execute/request_event callers also get the error.
+                self._logger.debug(
+                    f"Request {request.id}: endpoint '{function_name}' not found "
+                    f"(plugin={plugin_name}, kind={request.kind})"
+                )
                 await self._set_request_result(
                     request, f"Endpoint {function_name} not found", True
                 )
@@ -5511,6 +5530,22 @@ class Plexus(EventMixin):
                         if isinstance(e, RequestException)
                         else f"{type(e).__name__}: {e}"
                     )
+                    # B-062: a fire-and-forget publish_event fan-out discards the
+                    # error result, so an UNEXPECTED subscriber handler crash is
+                    # otherwise invisible. Surface it. Designed control-flow
+                    # rejects (RateLimit/Capability and other RequestException
+                    # subtypes) are excluded: the rate-limit IN-admit gate raises
+                    # RateLimitException before the handler runs and is already
+                    # logged at WARNING. Execute/request_event surface the error to
+                    # their awaiting caller, so only publish_event needs this.
+                    if request.kind == "publish_event" and not isinstance(
+                        e, RequestException
+                    ):
+                        self._logger.error(
+                            f"publish_event subscriber "
+                            f"{plugin_name}.{function_name} crashed for request "
+                            f"{request.id}: {type(e).__name__}: {e}"
+                        )
                     await self._set_request_result(request, err, True)
                     return
 
