@@ -42,7 +42,7 @@ from plexus.runtime import _EMIT_DEPTH, _MAX_EMIT_DEPTH  # noqa: E402
 from _test_helpers import CaseRecorder  # noqa: E402
 
 
-SUITE_VERSION = "0.3.0"
+SUITE_VERSION = "0.3.1"
 
 
 # --- events stubs -----------------------------------------------------------
@@ -404,6 +404,12 @@ class TestAuditPortUnitSuite(Plugin):
                 ("remote", None, AH, True, "hosts=remote accepts (602)"),
                 (AH, None, AH, True, "hosts=str==author_host accepts (607)"),
                 (OTHER, None, AH, False, "hosts=str!=author_host rejects (607)"),
+                # EQUALITY, not substring: hosts is a prefix of author_host.
+                # 607 is `==`; a `==`->`in` mutation (sub_hosts in author_host,
+                # "peer" in "peerA") would wrongly accept. AH/OTHER can't catch
+                # that (neither is a substring of the other), so pin it here.
+                ("peer", None, "peerA", False,
+                 "hosts prefix of author_host: == rejects, not substring (607)"),
                 ([AH], None, AH, True, "hosts=[author_host] accepts (610)"),
                 ([OTHER], None, AH, False, "hosts=[other] rejects"),
                 (["any"], None, AH, True, "hosts=[any] accepts (611)"),
@@ -419,7 +425,19 @@ class TestAuditPortUnitSuite(Plugin):
                 ("any", AH, AH, False, "blocked=str==author_host rejects (624)"),
                 ("any", OTHER, AH, True,
                  "blocked=str!=author_host falls through to accept (634)"),
+                # EQUALITY, not substring, on the blocked side: blocked "peerA"
+                # vs author "peer". 624 is `==`; a `==`->`in` mutation
+                # (author_host in sub_blocked, "peer" in "peerA") would wrongly
+                # block. Expected accept (they are not equal).
+                ("any", "peerA", "peer", True,
+                 "blocked longer than author_host: == accepts, not substring (624)"),
                 ("any", [AH], AH, False, "blocked=[author_host] rejects (630)"),
+                # blocked LIST containing the literal "any"/"remote" rejects,
+                # independent of author_host (628/629). The hosts-list side
+                # tests these; the blocked-list side must too, else an impl that
+                # dropped the two `in` checks would pass every other row.
+                ("any", ["any"], AH, False, "blocked=[any] list rejects (628)"),
+                ("any", ["remote"], AH, False, "blocked=[remote] list rejects (629)"),
                 ("any", [OTHER], AH, True, "blocked=[other] accepts"),
                 ("any", [], AH, True, "blocked=[] empty list accepts"),
                 # ASYMMETRY: a wrong-type `hosts` REJECTS (614) but a wrong-type

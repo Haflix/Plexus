@@ -51,9 +51,10 @@ class NetFixTarget(Plugin):
         # B-092: a hosts="local" sub used ONLY by the net_hostile receiver-gate
         # cell. It opts out of remote publishers, so an inbound FANOUT/FIRST
         # from a peer must be rejected by _sub_accepts_remote_publisher at the
-        # RECEIVER (manager.py:638). Being hosts="local" it never advertises
-        # (remote_eligible=False, manager.py:527), so it adds no directory
-        # surface and cannot affect any other cell's routing/counts.
+        # RECEIVER (manager.py:638). Being hosts="local" it is
+        # remote_eligible=False (manager.py:527), so the serve-time export
+        # filter (directory.py:184) drops it: invisible in peers' snapshots and
+        # content_hash, so it cannot affect any other cell's routing/counts.
         lsid = await self._plexus.subscribe_event(
             "fix/localonly", self.plugin_name, self.plugin_uuid,
             target_access_name="fix_probe_handler", hosts="local",
@@ -129,10 +130,16 @@ class NetFixTarget(Plugin):
         gate (manager.py:638) rather than to a missing/typo'd sub. Checks the
         registry directly (an execute, not a gated event) so the gate under
         test is not involved in the existence proof itself."""
+        # Check topic + enabled + TARGET: "exists on the right topic" alone
+        # would let a sub mis-wired to a non-answering handler pass the
+        # existence control while the negative ('no pong') passes for the wrong
+        # reason. Pin that it routes to fix_probe_handler — the same handler the
+        # cell's fix/probe control proves answers end-to-end.
         subs = await self._plexus.topic_registry.list_local_subs()
         return any(
             getattr(s, "topic_pattern", None) == "fix/localonly"
             and getattr(s, "enabled", True)
+            and getattr(s, "target_access_name", None) == "fix_probe_handler"
             for s in subs
         )
 

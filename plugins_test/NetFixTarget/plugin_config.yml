@@ -1,5 +1,5 @@
 description: Wave-2 cross-node service fixture (remote=True) — unary/echo/tag/stream endpoints + slow-handler flag + networkish raiser + rate control + fan-out topic handlers, for the networking-rewrite socket cells
-version: 0.1.3
+version: 0.1.4
 remote: True
 arguments:
 subscriptions:
