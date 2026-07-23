@@ -41,7 +41,7 @@ from plexus.exceptions import RequestException  # noqa: E402
 from _test_helpers import CaseRecorder  # noqa: E402
 
 
-SUITE_VERSION = "0.4.0"
+SUITE_VERSION = "0.5.0"
 TARGET = "TestExecuteTarget"
 TARGET2 = "TestExecuteTarget2"
 
@@ -100,6 +100,7 @@ class TestExecuteSuite(Plugin):
         await self._basic_hosts_validation(rec, kw)
         await self._basic_blocked_hosts_behavior(rec, kw)
         await self._basic_timeout(rec, kw)
+        await self._b089_timeout_zero_unbounded(rec, kw)
         await self._basic_accessibility(rec, kw)
         await self._basic_sync(rec, kw)
         await self._basic_multi_instance(rec, kw)
@@ -573,6 +574,32 @@ class TestExecuteSuite(Plugin):
             "exec.timeout.hang_with_timeout", body_hang_with_timeout,
             hosts=("local", "remote"), tags=("timeout",),
             hard_timeout_s=15.0, **kw,
+        )
+
+    async def _b089_timeout_zero_unbounded(self, rec: CaseRecorder, kw: Dict) -> None:
+        # B-089: a per-call timeout of 0 must normalize to None (= unbounded),
+        # matching the None contract, at BOTH request constructors. Guards the
+        # utils.py normalization so no downstream reader can ever see a bare 0
+        # again — the sync-gen `is not None` gate (core.py) and the remote
+        # deadline / wire handler_timeout paths all treated 0 as "immediate"
+        # before the fix.
+        async def body(c):
+            from plexus.utils import Request, GeneratorRequest
+            c.expect(Request("h", "p", "m", timeout=0).timeout_duration, None)
+            c.expect(
+                GeneratorRequest("h", "p", "m", timeout=0).timeout_duration, None
+            )
+            # wire tuple form (duration, created_at) normalizes on the duration
+            c.expect(
+                Request("h", "p", "m", timeout=(0, 123.0)).timeout_duration, None
+            )
+            # positive values and None pass through untouched
+            c.expect(Request("h", "p", "m", timeout=2.5).timeout_duration, 2.5)
+            c.expect(Request("h", "p", "m", timeout=None).timeout_duration, None)
+
+        await rec.run_case(
+            "exec.B-089.timeout_zero_is_unbounded", body,
+            tags=("timeout",), bug_ids=("B-089",), **kw,
         )
 
     # ====================================================================

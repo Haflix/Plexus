@@ -426,6 +426,7 @@ async def run_tests() -> int:
                     "TestRateLimitConfigUnitSuite",
                     "TestRateLimiterUnitSuite",
                     "TestDepResolutionUnitSuite",
+                    "TestDepResolutionSuite",
                     "TestAuditPortUnitSuite",
                     "TestNetPairUnitSuite",
                     "TestNetcoreUnitSuite",

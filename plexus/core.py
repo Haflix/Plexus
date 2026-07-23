@@ -2279,8 +2279,26 @@ class Plexus(EventMixin):
     async def load_plugin_with_conf(self, plugin_entry: list) -> None:
 
         async def error_config(message):
+            # B-094: a config-level load failure is fatal, exactly like an
+            # on_load raise (fail-fast boot policy; see the on_load path below).
+            # Record a FAILED_LOAD diagnostic (create the state entry first when
+            # the failure fired before the pre-create block), then raise
+            # ConfigException so the boot aborts and _reload_plugin's
+            # reload_failed alert fires -- instead of silently popping + continuing.
             self._logger.error(f"Plugin '{name}': {message}")
-            await self.pop_plugin(name)
+            if name not in self.plugin_states:
+                self.plugin_states[name] = PluginState(
+                    name=name, state=State.UNLOADED
+                )
+            self.plugin_states[name].last_errors[Phase.LOAD] = ErrorRecord(
+                exception_type="plexus.exceptions.ConfigException",
+                exception_repr=message,
+                traceback="",
+                ts=time.time(),
+            )
+            if self.plugin_states[name].state != State.FAILED_LOAD:
+                self._transition_plugin(name, State.FAILED_LOAD)
+            raise ConfigException(f"Plugin '{name}': {message}")
 
         async def warn_config(message):
             self._logger.warning(f"Plugin '{name}': {message}")

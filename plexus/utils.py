@@ -2315,10 +2315,14 @@ class Request:
         # backwards-compat with older peers but IGNORE its second element;
         # the receiver always anchors the deadline to its own monotonic
         # clock at construction time.
+        # B-089: a per-call timeout of 0 means NO timeout (unbounded), same as
+        # None. Normalize 0 -> None here so every downstream reader agrees (the
+        # truthiness gates, the sync-gen `is not None` gate, and the remote
+        # `deadline=` / wire `handler_timeout` paths all treat None as unbounded).
         if type(timeout) == tuple:
-            self.timeout_duration = timeout[0]
+            self.timeout_duration = timeout[0] or None
         else:
-            self.timeout_duration = timeout
+            self.timeout_duration = timeout or None
         self.created_at = self.timestamp
         self.created_at_mono = time.monotonic()
 
@@ -2485,10 +2489,14 @@ class GeneratorRequest:
         # cannot warp the budget. The tuple form is still accepted for
         # wire backwards-compat with older peers but its sender-side
         # ``created_at`` is discarded.
+        # B-089: a per-call timeout of 0 means NO timeout (unbounded), same as
+        # None. Normalize 0 -> None here so every downstream reader agrees (the
+        # truthiness gates, the sync-gen `is not None` gate, and the remote
+        # `deadline=` / wire `handler_timeout` paths all treat None as unbounded).
         if type(timeout) == tuple:
-            self.timeout_duration = timeout[0]
+            self.timeout_duration = timeout[0] or None
         else:
-            self.timeout_duration = timeout
+            self.timeout_duration = timeout or None
         self.created_at = self.timestamp
         self.created_at_mono = time.monotonic()
 

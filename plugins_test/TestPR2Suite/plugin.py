@@ -30,11 +30,12 @@ from typing import Any, Dict, List, Optional  # noqa: E402
 from plexus.utils import Plugin  # noqa: E402
 from plexus.decorators import async_log_errors, log_errors  # noqa: E402
 from plexus.core import apply_overrides  # noqa: E402
+from plexus.exceptions import ConfigException  # noqa: E402
 
 from _test_helpers import CaseRecorder  # noqa: E402
 
 
-SUITE_VERSION = "0.1.1"
+SUITE_VERSION = "0.2.0"
 
 # Fixture plugin names (must match test_config.yml entries)
 FIXTURE        = "TestPR2Fixture"
@@ -110,8 +111,13 @@ class TestPR2Suite(Plugin):
         return None
 
     async def _ensure_unloaded(self, name: str) -> None:
-        """Pop a fixture if it somehow ended up loaded (cleanup helper)."""
-        if name in self._plexus.plugins:
+        """Pop a fixture if it somehow ended up loaded (cleanup helper).
+
+        B-094: a fail-fast config error leaves a FAILED_LOAD plugin_states entry
+        with no live instance, so clear a lingering state entry too, not just a
+        live instance. pop_plugin is a no-op for an already-UNLOADED config entry.
+        """
+        if name in self._plexus.plugins or name in self._plexus.plugin_states:
             try:
                 await self._plexus.pop_plugin(name)
             except Exception:
@@ -142,14 +148,11 @@ class TestPR2Suite(Plugin):
     async def _case01_list_form_rejected(self, rec: CaseRecorder, kw: dict) -> None:
         async def body(c):
             await self._ensure_unloaded(LIST_FIXTURE)
-            loaded = await self._load_fixture(LIST_FIXTURE)
-            # The plugin should NOT be present — error_config calls pop_plugin
-            if loaded:
-                c.set_marker("plugin_loaded_despite_list_form")
-                raise AssertionError(
-                    "list-form endpoints should cause load failure "
-                    "but plugin ended up in core.plugins"
-                )
+            # B-094: config-level load failures now fail fast —
+            # load_plugin_with_conf raises ConfigException (previously it logged
+            # + popped silently and the plugin was merely absent).
+            c.expect_exception(ConfigException, match=r"list-form")
+            await self._load_fixture(LIST_FIXTURE)
 
         await rec.run_case(
             "pr2.config.list_form_endpoints_rejected",
@@ -411,15 +414,10 @@ class TestPR2Suite(Plugin):
                     }
                 }
             }
-            loaded = await self._load_fixture(FIXTURE, overrides=overrides)
-            if loaded:
-                c.set_marker("plugin_loaded_despite_missing_required_fields")
-                await self._ensure_unloaded(FIXTURE)
-                raise AssertionError(
-                    "__replace__ with missing required fields (remote, "
-                    "accessible_by_other_plugins) should cause fail-load (C12) "
-                    "but plugin ended up in core.plugins"
-                )
+            # B-094: fail-fast — __replace__ omitting required fields now raises
+            # ConfigException (C12; was: silent pop, plugin absent).
+            c.expect_exception(ConfigException, match=r"is missing")
+            await self._load_fixture(FIXTURE, overrides=overrides)
 
         await rec.run_case(
             "pr2.apply_overrides.replace_missing_required_fields_error",

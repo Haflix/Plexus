@@ -408,7 +408,8 @@ callers can react to legitimate plugin/network failures.
 `execute()` takes three more optional keywords:
 
 - `timeout` (float, default `None`) bounds the call; the request fails
-  if the target does not return in time.
+  if the target does not return in time. A value of `0` means no timeout
+  (unbounded), the same as `None`.
 - `author` / `author_id` assert a caller identity. They default to your
   own `plugin_name` / `plugin_uuid`, so leave them unset for normal
   calls. Overriding them is identity assertion for the capability gate;
@@ -626,7 +627,7 @@ Each plugin tracked by the framework follows a 6-state machine:
 | `ENABLING` | `on_enable` in progress. |
 | `ENABLED` | `on_enable` returned. Endpoints dispatchable. |
 | `DISABLING` | `on_disable` in progress. |
-| `FAILED_LOAD` | `on_load` raised, or a dependency constraint failed. No instance. `last_errors[Phase.LOAD]` populated for the `on_load` case. At boot an `on_load` raise aborts startup outright (plugins listed after it never load), so keep `on_load` unfailable and put anything that can fail in `on_enable`. See [architecture.md](./architecture.md#on_loadself-args-kwargs--synchronous). |
+| `FAILED_LOAD` | `on_load` raised, a config/manifest validation failure occurred (bad `path:`, malformed manifest, bad `endpoints`/`dependencies`/`events`/`subscriptions`/`rate_limits`, rejected override), or a dependency constraint failed. No instance. `last_errors[Phase.LOAD]` populated. At boot any of these aborts startup outright (plugins listed after it never load), so keep `on_load` unfailable and put anything that can fail in `on_enable`. See [architecture.md](./architecture.md#on_loadself-args-kwargs--synchronous). |
 
 Read state with `plx.plugin_states[name].state`. The state enum lives in
 [`plexus/plugin_state.py`](../plexus/plugin_state.py); import as

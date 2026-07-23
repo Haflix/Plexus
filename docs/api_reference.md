@@ -112,7 +112,7 @@ Each method below has signature, args, return, raises, and behaviour notes. The 
 | `blocked_hosts` | `str \| list \| None` | `None` | Same shape as `hosts`. |
 | `author` | `str \| None` | `None` | Caller-side author identity for filter chains. When `None`, substituted with the calling plugin's own `plugin_name`. |
 | `author_id` | `str \| None` | `None` | Caller-side author uuid. When `None`, substituted with the calling plugin's own `plugin_uuid`. |
-| `timeout` | `float \| None` | `None` | Per-call deadline. Framework-level default if `None`. |
+| `timeout` | `float \| None` | `None` | Per-call deadline. A value of `0` means no timeout (unbounded), the same as `None`. Framework-level default if `None`. |
 
 **Returns** Whatever the endpoint returns.
 
@@ -191,7 +191,7 @@ Local subs are tried first, in insertion order. On no local match, remote candid
 | `topic_vars` | `Dict[str, str] \| None` | `None` | See constraints below. |
 | `hosts` | `str \| list \| None` | `None` | Override the manifest's `hosts:`. When both the caller and the manifest leave `hosts` as `None`, the publisher coerces to `"local"`. |
 | `blocked_hosts` | `str \| list \| None` | `None` | Override the manifest's `blocked_hosts:`. |
-| `timeout` | `float \| None` | `None` | Per-call deadline. |
+| `timeout` | `float \| None` | `None` | Per-call deadline. A value of `0` means no timeout (unbounded), the same as `None`. |
 
 **Returns** Whatever the matched handler returns.
 
@@ -383,7 +383,7 @@ From `plexus.exceptions` (also re-exported from the top-level `plexus` package).
 
 | Class                     | Base               | Raised when                                                                                                                                              |
 |---------------------------|--------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `ConfigException`         | `Exception`        | `ConfigUtil.check_config_integrity` finds a missing required section.                                                                                    |
+| `ConfigException`         | `Exception`        | `ConfigUtil.check_config_integrity` finds a missing required section, or a plugin's config/manifest fails validation during load (bad path, unreadable manifest, malformed `endpoints`/`dependencies`/`events`/`subscriptions`/`rate_limits`, or a bad override). A config-level load failure is fatal at boot and records the plugin as `FAILED_LOAD`. |
 | `RequestException`        | `Exception`        | Any plugin-call failure: endpoint not found, target not ready, method-shape mismatch, target raised, circular sync call, no event subscriber matches, event disabled, framework-not-started guard. |
 | `NetworkRequestException` | `RequestException` | Network-level failure during a remote dispatch (connection error, peer error, timeout).                                                                  |
 | `NoLocalSubException`     | `RequestException` | Peer signals "no local sub matched" on a remote `request_event` / `request_event_stream`. Distinct subclass so request-event fall-through preserves order. |
