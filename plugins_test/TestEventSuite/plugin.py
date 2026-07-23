@@ -41,7 +41,7 @@ from plexus.exceptions import RequestException  # noqa: E402
 from _test_helpers import CaseRecorder  # noqa: E402
 
 
-SUITE_VERSION = "0.4.0"
+SUITE_VERSION = "0.5.0"
 
 TARGET = "TestEventTarget"
 BAD_ACTOR = "TestEventBadActor"
@@ -147,6 +147,7 @@ class TestEventSuite(Plugin):
         await self._basic_request_cleanup(rec, kw)
         await self._basic_hard_removal(rec, kw)
         await self._basic_edge(rec, kw)
+        await self._b092_bogus_target_plugin_uuid(rec, kw)
 
         return rec.to_dict()
 
@@ -1669,4 +1670,71 @@ class TestEventSuite(Plugin):
             body_static_topic_no_topic_vars,
             tags=("basic", "edge"),
             **kw,
+        )
+
+    # ====================================================================
+    # B-092: target_plugin_uuid instance pin
+    # ====================================================================
+
+    async def _b092_bogus_target_plugin_uuid(
+        self, rec: CaseRecorder, kw: Dict
+    ) -> None:
+        # B-092 #3: a sub's `target_plugin_uuid` pins delivery to a specific
+        # instance. The fan-out feeds it to find_endpoint as plugin_uuid
+        # (events.py:1191), where the uuid-exact gate (core.py:5223) applies.
+        # Only POSITIVE uses of target_plugin_uuid existed; a BOGUS pin must
+        # NOT silently fall back to a name match. Routes to the suite's own
+        # handle_smoke_request (a value-returning handler) on a dedicated topic
+        # with no standing sub, so the runtime sub is the sole answerer.
+        TOPIC = "test_event/req/uuidpin"
+        EV = "req_uuidpin_event"
+
+        async def _add(pin):
+            return await self._plexus.subscribe_event(
+                TOPIC, self.plugin_name, self.plugin_uuid,
+                target_access_name="handle_smoke_request",
+                target_plugin=self.plugin_name,
+                target_plugin_uuid=pin,
+            )
+
+        async def body_real_pin_delivers(c):
+            # Control: the REAL suite uuid pins this instance -> delivered.
+            sid = await _add(self.plugin_uuid)
+            try:
+                r = await self.request_event(EV, payload={"q": "ping"}, timeout=2.0)
+                c.expect(r, {"echo": "ping"})
+            finally:
+                try:
+                    await self._plexus.unsubscribe_event(sid)
+                except Exception:
+                    pass
+
+        async def body_bogus_pin_rejected(c):
+            # A pin that matches no live instance: the sub still matches the
+            # topic, but dispatch finds no endpoint (uuid-exact), so
+            # request_event raises rather than answering via a name fallback.
+            sid = await _add("bogus-uuid-matches-no-instance")
+            try:
+                # match="not found" so a NO-SUBSCRIBER-match RequestException
+                # (message "no local subscriber matches...") can't satisfy this
+                # for the wrong reason — only the uuid-gate reject, whose
+                # find_endpoint message is "Endpoint ... not found"
+                # (core.py:5402), does.
+                c.expect_exception(RequestException, match="not found")
+                await self.request_event(EV, payload={"q": "ping"}, timeout=2.0)
+            finally:
+                try:
+                    await self._plexus.unsubscribe_event(sid)
+                except Exception:
+                    pass
+
+        await rec.run_case(
+            "event.dispatch.target_plugin_uuid_real_pin_delivers",
+            body_real_pin_delivers,
+            tags=("dispatch", "uuid"), bug_ids=("B-092",), **kw,
+        )
+        await rec.run_case(
+            "event.dispatch.target_plugin_uuid_bogus_pin_rejected",
+            body_bogus_pin_rejected,
+            tags=("dispatch", "uuid"), bug_ids=("B-092",), **kw,
         )

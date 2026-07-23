@@ -41,7 +41,7 @@ from plexus.exceptions import RequestException  # noqa: E402
 from _test_helpers import CaseRecorder  # noqa: E402
 
 
-SUITE_VERSION = "0.3.0"
+SUITE_VERSION = "0.4.0"
 TARGET = "TestExecuteTarget"
 TARGET2 = "TestExecuteTarget2"
 
@@ -755,10 +755,50 @@ class TestExecuteSuite(Plugin):
                     )
 
 
+        async def body_uuid_after_reload(c):
+            # B-092 #7: a plugin_uuid held across a reload must NOT resolve to
+            # the new instance. Reload re-instantiates (new uuid); the endpoint
+            # is still reachable BY NAME, but the stale uuid is uuid-exact
+            # rejected at find_endpoint. (Previously skipped citing a stale
+            # "Phase 4" blocker; _reload_plugin is exercised by other suites
+            # today.) TARGET2 is the multi-instance spare — only used by-name by
+            # later cells, and reload preserves its ENABLED state, so this is a
+            # clean net-zero operation.
+            old = await self.execute(TARGET2, "get_uuid")
+            await self._plexus._reload_plugin(TARGET2)
+            new = await self.execute(TARGET2, "get_uuid")
+            c.expect(new != old, True)
+            # by-name still resolves — to the NEW instance
+            c.expect(await self.execute(TARGET2, "get_uuid", plugin_uuid=new), new)
+            # the STALE uuid is rejected
+            try:
+                await self.execute(TARGET2, "get_uuid", plugin_uuid=old)
+                raise AssertionError(
+                    "stale plugin_uuid after reload was accepted")
+            except RequestException as e:
+                if "not found" not in str(e).lower():
+                    raise AssertionError(
+                        f"unexpected error for stale uuid: {e!r}")
+
+        # NOTE: a pop-then-call cell was considered and dropped. After
+        # pop_plugin the instance is absent from self.plugins, so find_endpoint
+        # never reaches the uuid-exact gate (core.py:5223) — both a by-name and
+        # a held-uuid call fail identically for "plugin gone". That is a
+        # pop-reachability lifecycle property, not the B-092 uuid-exact one the
+        # reload cell above covers; confirmed by negative control (disabling
+        # 5223 does not flip such a cell). It also needed a manual pop+restore
+        # of a shared fixture, a needless landmine. Left out on purpose.
+
         await rec.run_case(
             "exec.contract.find_endpoint_uuid_target_plugin_conflict",
             body_uuid_target_conflict,
             tags=("discovery",), **kw,
+        )
+        await rec.run_case(
+            "exec.contract.uuid_invalidated_after_reload",
+            body_uuid_after_reload,
+            tags=("discovery", "reload"), bug_ids=("B-092",),
+            hard_timeout_s=15.0, **kw,
         )
 
     # ====================================================================
