@@ -627,7 +627,7 @@ Each plugin tracked by the framework follows a 6-state machine:
 | `ENABLING` | `on_enable` in progress. |
 | `ENABLED` | `on_enable` returned. Endpoints dispatchable. |
 | `DISABLING` | `on_disable` in progress. |
-| `FAILED_LOAD` | `on_load` raised, a config/manifest validation failure occurred (bad `path:`, malformed manifest, bad `endpoints`/`dependencies`/`events`/`subscriptions`/`rate_limits`, rejected override), or a dependency constraint failed. No instance. `last_errors[Phase.LOAD]` populated. At boot any of these aborts startup outright (plugins listed after it never load), so keep `on_load` unfailable and put anything that can fail in `on_enable`. See [architecture.md](./architecture.md#on_loadself-args-kwargs--synchronous). |
+| `FAILED_LOAD` | `on_load` raised, a config/manifest validation failure (bad `path:`, malformed manifest, bad `endpoints`/`dependencies`/`events`/`subscriptions`/`rate_limits`, rejected override), or a dependency constraint failed (missing, version-mismatch, or cycle). No instance. An `on_load` raise or a config/manifest failure aborts the boot outright (plugins listed after it never load) and records `last_errors[Phase.LOAD]`; a dependency-resolution failure instead marks only the affected plugin(s) `FAILED_LOAD` while the rest of the boot proceeds, and leaves `last_errors[Phase.LOAD]` empty. Keep `on_load` unfailable and put anything that can fail in `on_enable`. See [architecture.md](./architecture.md#on_loadself-args-kwargs--synchronous). |
 
 Read state with `plx.plugin_states[name].state`. The state enum lives in
 [`plexus/plugin_state.py`](../plexus/plugin_state.py); import as
