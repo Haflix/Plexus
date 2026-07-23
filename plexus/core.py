@@ -2298,6 +2298,12 @@ class Plexus(EventMixin):
             )
             if self.plugin_states[name].state != State.FAILED_LOAD:
                 self._transition_plugin(name, State.FAILED_LOAD)
+            # B-099: a config-level failure that fires AFTER the module import
+            # (no-Plugin-subclass / rate_limits / events / subscriptions shape)
+            # never reaches the teardown path, so purge the stashed loader entry
+            # here so the failed load does not leak sys.modules/sys.path. No-op
+            # for the pre-import failures (nothing stashed yet).
+            self._purge_loader_cleanup(name)
             raise ConfigException(f"Plugin '{name}': {message}")
 
         async def warn_config(message):
@@ -2774,6 +2780,11 @@ class Plexus(EventMixin):
                     name,
                     exc,
                 )
+            # B-099: the module import already stashed a loader-cleanup entry
+            # (before Plugin() ran); a failed/cancelled construction never
+            # reaches teardown, so purge it here to avoid a sys.modules/sys.path
+            # leak + stale-module rebind on a later reload.
+            self._purge_loader_cleanup(name)
             raise
 
         plugin.plugin_name = name
@@ -4057,6 +4068,31 @@ class Plexus(EventMixin):
                 # _lifecycle_ready.clear() at the top (gate blocks).
                 self._transition_plugin(plugin_name, State.INACTIVE)
 
+    def _purge_loader_cleanup(self, plugin_name: str) -> None:
+        """Undo the sys.path + sys.modules additions ``load_plugin_with_conf``
+        recorded in ``_plugin_loader_cleanup`` for a plugin, and drop the entry.
+
+        Called on plugin teardown (``_pop_plugin_under_lock``) AND on a
+        post-import LOAD FAILURE (B-099: the on_load raise + every config-level
+        error_config, which never reach ``self.plugins[name] = plugin`` and so
+        never hit the teardown path). Without it a failed load leaves the
+        imported module objects in ``sys.modules`` + the plugin dir on
+        ``sys.path``; a later reload/re-import can then rebind to the STALE
+        module instead of the freshly-edited file. Idempotent + a no-op when no
+        entry was stashed (e.g. a failure before the import). Defensive getattr
+        for tests that bypass ``__init__`` via ``object.__new__(Plexus)``.
+        """
+        cleanup = getattr(self, "_plugin_loader_cleanup", {}).pop(plugin_name, None)
+        if cleanup is not None:
+            for _mod_name in cleanup["sys_modules_added"]:
+                sys.modules.pop(_mod_name, None)
+            _path_entry = cleanup["sys_path_added"]
+            if _path_entry:
+                try:
+                    sys.path.remove(_path_entry)
+                except ValueError:
+                    pass  # already removed by something else (defensive)
+
     async def _pop_plugin_under_lock(self, plugin_name: str) -> bool:
         """Body of pop_plugin minus the lifecycle_lock acquisition.
 
@@ -4230,18 +4266,8 @@ class Plexus(EventMixin):
         # newly-loaded code mysteriously executing OLD logic. Done outside
         # the plugin_lock above because sys-module mutation is unrelated to
         # the plugin_dict / topic / observer / logger cleanup that needs the
-        # lock. Defensive getattr for tests that bypass __init__ via
-        # object.__new__(Plexus) and never populate _plugin_loader_cleanup.
-        cleanup = getattr(self, "_plugin_loader_cleanup", {}).pop(plugin_name, None)
-        if cleanup is not None:
-            for _mod_name in cleanup["sys_modules_added"]:
-                sys.modules.pop(_mod_name, None)
-            _path_entry = cleanup["sys_path_added"]
-            if _path_entry:
-                try:
-                    sys.path.remove(_path_entry)
-                except ValueError:
-                    pass  # already removed by something else (defensive)
+        # lock.
+        self._purge_loader_cleanup(plugin_name)
 
         # Rate limiter (Step 3): with the plugin removed from self.plugins, a
         # rebuild drops its now-orphan static + Sub-IN buckets and keeps the

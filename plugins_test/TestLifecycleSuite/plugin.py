@@ -33,7 +33,7 @@ from plexus.plugin_state import Phase, State  # noqa: E402  (C-152)
 from _test_helpers import CaseRecorder  # noqa: E402
 
 
-SUITE_VERSION = "0.4.0"
+SUITE_VERSION = "0.5.0"
 VICTIM = "TestLifecycleVictim"
 VICTIM2 = "TestLifecycleVictim2"
 VICTIM_PATH = "./plugins_test/TestLifecycleVictim"
@@ -1318,6 +1318,18 @@ class TestLifecycleSuite(Plugin):
                     # (rename, import error, moved directory) the real cause
                     # must not be swallowed.
                     load_exc = exc
+
+                # B-099: the failed load imported the fixture module (which
+                # stashes a _plugin_loader_cleanup entry) then raised in on_load.
+                # The purge must have run so the entry does not leak — a later
+                # reload could otherwise rebind stale module code. Pre-fix this
+                # entry survived for the rest of the process.
+                c.expect(
+                    LOAD_CRASH in getattr(
+                        self._plexus, "_plugin_loader_cleanup", {}
+                    ),
+                    False,
+                )
 
                 ps = self._plexus.plugin_states.get(LOAD_CRASH)
                 if ps is None:
