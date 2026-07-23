@@ -2319,7 +2319,6 @@ class Plexus(EventMixin):
             )
         except ValueError as e:
             await error_config(str(e))
-            return
 
         if not plugin_entry.get("enabled"):
             self._logger.debug(
@@ -2353,7 +2352,6 @@ class Plexus(EventMixin):
         path = os.path.abspath(path)
         if not os.path.exists(path):
             await error_config(f"Plugin directory missing: {name} ({path})")
-            return
 
         # Load plugin config
         try:
@@ -2363,7 +2361,6 @@ class Plexus(EventMixin):
                 plugin_config = yaml.safe_load(f)
         except Exception as e:
             await error_config(f"Failed loading config for {name}: {e}")
-            return
 
         # Validate plugin config
         for field in [
@@ -2387,7 +2384,6 @@ class Plexus(EventMixin):
         if deps_reason is not None:
             prefix = f".{deps_field}" if deps_field else ""
             await error_config(f"dependencies{prefix}: {deps_reason}")
-            return
         # SHAPE-only identifier check on each dep target. Forward
         # references (cycle plugins pointing at each other before both
         # are loaded) are intentionally legal here; existence checks
@@ -2400,7 +2396,6 @@ class Plexus(EventMixin):
                 _validate_identifier_name(spec.name, context="dependency target")
             except ValueError as e:
                 await error_config(str(e))
-                return
 
         # Early shape check on RAW endpoints config (PR2: dict keyed by
         # access_name). Catches the legacy list-form before override
@@ -2418,13 +2413,11 @@ class Plexus(EventMixin):
                 "removed in PR2. Convert each list entry to a dict entry "
                 "keyed by its access_name."
             )
-            return
         elif not isinstance(endpoints_raw, dict):
             await error_config(
                 f"endpoints: must be a dict keyed by access_name; got "
                 f"{type(endpoints_raw).__name__}."
             )
-            return
 
         # ── Argument override application ────────────────────────────────
         # Base args from plugin_config.yml. Must be dict-or-null.
@@ -2434,7 +2427,6 @@ class Plexus(EventMixin):
                 f"top-level 'arguments' in plugin_config.yml must be a mapping (dict) "
                 f"or omitted; got {type(base_args).__name__}"
             )
-            return
 
         # Detect legacy top-level `arguments:` on the plugin entry — Q22:
         # field was renamed to `overrides.arguments:` in PR2.
@@ -2487,7 +2479,6 @@ class Plexus(EventMixin):
                 )
             except ValueError as e:
                 await error_config(f"override application failed: {e}")
-                return
 
         # Validate MERGED endpoints (post-override). Override-introduced
         # violations (e.g. `__replace__: true` that drops required fields,
@@ -2505,7 +2496,6 @@ class Plexus(EventMixin):
                 f"endpoints (post-override) must be a dict keyed by access_name; "
                 f"got {type(merged_endpoints).__name__}"
             )
-            return
         else:
             for ep_key, endpoint in merged_endpoints.items():
                 # The dict key is the canonical access_name. Validate it.
@@ -2513,14 +2503,12 @@ class Plexus(EventMixin):
                     _validate_identifier_name(ep_key, context="endpoint access_name")
                 except ValueError as e:
                     await error_config(str(e))
-                    return
 
                 if not isinstance(endpoint, dict):
                     await error_config(
                         f"endpoint '{ep_key}': value must be a mapping; got "
                         f"{type(endpoint).__name__}"
                     )
-                    return
 
                 # access_name field on the entry is optional; if present and
                 # different from the dict key, warn and use the key.
@@ -2540,7 +2528,6 @@ class Plexus(EventMixin):
                         await error_config(
                             f"endpoint '{ep_key}' is missing {field} in plugin_config.yml"
                         )
-                        return
 
                 # internal_name optional; if present, validate as str/non-empty/ascii.
                 if "internal_name" in endpoint:
@@ -2551,19 +2538,16 @@ class Plexus(EventMixin):
                             f"{type(iv)} in plugin_config.yml as it must be a "
                             f"{str}"
                         )
-                        return
                     if not iv.strip():
                         await error_config(
                             f"endpoint '{ep_key}': internal_name is empty in "
                             f"plugin_config.yml"
                         )
-                        return
                     if not iv.isascii():
                         await error_config(
                             f"endpoint '{ep_key}': internal_name contains non "
                             f"ascii chars in plugin_config.yml"
                         )
-                        return
 
                 # Type checks for required boolean fields.
                 for check in [
@@ -2576,7 +2560,6 @@ class Plexus(EventMixin):
                             f"{type(endpoint[check[0]])} in plugin_config.yml "
                             f"as it must be a {check[1]}"
                         )
-                        return
 
         merged_args = merged_config.get("arguments")
 
@@ -2725,7 +2708,6 @@ class Plexus(EventMixin):
         )
         if plugin_class is None:
             await error_config(f"No Plugin subclass found in {module_path}")
-            return
 
         # v0.26.0: pre-create state entry BEFORE Plugin(...)
         # so the @property read inside Plugin.__init__ works (returns False
@@ -2885,7 +2867,6 @@ class Plexus(EventMixin):
             )
         except ValueError as e:
             await error_config(f"rate_limits: {e}")
-            return
         plugin._declared_rate_limits = (decl_cfg, decl_sub)
 
         # ── PR3 Stage B: parse events: and subscriptions: sections ─────
@@ -2902,7 +2883,6 @@ class Plexus(EventMixin):
                 f"events: must be a mapping (dict keyed by event_id); got "
                 f"{type(events_cfg).__name__}"
             )
-            return
 
         subs_cfg = merged_config.get("subscriptions")
         if subs_cfg is None:
@@ -2912,7 +2892,6 @@ class Plexus(EventMixin):
                 f"subscriptions: must be a mapping (dict keyed by "
                 f"declared_id); got {type(subs_cfg).__name__}"
             )
-            return
 
         hostname_val = self.hostname
         plugin_events: Dict[str, Dict[str, Any]] = {}
@@ -2921,7 +2900,6 @@ class Plexus(EventMixin):
                 _validate_identifier_name(event_id, context="event_id")
             except ValueError as e:
                 await error_config(str(e))
-                return
             if entry is None:
                 entry = {}
             if not isinstance(entry, dict):
@@ -2929,7 +2907,6 @@ class Plexus(EventMixin):
                     f"events.{event_id}: entry must be a mapping; got "
                     f"{type(entry).__name__}"
                 )
-                return
 
             raw_topic = entry.get("topic")
             if raw_topic is None or not isinstance(raw_topic, str):
@@ -2937,7 +2914,6 @@ class Plexus(EventMixin):
                     f"events.{event_id}: 'topic' field is required and must "
                     f"be a string"
                 )
-                return
 
             # Resolve load-time placeholders (LOCKED J).
             resolved_topic = _resolve_load_time_template(
@@ -2963,7 +2939,6 @@ class Plexus(EventMixin):
                 )
             except ValueError as e:
                 await error_config(str(e))
-                return
 
             # Validate event-entry hosts/blocked_hosts via the same
             # normalizer execute_sync uses (rejects empty list, empty
@@ -2985,7 +2960,6 @@ class Plexus(EventMixin):
                 )
             except ValueError as e:
                 await error_config(str(e))
-                return
 
             entry_dict = {
                 "topic": stripped_topic,
@@ -3002,7 +2976,6 @@ class Plexus(EventMixin):
                 _validate_identifier_name(declared_id, context="declared_id")
             except ValueError as e:
                 await error_config(str(e))
-                return
             if entry is None:
                 entry = {}
             if not isinstance(entry, dict):
@@ -3010,7 +2983,6 @@ class Plexus(EventMixin):
                     f"subscriptions.{declared_id}: entry must be a mapping; "
                     f"got {type(entry).__name__}"
                 )
-                return
 
             raw_topic = entry.get("topic")
             if raw_topic is None or not isinstance(raw_topic, str):
@@ -3018,7 +2990,6 @@ class Plexus(EventMixin):
                     f"subscriptions.{declared_id}: 'topic' field is required "
                     f"and must be a string"
                 )
-                return
 
             target_access = entry.get("target_access_name")
             if (
@@ -3030,7 +3001,6 @@ class Plexus(EventMixin):
                     f"subscriptions.{declared_id}: 'target_access_name' "
                     f"field is required and must be a non-empty string"
                 )
-                return
 
             # Resolve load-time placeholders FIRST (then reject {var} +
             # other invalid shapes). LOCKED J says unknown {var} is left
@@ -3052,7 +3022,6 @@ class Plexus(EventMixin):
                 )
             except ValueError as e:
                 await error_config(str(e))
-                return
 
             # R2-KK-2: filter values may contain load-time templates
             # such as ``hosts: '{hostname}'`` (or per-item in a list).
@@ -3133,7 +3102,6 @@ class Plexus(EventMixin):
                 )
             except ValueError as e:
                 await error_config(str(e))
-                return
 
             # R2-DD-9: validate target_plugin / target_plugin_uuid
             # types BEFORE they are stored. A YAML entry with a
@@ -3147,7 +3115,6 @@ class Plexus(EventMixin):
                     f"subscriptions.{declared_id}: 'target_plugin' must "
                     f"be a non-empty string; got {type(target_plugin).__name__}"
                 )
-                return
 
             target_plugin_uuid = entry.get("target_plugin_uuid")
             if target_plugin_uuid is not None and not isinstance(
@@ -3158,7 +3125,6 @@ class Plexus(EventMixin):
                     f"must be a string or null; got "
                     f"{type(target_plugin_uuid).__name__}"
                 )
-                return
 
             entry_dict = {
                 "topic": stripped_topic,
