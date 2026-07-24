@@ -2011,8 +2011,12 @@ class Plexus(EventMixin):
     async def _resolve_dependencies(self) -> None:
         """Resolve plugin dependencies after load, before enable.
 
-        Boot-only. Hot-reload paths (_reload_plugin) do NOT trigger this
-        — operator restart required to enforce changed deps.
+        Called at boot (load_plugins) AND on hot-reload (_reload_plugin),
+        which reorders it to run BEFORE the re-enable so a reloaded manifest
+        whose newly-unsatisfiable required dep would fail resolution marks the
+        plugin FAILED_LOAD while it is still INACTIVE (a valid transition),
+        instead of ghost-stamping a live ENABLED plugin (HUNT-075). The
+        cascade below only stamps FAILED_LOAD from a VALID source state.
 
         Failed plugins are transitioned to FAILED_LOAD via the two-phase
         protocol: _set_plugin_state_no_emit under plugin_lock, then emit
@@ -2028,6 +2032,11 @@ class Plexus(EventMixin):
         topo order.
         """
         pending_emits = []
+        # HUNT-075: names dropped from the cascade because their current state
+        # is not a valid source for -> FAILED_LOAD (only reachable on reload,
+        # where a live ENABLED plugin or dependent can land in result.failed).
+        # Logged after plugin_lock releases, mirroring pending_emits.
+        pending_skips: List[Tuple[str, State, str]] = []
         # Pre-bind so the post-lock optional_warnings loop doesn't trip
         # UnboundLocalError on a future caller that wraps
         # _resolve_dependencies in try/except (the docstring relies on
@@ -2039,10 +2048,12 @@ class Plexus(EventMixin):
             # plugin_lock serializes against pop_plugin / enable_plugin /
             # disable_plugin / _reload_plugin. It does NOT serialize
             # against _apply_yaml at core.py:1188 (which mutates
-            # self.yaml_config without any lock). Safe at boot only
-            # because hot-reload cannot run before wait_until_ready
-            # returns. Do not generalize this guarantee to runtime
-            # callers without an additional guard.
+            # self.yaml_config without any lock) — a pre-existing
+            # reload/config-reload read race this method neither creates
+            # nor worsens. (The earlier "safe at boot only because
+            # hot-reload cannot run" reasoning was stale: _reload_plugin
+            # DOES call this; the FAILED_LOAD source-state guard below is
+            # what keeps the reload path safe.)
             plugin_versions = {
                 name: self.plugins[name].version
                 for name in self._plugin_deps
@@ -2087,13 +2098,29 @@ class Plexus(EventMixin):
             for failed_name in result.failed:
                 if failed_name not in self.plugin_states:
                     continue
-                # R2-HH-7: both INACTIVE -> FAILED_LOAD and UNLOADED ->
-                # FAILED_LOAD are valid per _VALID_TRANSITIONS (core.py).
-                # A plugin reaching the cascade here may be in either
-                # source state: INACTIVE (normal load succeeded but its
-                # dependency failed resolution) or UNLOADED (the plugin
-                # itself failed to even load and we are now cascading
-                # the failure to its dependents).
+                # R2-HH-7: INACTIVE -> FAILED_LOAD and UNLOADED ->
+                # FAILED_LOAD are valid per _VALID_TRANSITIONS. At boot every
+                # result.failed name is INACTIVE (load ok, dep failed) or
+                # UNLOADED (self failed to load, cascading to dependents).
+                # HUNT-075: on RELOAD _resolve_dependencies runs while the
+                # reloaded plugin AND its reverse-dependents may be live
+                # ENABLED (resolve's BFS cascade drags them into
+                # result.failed). Stamping ENABLED -> FAILED_LOAD is an
+                # INVALID transition that _validate_transition only warns-and-
+                # applies, leaving a live plugin reading enabled=False so
+                # close() skips its on_disable -> ghost-enabled resource leak.
+                # Only stamp when the transition is valid; otherwise leave the
+                # plugin in place and warn (deferred, after the lock).
+                cur = self.plugin_states[failed_name].state
+                if (
+                    State.FAILED_LOAD
+                    not in self._VALID_TRANSITIONS.get(cur, frozenset())
+                    and cur != State.FAILED_LOAD
+                ):
+                    pending_skips.append(
+                        (failed_name, cur, result.failed[failed_name])
+                    )
+                    continue
                 old_state, new_state, ts = self._set_plugin_state_no_emit(
                     failed_name, State.FAILED_LOAD
                 )
@@ -2109,6 +2136,18 @@ class Plexus(EventMixin):
                 f"Plugin '{failed_name}': dependency check failed: {reason}"
             )
             self._emit_plugin_state_change(failed_name, old_state, new_state, ts)
+        for skipped_name, skipped_state, skipped_reason in pending_skips:
+            # HUNT-075: a live/transitioning plugin (reload only) whose deps now
+            # fail. Leaving it in place avoids the ghost-enabled leak; the warning
+            # is the operator signal (it stays ENABLED, so it is NOT surfaced by
+            # the R4-WW-5 FAILED_LOAD dependent scan).
+            self._logger.warning(
+                "Plugin '%s': dependency check failed (%s) but it is currently "
+                "%s — leaving it in place (not stamping FAILED_LOAD from an "
+                "invalid source state). Its required dependency is unsatisfiable; "
+                "reload '%s' to recover.",
+                skipped_name, skipped_reason, skipped_state.value, skipped_name,
+            )
         for warning in result.optional_warnings:
             self._logger.warning(warning)
 
@@ -4665,15 +4704,40 @@ class Plexus(EventMixin):
                     ts=time.time(),
                 )
                 raise
+            # R4-WW-4 / HUNT-075: recompute the dependency graph BEFORE the
+            # re-enable (was after). A reloaded plugin may change its declared
+            # deps (new/removed requirement, new cycle); resolving first means a
+            # now-unsatisfiable required dep stamps the reloaded plugin
+            # FAILED_LOAD while it is still INACTIVE (a VALID transition), so the
+            # re-enable guard below simply skips it — instead of re-enabling the
+            # plugin and then having resolve ghost-stamp a live ENABLED plugin.
+            # Placed AFTER the load try/except above so a resolve raise is not
+            # misclassified as a load failure; kept UNCONDITIONAL (topo must be
+            # recomputed on the not-previously-enabled path too).
+            try:
+                await self._resolve_dependencies()
+            except Exception:
+                # _resolve_dependencies isn't expected to raise on cycles
+                # (it records them in plugin_states); but if a future
+                # variant does, keep reload semantics deterministic.
+                self._logger.critical(
+                    "Plugin %r reload: _resolve_dependencies raised — the "
+                    "in-memory dep topo order may be stale until the next "
+                    "framework restart.",
+                    plugin_name,
+                    exc_info=True,
+                )
+
             if previously_enabled:
                 # C-144: explicit log on the skip path so an operator can
                 # see why a previously-enabled plugin did not come back
                 # ENABLED after reload. _enable_plugin_under_lock returns
                 # silently when the post-load state is not INACTIVE (e.g.
-                # FAILED_LOAD from a dependency mismatch, or UNLOADED
-                # because the plugin entry was removed mid-reload). The
-                # natural happy-path is INACTIVE → ENABLING → ENABLED;
-                # anything else is operator-visible.
+                # FAILED_LOAD from a dependency mismatch — including the
+                # HUNT-075 resolve above — or UNLOADED because the plugin
+                # entry was removed mid-reload). The natural happy-path is
+                # INACTIVE → ENABLING → ENABLED; anything else is
+                # operator-visible.
                 ps_post = self.plugin_states.get(plugin_name)
                 if ps_post is None or ps_post.state != State.INACTIVE:
                     state_label = (
@@ -4690,27 +4754,52 @@ class Plexus(EventMixin):
                         state_label,
                     )
                 else:
-                    await self._enable_plugin_under_lock(plugin_name)
-
-            # R4-WW-4: recompute the dependency graph after reload. A
-            # reloaded plugin may have changed its declared dependencies
-            # (new requirements, removed requirements, new cycle). Without
-            # this call self._dep_topo_order would reflect the pre-reload
-            # graph — shutdown order is wrong and freshly-introduced
-            # cycles go undetected until the next full restart.
-            try:
-                await self._resolve_dependencies()
-            except Exception:
-                # _resolve_dependencies isn't expected to raise on cycles
-                # (it records them in plugin_states); but if a future
-                # variant does, keep reload semantics deterministic.
-                self._logger.critical(
-                    "Plugin %r reload: _resolve_dependencies raised — the "
-                    "in-memory dep topo order may be stale until the next "
-                    "framework restart.",
-                    plugin_name,
-                    exc_info=True,
-                )
+                    # HUNT-076: mirror the boot enable-time dep precheck
+                    # (start_plugins). Reload previously called
+                    # _enable_plugin_under_lock directly, which gates only on
+                    # the plugin's OWN state — so a reloaded dependent whose
+                    # required dep was meanwhile disabled would re-run its
+                    # on_enable against a down dependency. Refuse to re-enable
+                    # when a required dep is not ENABLED; mark FAILED_LOAD
+                    # (boot parity + operator-visible via last_errors[LOAD]).
+                    unmet = [
+                        s.name
+                        for s in self._plugin_deps.get(plugin_name, [])
+                        if not s.optional and s.name != PLEXUS_SELF_NAME
+                        and (
+                            self.plugin_states.get(s.name) is None
+                            or self.plugin_states[s.name].state != State.ENABLED
+                        )
+                    ]
+                    if unmet:
+                        cascade_reason = (
+                            f"required dep(s) {sorted(unmet)!r} did not reach "
+                            f"ENABLED (reload enable-time cascade)"
+                        )
+                        async with self.plugin_lock:
+                            old_state, new_state, ts = (
+                                self._set_plugin_state_no_emit(
+                                    plugin_name, State.FAILED_LOAD
+                                )
+                            )
+                            self.plugin_states[plugin_name].last_errors[
+                                Phase.LOAD
+                            ] = ErrorRecord(
+                                exception_type="plexus.exceptions.PluginDependencyError",
+                                exception_repr=cascade_reason,
+                                traceback="",
+                                ts=ts,
+                            )
+                        self._logger.error(
+                            "[RELOAD] plugin %r not re-enabled: %s",
+                            plugin_name,
+                            cascade_reason,
+                        )
+                        self._emit_plugin_state_change(
+                            plugin_name, old_state, new_state, ts
+                        )
+                    else:
+                        await self._enable_plugin_under_lock(plugin_name)
 
             # Rate limiter (Step 3): the reloaded plugin has brand-new endpoint
             # dicts + freshly-registered subs, so any cached charge-set that

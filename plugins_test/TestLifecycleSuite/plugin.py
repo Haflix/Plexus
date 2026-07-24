@@ -29,11 +29,13 @@ from plexus.utils import Plugin  # noqa: E402
 from plexus.decorators import async_log_errors, log_errors  # noqa: E402
 from plexus.exceptions import RequestException  # noqa: E402
 from plexus.plugin_state import Phase, State  # noqa: E402  (C-152)
+from plexus.dependencies import DependencySpec  # noqa: E402  (HUNT-075/076)
+from packaging.specifiers import SpecifierSet  # noqa: E402  (HUNT-075/076)
 
 from _test_helpers import CaseRecorder  # noqa: E402
 
 
-SUITE_VERSION = "0.5.0"
+SUITE_VERSION = "0.6.0"
 VICTIM = "TestLifecycleVictim"
 VICTIM2 = "TestLifecycleVictim2"
 VICTIM_PATH = "./plugins_test/TestLifecycleVictim"
@@ -99,6 +101,7 @@ class TestLifecycleSuite(Plugin):
         await self._basic_logger_levels_skip(rec, kw)
         await self._basic_async_reload_skip(rec, kw)
         await self._state_machine_coverage(rec, kw)  # C-152
+        await self._hunt075_076_reload_deps(rec, kw)  # HUNT-075/076 reload dep fix
         # B-073: B-006 case deleted (tested
         # _running_loop_task which was killed in Step 4). Done-callback
         # eviction removes the entire failure mode the case guarded
@@ -1451,3 +1454,46 @@ class TestLifecycleSuite(Plugin):
             if entry.get("name") == name:
                 return entry
         return None
+
+    # ====================================================================
+    # HUNT-075 / HUNT-076 — reload dependency ordering (fix 0.79.0)
+    # ====================================================================
+
+    async def _hunt075_076_reload_deps(self, rec: CaseRecorder, kw: Dict) -> None:
+        await self._hunt075_ghost_stamp_guard(rec, kw)
+
+    async def _hunt075_ghost_stamp_guard(self, rec: CaseRecorder, kw: Dict) -> None:
+        async def body(c):
+            px = self._plexus
+            await self._ensure_victim_clean()  # VICTIM ENABLED
+            ps = px.plugin_states.get(VICTIM)
+            c.expect(ps is not None and ps.state == State.ENABLED, True)
+            saved = px._plugin_deps.get(VICTIM)
+            try:
+                # Inject a required dep on a plugin that does not exist ->
+                # _resolve_dependencies puts the live ENABLED VICTIM in
+                # result.failed (missing dep). HUNT-075: the cascade guard must
+                # NOT stamp it FAILED_LOAD (that flips plugin.enabled to False ->
+                # close() skips on_disable -> ghost-enabled resource leak). It
+                # must stay ENABLED (with a deferred warning).
+                px._plugin_deps[VICTIM] = [
+                    DependencySpec(
+                        name="__hunt075_absent__",
+                        version=SpecifierSet(""), optional=False,
+                    )
+                ]
+                await px._resolve_dependencies()
+                ps2 = px.plugin_states.get(VICTIM)
+                if ps2 is None or ps2.state != State.ENABLED:
+                    raise AssertionError(
+                        f"HUNT-075: live ENABLED {VICTIM!r} was stamped "
+                        f"{ps2.state.value if ps2 else None} by dependency "
+                        f"resolution — ghost-enabled leak (must stay ENABLED)."
+                    )
+            finally:
+                if saved is None:
+                    px._plugin_deps.pop(VICTIM, None)
+                else:
+                    px._plugin_deps[VICTIM] = saved
+                await px._resolve_dependencies()  # restore the real graph
+        await rec.run_case("lifecycle.hunt075_ghost_stamp_guard", body, **kw)
