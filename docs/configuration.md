@@ -105,8 +105,10 @@ plugins:
         token: "<dev-token>"
 ```
 
-Other plugins target a specific instance by name (and optionally by
-`plugin_uuid` if multiple instances share a name in advanced setups):
+Plugin `name`s must be unique within a host — two `plugins:` entries that
+share a `name` are rejected at config load (`ConfigException`). Other plugins
+target a specific instance by name; `plugin_uuid` disambiguates only when the
+same name legitimately exists on multiple NODES:
 
 ```python
 # Target by name (the common case):
