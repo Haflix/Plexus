@@ -56,6 +56,20 @@ plugins:
     enabled: true
     path: ./plugins_test/TestLifecycleVictim
 
+  # HUNT-076 fixture pair: DepChild declares a REQUIRED dep on DepBase in its
+  # manifest, so at boot (DepBase ENABLED) DepChild boots ENABLED. The
+  # lifecycle.hunt076_reload_dep_precheck case disables DepBase, reloads
+  # DepChild, and asserts the reload precheck refuses to re-enable it against a
+  # down required dep (FAILED_LOAD). DepBase listed first so it loads before
+  # DepChild's dep resolves.
+  - name: TestLifecycleDepBase
+    enabled: true
+    path: ./plugins_test/TestLifecycleDepBase
+
+  - name: TestLifecycleDepChild
+    enabled: true
+    path: ./plugins_test/TestLifecycleDepChild
+
   # B-007 fixture: plugin_config.yml with NO version field. Stays
   # enabled:false and is loaded ON DEMAND by lifecycle.B-007 — see B-093.
   # If B-007 regressed while this booted, the KeyError would abort the load

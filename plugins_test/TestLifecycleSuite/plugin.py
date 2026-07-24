@@ -35,7 +35,7 @@ from packaging.specifiers import SpecifierSet  # noqa: E402  (HUNT-075/076)
 from _test_helpers import CaseRecorder  # noqa: E402
 
 
-SUITE_VERSION = "0.6.0"
+SUITE_VERSION = "0.7.0"
 VICTIM = "TestLifecycleVictim"
 VICTIM2 = "TestLifecycleVictim2"
 VICTIM_PATH = "./plugins_test/TestLifecycleVictim"
@@ -1461,6 +1461,7 @@ class TestLifecycleSuite(Plugin):
 
     async def _hunt075_076_reload_deps(self, rec: CaseRecorder, kw: Dict) -> None:
         await self._hunt075_ghost_stamp_guard(rec, kw)
+        await self._hunt076_reload_dep_precheck(rec, kw)
 
     async def _hunt075_ghost_stamp_guard(self, rec: CaseRecorder, kw: Dict) -> None:
         async def body(c):
@@ -1497,3 +1498,67 @@ class TestLifecycleSuite(Plugin):
                     px._plugin_deps[VICTIM] = saved
                 await px._resolve_dependencies()  # restore the real graph
         await rec.run_case("lifecycle.hunt075_ghost_stamp_guard", body, **kw)
+
+    async def _hunt076_reload_dep_precheck(self, rec: CaseRecorder, kw: Dict) -> None:
+        BASE = "TestLifecycleDepBase"
+        CHILD = "TestLifecycleDepChild"
+
+        async def body(c):
+            px = self._plexus
+            # Preconditions: the fixture pair booted ENABLED (CHILD requires BASE
+            # in its manifest; BASE is enabled -> CHILD enabled). Recover CHILD if
+            # a prior run of this case left it FAILED_LOAD.
+            if (px.plugin_states.get(CHILD) is None
+                    or px.plugin_states[CHILD].state != State.ENABLED):
+                try:
+                    await px._reload_plugin(CHILD)
+                except Exception:
+                    pass
+            bps = px.plugin_states.get(BASE)
+            base_was_enabled = bps is not None and bps.state == State.ENABLED
+            cps = px.plugin_states.get(CHILD)
+            if cps is None or cps.state != State.ENABLED:
+                raise AssertionError(
+                    f"precondition: {CHILD!r} must be ENABLED before the test; "
+                    f"got {cps.state.value if cps else None}"
+                )
+            try:
+                # Runtime-disable the required dep BASE (disable does NOT cascade,
+                # so CHILD stays ENABLED). Its config entry is still enabled, so
+                # dependency RESOLUTION still sees BASE as available — only the
+                # enable-time precheck can catch that BASE is not ENABLED now.
+                if base_was_enabled:
+                    await px.disable_plugin(BASE)
+                # Reload CHILD.
+                await px._reload_plugin(CHILD)
+                # HUNT-076: the reload precheck must refuse to re-enable CHILD
+                # against a not-ENABLED required dep -> FAILED_LOAD with a
+                # PluginDependencyError ErrorRecord (boot parity, Option B).
+                ps = px.plugin_states.get(CHILD)
+                if ps is None or ps.state != State.FAILED_LOAD:
+                    raise AssertionError(
+                        f"HUNT-076: reloading {CHILD!r} while required dep {BASE!r} "
+                        f"is not ENABLED must end FAILED_LOAD; got "
+                        f"{ps.state.value if ps else None} (re-enabled against a "
+                        f"down required dependency)."
+                    )
+                err = (ps.last_errors or {}).get(Phase.LOAD)
+                if err is None or "enable-time cascade" not in (
+                    err.exception_repr or ""
+                ):
+                    raise AssertionError(
+                        f"HUNT-076: expected a reload enable-time-cascade "
+                        f"ErrorRecord on {CHILD!r}; got {err!r}"
+                    )
+            finally:
+                # Restore: re-enable BASE, reload CHILD -> should return ENABLED.
+                if base_was_enabled:
+                    try:
+                        await px.enable_plugin(BASE)
+                    except Exception:
+                        pass
+                try:
+                    await px._reload_plugin(CHILD)
+                except Exception:
+                    pass
+        await rec.run_case("lifecycle.hunt076_reload_dep_precheck", body, **kw)
