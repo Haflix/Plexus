@@ -482,6 +482,13 @@ class Plexus(EventMixin):
         # is alive, so it takes the lockless internal helper instead.
         self._config_lock: asyncio.Lock = asyncio.Lock()
 
+        # HUNT-051: serializes _rebuild_charge_sets' snapshot->clear->repopulate
+        # against the runtime subscribe_event _rl_sub_in writer, so a sub added
+        # concurrently with a rebuild cannot lose its Sub-IN charge-set (which
+        # would make _rl_admit_in admit it WITHOUT charge). Lock order:
+        # lifecycle_lock -> _rl_rebuild_lock -> topic_registry._lock.
+        self._rl_rebuild_lock: asyncio.Lock = asyncio.Lock()
+
         # PR3 Stage A: dedicated executor for sync subscriber handlers
         # (Q17 + C3 + C8). Default 4 workers, configurable via
         # `general.sync_dispatcher_workers`. Reads from the live yaml_config
@@ -5828,6 +5835,17 @@ class Plexus(EventMixin):
         )
 
     async def _rebuild_charge_sets(self) -> None:
+        # HUNT-051: hold _rl_rebuild_lock across the ENTIRE rebuild (the empty-config
+        # early-return clear AND the snapshot->clear->repopulate->prune) so it
+        # serializes against subscribe_event's Sub-IN build. Delegated to
+        # _rebuild_charge_sets_locked to avoid reindenting the whole body; the lock
+        # is held for its full duration. No caller holds this lock (boot/pop/reload
+        # entry points don't), and the body never re-enters subscribe/unsubscribe,
+        # so there is no reentrancy.
+        async with self._rl_rebuild_lock:
+            await self._rebuild_charge_sets_locked()
+
+    async def _rebuild_charge_sets_locked(self) -> None:
         """(Re)build every precomputed charge-set side-table from the current
         rate-limit config + the live plugin/sub set. Idempotent
         clear-and-repopulate (never appends), so any trigger -- initial load,

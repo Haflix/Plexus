@@ -2299,10 +2299,20 @@ class EventMixin:
         # Rate limiter (Step 3): build the new sub's IN-set charge-set so a
         # runtime subscribe (after the initial-load rebuild) is limited too.
         # No-op when rate limiting is off.
-        if self._rate_limits_active:
-            rl_sub = await self.topic_registry.get_subscription(sub_uuid)
-            if rl_sub is not None:
-                self._rl_build_sub(rl_sub)
+        #
+        # HUNT-051: acquire _rl_rebuild_lock (UNCONDITIONALLY — the
+        # _rate_limits_active check is INSIDE so a concurrent rebuild flipping
+        # the flag True cannot slip past, closing the activation TOCTOU) so this
+        # Sub-IN build serializes against _rebuild_charge_sets' clear+repopulate;
+        # otherwise the rebuild can wipe this sub's entry -> admit-without-charge.
+        # NARROW: topic_registry.subscribe (above) stays OUTSIDE the lock — the
+        # build being mutually exclusive with the whole rebuild is sufficient.
+        # Order: _rl_rebuild_lock -> topic_registry._lock.
+        async with self._rl_rebuild_lock:
+            if self._rate_limits_active:
+                rl_sub = await self.topic_registry.get_subscription(sub_uuid)
+                if rl_sub is not None:
+                    self._rl_build_sub(rl_sub)
 
         return sub_uuid
 

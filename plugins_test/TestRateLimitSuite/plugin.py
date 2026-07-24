@@ -77,7 +77,7 @@ from plexus.ratelimiter import (  # noqa: E402
 
 from _test_helpers import CaseRecorder  # noqa: E402
 
-SUITE_VERSION = "0.13.0"
+SUITE_VERSION = "0.14.0"
 SUITE = "TestRateLimitSuite"
 TARGET = "TestRateLimitTarget"
 
@@ -188,6 +188,7 @@ class TestRateLimitSuite(Plugin):
             await self._case_event_out(rec, kw)
             await self._case_cross_plugin_sub(rec, kw)
             await self._case_runtime_sub_fallback(rec, kw, runtime_subs)
+            await self._case_b051_subscribe_serializes_vs_rebuild(rec, kw, runtime_subs)
             await self._case_teardown_sub_bucket(rec, kw)
             await self._case_empty_config(rec, kw)
             await self._case_empty_config_prunes_orphans(rec, kw)
@@ -351,6 +352,87 @@ class TestRateLimitSuite(Plugin):
             if su in px._rl_sub_in:
                 raise AssertionError("unsubscribe must drop the sub's charge-set entry")
         await rec.run_case("ratelimit.runtime_sub_fallback", body, **kw)
+
+    async def _case_b051_subscribe_serializes_vs_rebuild(self, rec, kw, runtime_subs):
+        async def body(c):
+            px = self._plexus
+            # HUNT-051 regression. The bug: subscribe_event's Sub-IN charge-set
+            # build (_rl_build_sub) ran UNSERIALIZED against _rebuild_charge_sets'
+            # snapshot->clear->repopulate, so a sub added during a rebuild could
+            # lose its _rl_sub_in entry -> _rl_admit_in returns None = admit
+            # WITHOUT charge. The fix serializes both under _rl_rebuild_lock.
+            #
+            # Deterministic discriminator (no timing race): hold _rl_rebuild_lock
+            # exactly as _rebuild_charge_sets does across its whole body. With the
+            # fix, a concurrent subscribe_event registers its sub (lock-free) but
+            # its build BLOCKS on the held lock -> no _rl_sub_in entry appears while
+            # the lock is held. Without the fix, the build runs immediately -> the
+            # entry is present while the lock is held (the exact unserialized write
+            # a rebuild could then wipe).
+            self._apply({
+                (DIM_ENDPOINT_IN, endpoint_key(TARGET, "sink")): {"max": 10, "window": 1},
+                (DIM_PLUGIN_IN, TARGET): {"max": 50, "window": 1},
+            })
+            await px._rebuild_charge_sets()
+
+            await px._rl_rebuild_lock.acquire()
+            task = asyncio.create_task(px.subscribe_event(
+                topic="ratelimit/b051", plugin_name=self.plugin_name,
+                plugin_uuid=self.plugin_uuid, target_access_name="sink",
+                target_plugin=TARGET, hosts="local", declared_id="b051sub",
+            ))
+            lock_held = True
+            try:
+                # Wait until the sub is REGISTERED in topic_registry (lock-free, so
+                # this completes under the held lock in BOTH fixed and unfixed code).
+                su = None
+                for _ in range(1000):
+                    await asyncio.sleep(0)
+                    subs = await px.topic_registry.get_plugin_subscriptions(
+                        self.plugin_uuid
+                    )
+                    match = [s.sub_uuid for s in subs if s.declared_id == "b051sub"]
+                    if match:
+                        su = match[0]
+                        break
+                if su is None:
+                    raise AssertionError(
+                        "subscribe_event did not register the sub within the poll budget"
+                    )
+                # Give an UNSERIALIZED build (unfixed code) ample event-loop turns to
+                # complete. The fix keeps the build blocked on the held lock no matter
+                # how many turns pass, so this cannot flake green.
+                for _ in range(50):
+                    await asyncio.sleep(0)
+                built_while_lock_held = su in px._rl_sub_in
+
+                # Release BEFORE asserting so the blocked build proceeds and the task
+                # is never orphaned.
+                px._rl_rebuild_lock.release()
+                lock_held = False
+                su_final = await task
+                runtime_subs.append(su_final)
+
+                if built_while_lock_held:
+                    raise AssertionError(
+                        "HUNT-051: subscribe_event built the Sub-IN charge-set while "
+                        "_rl_rebuild_lock was held -> the build is NOT serialized "
+                        "against _rebuild_charge_sets, so a concurrent rebuild can "
+                        "wipe it (admit-without-charge)."
+                    )
+                if su_final not in px._rl_sub_in:
+                    raise AssertionError(
+                        "after _rl_rebuild_lock released, the serialized "
+                        "subscribe_event build must complete and populate _rl_sub_in"
+                    )
+                await px.unsubscribe_event(su_final)
+                runtime_subs.remove(su_final)
+            finally:
+                if lock_held:
+                    px._rl_rebuild_lock.release()
+                if not task.done():
+                    task.cancel()
+        await rec.run_case("ratelimit.b051_subscribe_serializes_vs_rebuild", body, **kw)
 
     async def _case_teardown_sub_bucket(self, rec, kw):
         async def body(c):
