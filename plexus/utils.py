@@ -1067,9 +1067,26 @@ class ConfigUtil:
                 raise ConfigException(f"Missing config section: {section}")
 
         # Validate plugins
+        seen_names: set = set()  # HUNT-156
         for plugin in yaml_config.get("plugins", []):
             if "name" not in plugin or "enabled" not in plugin:
                 raise ConfigException("Plugin entry missing name/enabled field")
+
+            # HUNT-156: reject duplicate plugin names. Two 'plugins:' entries
+            # with the same name are silently unsupported — the second
+            # load_plugin_with_conf pops+tears-down the first instance (only an
+            # INFO log), so an operator copy-pasting an entry to make a "second
+            # instance" loses the first. Multi-instance requires DISTINCT names
+            # (same path/source, different name). Fail loudly at config load
+            # instead, matching how the framework already rejects duplicate peers.
+            _pname = plugin["name"]
+            if _pname in seen_names:
+                raise ConfigException(
+                    f"Duplicate plugin name '{_pname}' in config: two 'plugins:' "
+                    f"entries share a name. Multi-instance needs distinct names "
+                    f"(same path/source, different name)."
+                )
+            seen_names.add(_pname)
 
             # Warn if path is empty but plugin_package isn't configured
             if not plugin.get("path") and "plugin_package" not in yaml_config.get(

@@ -35,7 +35,7 @@ from plexus.exceptions import ConfigException  # noqa: E402
 from _test_helpers import CaseRecorder  # noqa: E402
 
 
-SUITE_VERSION = "0.2.0"
+SUITE_VERSION = "0.3.0"
 
 # Fixture plugin names (must match test_config.yml entries)
 FIXTURE        = "TestPR2Fixture"
@@ -97,6 +97,7 @@ class TestPR2Suite(Plugin):
         await self._case13_null_endpoints_loads_zero(rec, kw)
         await self._case14_empty_overrides_noop(rec, kw)
         await self._case15_description_override_reflected(rec, kw)
+        await self._case16_duplicate_plugin_name_rejected(rec, kw)
 
         return rec.to_dict()
 
@@ -423,6 +424,48 @@ class TestPR2Suite(Plugin):
             "pr2.apply_overrides.replace_missing_required_fields_error",
             body,
             tags=("pr2", "overrides", "replace"),
+            **kw,
+        )
+
+    # ====================================================================
+    # Case 16 — HUNT-156: check_config_integrity rejects duplicate plugin names
+    # ====================================================================
+
+    async def _case16_duplicate_plugin_name_rejected(
+        self, rec: CaseRecorder, kw: dict
+    ) -> None:
+        async def body(c):
+            from plexus.utils import ConfigUtil
+            general = {
+                "hostname": "h", "plugin_package": "p", "console_log_level": "INFO",
+            }
+            networking = {
+                "enabled": False, "port": 0, "direct_discoverable": False,
+                "auto_discoverable": False, "discover_nodes": [],
+            }
+            # Control: distinct names (same source is fine) must NOT raise.
+            ConfigUtil.check_config_integrity({
+                "plugins": [
+                    {"name": "PR2DupA", "enabled": True, "path": "./a"},
+                    {"name": "PR2DupB", "enabled": True, "path": "./a"},
+                ],
+                "general": general, "networking": networking,
+            })
+            # HUNT-156: two entries sharing a name must raise ConfigException
+            # (was: silent last-wins teardown of the first instance).
+            c.expect_exception(ConfigException, match=r"[Dd]uplicate plugin name")
+            ConfigUtil.check_config_integrity({
+                "plugins": [
+                    {"name": "PR2Dup", "enabled": True, "path": "./a"},
+                    {"name": "PR2Dup", "enabled": True, "path": "./b"},
+                ],
+                "general": general, "networking": networking,
+            })
+
+        await rec.run_case(
+            "pr2.duplicate_plugin_name_rejected",
+            body,
+            tags=("pr2", "config", "hunt156"),
             **kw,
         )
 
