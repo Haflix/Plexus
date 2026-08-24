@@ -11,7 +11,7 @@ if hasattr(sys.stderr, "reconfigure"):
 import contextlib
 import copy
 import functools
-import importlib
+import importlib.util
 import inspect
 import asyncio
 import time
