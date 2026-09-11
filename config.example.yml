@@ -30,6 +30,33 @@ plugins:
         host: "localhost"
         port: 5432
 
+  # Worked demo set: four small plugins under plugins_test/ that exercise
+  # the event system end to end. Flip all four to true and the host makes
+  # its own traffic: DemoTimer publishes a heartbeat every few seconds and
+  # DemoPub replays a publish -> ask -> flood cycle, which DemoSub and
+  # DemoOrch handle.
+  #
+  # Between them they show 1:N publish_event fan-out, a 1:1 request_event
+  # ask, cross-plugin subscription routing via target_plugin, an
+  # async-generator streaming endpoint, and an endpoint_in rate-limit
+  # reject. For the last one, scope a limit to DemoOrch's handle_ask
+  # endpoint; see docs/rate_limiting.md.
+  - name: DemoTimer
+    enabled: false
+    path: ./plugins_test/DemoTimer
+
+  - name: DemoPub
+    enabled: false
+    path: ./plugins_test/DemoPub
+
+  - name: DemoSub
+    enabled: false
+    path: ./plugins_test/DemoSub
+
+  - name: DemoOrch
+    enabled: false
+    path: ./plugins_test/DemoOrch
+
 
 general:
     hostname: ""                  # Empty = use system hostname

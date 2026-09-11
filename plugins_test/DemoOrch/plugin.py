@@ -1,10 +1,12 @@
-"""TUI smoke demo orchestrator — multi-target subscriber that adds
-variety to the Subscriptions / Plugins-detail panes:
+"""Demo orchestrator: the wiring-variety end of the demo set.
 
-  - 4 declared subscriptions across 3 topics (one cross-plugin to
-    TUIDemoSub, demoing the Target column)
-  - 3 handler endpoints + a stats endpoint + a streaming endpoint
-    (try Call on `count_stream` to see streaming output rendering)
+  - 4 declared subscriptions across 3 topics, one of them routed
+    cross-plugin via `target_plugin` so a topic lands on ANOTHER
+    plugin's endpoint
+  - `handle_ask` answers the 1:1 `demo.ask` request_event, and is the
+    endpoint a host scopes an `endpoint_in` rate limit to
+  - `count_stream` is an async-generator endpoint, exercising the
+    streaming dispatch path
 """
 
 import asyncio
@@ -13,12 +15,12 @@ from plexus.utils import Plugin
 from plexus.decorators import async_log_errors, async_gen_log_errors, log_errors
 
 
-class TUIDemoOrch(Plugin):
+class DemoOrch(Plugin):
     @log_errors
     def on_load(self, *args, **kwargs):
         self.description = (
-            "TUI smoke demo orchestrator — multi-target subscriber + "
-            "streaming endpoint demo."
+            "Demo orchestrator: multi-target subscriber plus "
+            "streaming endpoint."
         )
         self._counts: dict = {
             "heartbeat": 0,
@@ -53,10 +55,11 @@ class TUIDemoOrch(Plugin):
     @async_log_errors
     async def handle_ask(self, event):
         """1:1 request_event handler for topic demo.ask. Returns a value
-        so a request_event fired on this topic gets an answer. Drives the
-        presentation's Beat 2 (1:1 ask answered by a local subscriber) and
-        Beat 3 (flood — this endpoint carries the tight endpoint_in rate
-        limit that the flood trips)."""
+        so a request_event fired on this topic gets an answer. When the
+        asking plugin runs on another node and nothing subscribes
+        demo.ask locally there, the request falls through to this handler
+        across the wire. This is also the endpoint a host scopes a tight
+        endpoint_in rate limit to, so DemoPub.beat3_flood can trip it."""
         self._counts["ask"] += 1
         return {"answer": "pong", "from": self._plexus.hostname}
 
@@ -66,9 +69,9 @@ class TUIDemoOrch(Plugin):
 
     @async_gen_log_errors()
     async def count_stream(self, n: int = 5):
-        """Async generator endpoint — yields integers 1..n with a
-        small delay between each. Demonstrates the framework's
-        execute_stream path + the TUI's streaming-result rendering.
+        """Async generator endpoint yielding integers 1..n with a small
+        delay between each, exercising the framework's execute_stream
+        dispatch path.
         """
         n = max(1, min(int(n), 50))
         for i in range(1, n + 1):

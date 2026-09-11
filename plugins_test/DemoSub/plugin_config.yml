@@ -1,5 +1,5 @@
-description: TUI smoke demo — declares subscriptions to TUIDemoPub events so the Subs / Catalogue / Live-stream panels show realistic dispatch metadata.
-version: 0.1.0
+description: "Demo subscriber: declares subscriptions on DemoPub's topics and counts inbound events, so 1:N fan-out is verifiable."
+version: 0.2.0
 remote: false
 verbose_notifier: true
 arguments:

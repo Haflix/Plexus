@@ -1,16 +1,18 @@
-"""TUI smoke demo subscriber — receives events published by
-TUIDemoPub. Adds rows to the Subscriptions panel so that pane is not
-empty in single-node smoke testing."""
+"""Demo subscriber: the receiving end of DemoPub's 1:N publishes.
+
+Declares two subscriptions (`demo.greeted`, `demo.ticked`) and counts
+every event that reaches it, so fan-out is verifiable from a counter
+rather than from logs."""
 
 from plexus.utils import Plugin
 from plexus.decorators import async_log_errors, log_errors
 
 
-class TUIDemoSub(Plugin):
+class DemoSub(Plugin):
     @log_errors
     def on_load(self, *args, **kwargs):
         self.description = (
-            "TUI smoke demo subscriber — handles TUIDemoPub events."
+            "Demo subscriber: counts events published by DemoPub."
         )
         self._counter = 0
 

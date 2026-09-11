@@ -1,5 +1,5 @@
-description: TUI smoke demo — publishes events on demand for the Live-stream tab + carries tagged endpoints for the tag-search demo.
-version: 0.2.2
+description: "Demo publisher: 1:N publish_event burst, 1:1 request_event ask, and a flood that trips an endpoint_in rate limit. Carries tagged endpoints for tag-based discovery."
+version: 0.3.0
 remote: false
 verbose_notifier: true
 arguments:
@@ -16,7 +16,7 @@ events:
     hosts: "any"
     enabled: false
   # 1:1 ask target. request_event on this topic is answered by the local
-  # subscriber TUIDemoOrch.handle_ask. Drives Beat 2 + Beat 3.
+  # subscriber DemoOrch.handle_ask. Drives Beat 2 + Beat 3.
   ask:
     topic: "demo.ask"
     hosts: "any"
@@ -26,7 +26,7 @@ endpoints:
     internal_name: fire_events
     remote: false
     accessible_by_other_plugins: true
-    description: Publish a small burst of demo events into Live-stream
+    description: "Publish a small burst of demo events (3 greeted + 2 ticked)"
     tags: ["demo", "fire"]
     arguments: []
 
@@ -34,7 +34,7 @@ endpoints:
     internal_name: beat2_ask
     remote: false
     accessible_by_other_plugins: true
-    description: "Presentation Beat 2: 1:1 request_event answered by a local subscriber"
+    description: "Beat 2: 1:1 request_event on demo.ask, answered by whichever subscriber matches"
     tags: ["demo", "beat", "ask"]
     arguments: []
 
@@ -42,7 +42,7 @@ endpoints:
     internal_name: beat3_flood
     remote: false
     accessible_by_other_plugins: true
-    description: "Presentation Beat 3: flood the 1:1 ask endpoint to trip its rate limit"
+    description: "Beat 3: flood the 1:1 ask endpoint to trip its endpoint_in rate limit"
     tags: ["demo", "beat", "flood"]
     arguments:
       - name: n

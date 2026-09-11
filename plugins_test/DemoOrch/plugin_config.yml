@@ -1,5 +1,5 @@
-description: TUI smoke demo orchestrator — subscribes to TUIDemoTimer events + cross-plugin to TUIDemoPub. Adds variety to the Subscriptions / Plugins-detail panes.
-version: 0.2.1
+description: "Demo orchestrator: multi-topic subscriber with cross-plugin subscription routing, the 1:1 demo.ask handler, and a streaming endpoint."
+version: 0.3.0
 remote: false
 verbose_notifier: true
 arguments:
@@ -18,17 +18,17 @@ subscriptions:
     target_access_name: handle_greeted_via_orch
     hosts: "any"
   # Cross-plugin sub: orchestrator OWNS this sub but routes dispatches
-  # to TUIDemoSub.handle_ticked. Demonstrates the cross-plugin sub
-  # pattern in the Subs panel "Target" column.
+  # to DemoSub.handle_ticked. Demonstrates the cross-plugin sub
+  # pattern: the plugin that OWNS the sub and the plugin that HANDLES it differ.
   cross_to_subhandler:
     topic: "demo.timer.heartbeat"
-    target_plugin: TUIDemoSub
+    target_plugin: DemoSub
     target_access_name: handle_ticked
     hosts: "any"
   # 1:1 request_event target. A request_event on demo.ask is routed here
   # (config-routed: the caller addresses the topic, not this plugin).
   # Carries the tight endpoint_in rate limit (set in the node's
-  # config.yml) that the presentation's Beat 3 flood trips.
+  # config.yml) that DemoPub.beat3_flood trips.
   on_ask:
     topic: "demo.ask"
     target_access_name: handle_ask

@@ -1,5 +1,5 @@
-description: TUI smoke demo — fires demo events every few seconds so Live-stream is always populated without manual interaction.
-version: 0.1.0
+description: "Demo timer: publishes heartbeat and burst events on a background tick, giving a running host continuous ambient event traffic."
+version: 0.2.0
 remote: false
 verbose_notifier: true
 arguments:

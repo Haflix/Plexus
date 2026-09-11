@@ -1,13 +1,20 @@
-"""TUI smoke demo publisher.
+"""Demo publisher: drives the event system's outbound paths.
 
-Two purposes:
+Three things it exercises:
 
-  1. Fires a burst of demo events from `fire_events` so the Events ▸
-     Live stream panel populates. The events match topics that
-     `TUIDemoSub` subscribes to, so subscriber dispatch metrics show
-     up too.
-  2. Carries a few tagged endpoints (`demo`, `fire`, `ping`) so the
-     Plugins-tab tag-search input has something to filter against.
+  1. `fire_events` publishes a burst on `demo.greeted` / `demo.ticked`.
+     Both topics are subscribed by DemoSub and DemoOrch, so one call
+     fans out 1:N to several handlers.
+  2. `beat2_ask` fires a single `request_event` on `demo.ask`, a 1:1
+     ask that returns the answering subscriber's value. When no local
+     subscriber matches, the request falls through to a peer node.
+  3. `beat3_flood` fires twenty asks back to back so the burst lands
+     inside one token-bucket refill window, tripping whatever
+     `endpoint_in` limit the host configured on the handler, and
+     counts the resulting rejects.
+
+Also carries tagged endpoints (`demo`, `fire`, `ping`) so tag-based
+endpoint discovery has something to find.
 """
 
 import asyncio
@@ -17,15 +24,15 @@ from plexus.decorators import async_log_errors, log_errors
 from plexus.exceptions import RequestException
 
 
-class TUIDemoPub(Plugin):
+class DemoPub(Plugin):
     @log_errors
     def on_load(self, autoplay: bool = True, *args, **kwargs):
         self.description = (
-            "TUI smoke demo publisher — fires demo events on demand."
+            "Demo publisher: fires demo events on demand."
         )
-        # Presentation auto-play: when true, on_enable starts a loop that
-        # replays the 3 demo beats so the demo runs without clicking the
-        # TUI Call button. Set autoplay=false to disable.
+        # Auto-play: when true, on_enable starts a loop that replays the
+        # three demo beats, so the demo produces traffic without anyone
+        # calling an endpoint. Set autoplay=false to disable.
         self._autoplay = bool(autoplay)
         self._autoplay_task = None
 
@@ -46,12 +53,12 @@ class TUIDemoPub(Plugin):
                 pass
 
     async def _autoplay_loop(self):
-        """Replay the 3 presentation beats on a loop so the demo works
-        without the TUI Call button. Beat 1 (publish 1:N) -> Beat 2 (1:1
-        ask) -> Beat 3 (flood -> rejects), then idle and repeat. The
-        Rate-Limits tab reject counter keeps climbing across cycles."""
+        """Replay the three demo beats on a loop so the demo produces
+        traffic unattended. Beat 1 (publish 1:N) -> Beat 2 (1:1 ask) ->
+        Beat 3 (flood -> rejects), then idle and repeat, so the reject
+        tally keeps climbing across cycles."""
         try:
-            await asyncio.sleep(6.0)  # let the TUI settle after startup
+            await asyncio.sleep(6.0)  # let the host settle after startup
             while True:
                 try:
                     await self.fire_events()
@@ -68,9 +75,8 @@ class TUIDemoPub(Plugin):
     @async_log_errors
     async def fire_events(self):
         """Publish 5 events: 3 greeted + 2 ticked. Each fires a
-        `_core/event/published` bus emit (and `_core/event/requested`
-        for any matching subscriber dispatch), populating the Events
-        tab's Live-stream panel."""
+        `_core/event/published` bus emit, plus `_core/event/requested`
+        for any matching subscriber dispatch."""
         for i in range(3):
             await self.publish_event("greeted", payload={"i": i, "kind": "greet"})
         for i in range(2):
@@ -79,15 +85,16 @@ class TUIDemoPub(Plugin):
 
     @async_log_errors
     async def beat2_ask(self):
-        """Presentation Beat 2 — 1:1 request_event answered by a local subscriber.
+        """Beat 2: a 1:1 request_event that comes back with an answer.
 
-        Fires `request_event` on topic `demo.ask`. A local subscriber
-        (TUIDemoOrch.handle_ask) answers, and the return value comes back
-        here. Shows a 1:1 ask that is config-routed: the caller addresses
-        a topic, not a named plugin.
+        Fires `request_event` on topic `demo.ask`. Whichever subscriber
+        matches (DemoOrch.handle_ask) answers, and the return value comes
+        back here. The ask is config-routed: the caller addresses a topic,
+        not a named plugin, so in a two-node setup where nothing
+        subscribes demo.ask locally the request falls through to the peer.
 
-        Banner is logged at WARNING so it shows through the harness's
-        console_log_level: WARNING.
+        Logged at WARNING so it shows through a console_log_level of
+        WARNING.
         """
         answer = await self.request_event(
             "ask", payload={"q": "ping"}, timeout=3.0
@@ -97,8 +104,8 @@ class TUIDemoPub(Plugin):
 
     @async_log_errors
     async def beat3_flood(self, n: int = 20):
-        """Presentation Beat 3 — flood the 1:1 ask endpoint to trip its
-        endpoint_in rate limit.
+        """Beat 3: flood the 1:1 ask endpoint to trip its endpoint_in
+        rate limit.
 
         Fires `n` request_events back to back with no sleep, so the whole
         burst lands inside one token-bucket refill window. The endpoint_in
@@ -108,7 +115,7 @@ class TUIDemoPub(Plugin):
         we count.
 
         The reject also fires the `_core/ratelimit/rejected` observability
-        event, so the Rate-Limits tab shows the rejects climb.
+        event, so a host can observe the rejects as they happen.
         """
         ok = 0
         rejected = 0

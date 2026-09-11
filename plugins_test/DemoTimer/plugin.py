@@ -1,7 +1,9 @@
-"""TUI smoke demo timer — fires demo events on a background tick so
-the Events ▸ Live stream panel stays populated automatically (and
-the Plugins-tab Phase column shows non-zero traffic flowing through
-the framework even when nobody is clicking buttons)."""
+"""Demo timer: generates ambient event traffic on a background tick.
+
+Publishes a `heartbeat` every `tick_interval` seconds and, on every
+fourth tick, a 3-event `burst` in quick succession to exercise rapid
+emits. Exists so a running host has continuous event flow without
+anyone calling an endpoint."""
 
 import asyncio
 
@@ -9,11 +11,11 @@ from plexus.utils import Plugin
 from plexus.decorators import async_log_errors, log_errors
 
 
-class TUIDemoTimer(Plugin):
+class DemoTimer(Plugin):
     @log_errors
     def on_load(self, tick_interval: float = 3.0, *args, **kwargs):
         self.description = (
-            "TUI smoke demo timer — auto-fires demo events every "
+            "Demo timer: auto-fires demo events every "
             f"{tick_interval}s."
         )
         self._interval: float = float(tick_interval)
