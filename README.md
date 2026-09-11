@@ -264,6 +264,12 @@ internal `Plexus` helpers (`_*` prefix) are not. See the wire-protocol
 table in [docs/networking.md](docs/networking.md) for cross-version
 compatibility.
 
+## Acknowledgements
+
+The early networking and streaming work (0.6.0 through 0.6.5, mid-2025) was a
+collaboration with [1ckyDev](https://github.com/1ckyDev), who wrote the first
+structure of the networking layer. Development has been solo since.
+
 ## License
 
 See [LICENSE](LICENSE).
