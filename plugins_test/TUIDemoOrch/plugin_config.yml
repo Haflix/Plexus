@@ -1,5 +1,5 @@
 description: TUI smoke demo orchestrator — subscribes to TUIDemoTimer events + cross-plugin to TUIDemoPub. Adds variety to the Subscriptions / Plugins-detail panes.
-version: 0.1.0
+version: 0.2.1
 remote: false
 verbose_notifier: true
 arguments:
@@ -24,6 +24,14 @@ subscriptions:
     topic: "demo.timer.heartbeat"
     target_plugin: TUIDemoSub
     target_access_name: handle_ticked
+    hosts: "any"
+  # 1:1 request_event target. A request_event on demo.ask is routed here
+  # (config-routed: the caller addresses the topic, not this plugin).
+  # Carries the tight endpoint_in rate limit (set in the node's
+  # config.yml) that the presentation's Beat 3 flood trips.
+  on_ask:
+    topic: "demo.ask"
+    target_access_name: handle_ask
     hosts: "any"
 
 endpoints:
@@ -51,6 +59,15 @@ endpoints:
     accessible_by_other_plugins: true
     description: Handler for demo.greeted (via orchestrator)
     tags: ["demo", "sub", "orch"]
+    arguments:
+      - name: event
+
+  handle_ask:
+    internal_name: handle_ask
+    remote: false
+    accessible_by_other_plugins: true
+    description: 1:1 request_event handler for demo.ask — returns an answer to the asking peer
+    tags: ["demo", "sub", "orch", "ask"]
     arguments:
       - name: event
 

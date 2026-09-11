@@ -24,6 +24,7 @@ class TUIDemoOrch(Plugin):
             "heartbeat": 0,
             "burst": 0,
             "greeted_via_orch": 0,
+            "ask": 0,
         }
 
     @async_log_errors
@@ -48,6 +49,16 @@ class TUIDemoOrch(Plugin):
     async def handle_greeted_via_orch(self, event):
         self._counts["greeted_via_orch"] += 1
         return {"counter": self._counts["greeted_via_orch"]}
+
+    @async_log_errors
+    async def handle_ask(self, event):
+        """1:1 request_event handler for topic demo.ask. Returns a value
+        so a request_event fired on this topic gets an answer. Drives the
+        presentation's Beat 2 (1:1 ask answered by a local subscriber) and
+        Beat 3 (flood — this endpoint carries the tight endpoint_in rate
+        limit that the flood trips)."""
+        self._counts["ask"] += 1
+        return {"answer": "pong", "from": self._plexus.hostname}
 
     @async_log_errors
     async def stats(self):
