@@ -57,7 +57,7 @@ class TestExecuteSuite(Plugin):
 
     @log_errors
     def on_load(self, *args, **kwargs):
-        # Declare instance state per Plugin lifecycle contract (CLAUDE.md):
+        # Declare instance state per the Plugin lifecycle contract:
         self._t1_uuid: Optional[str] = None
         self._t2_uuid: Optional[str] = None
         self._multi_instance_smoke_passed: bool = False

@@ -178,7 +178,7 @@ async def run_all(
 
 Each case is tagged `category="basic"` or `category="edge"`:
 
-- **`basic`** — exercises a documented contract (in README or CLAUDE.md) OR reproduces a known bug from `bugtracker.md`. Failure here means a documented promise has been broken, or a known regression has surfaced. CI runs basic by default. **Run with `category="basic"`.**
+- **`basic`** — exercises a documented contract (in README or `docs/`) OR reproduces a known bug from `bugtracker.md`. Failure here means a documented promise has been broken, or a known regression has surfaced. CI runs basic by default. **Run with `category="basic"`.**
 - **`edge`** — exercises boundary conditions, stress patterns, undocumented behavior we want to lock, or unusual input shapes that aren't part of the documented contract but matter for robustness. Failure here is a quality concern, not a contract break. **Run with `category="edge"`.**
 
 `run_all()` with no `category` runs both. CI may run only `category="basic"` for fast feedback and `category="edge"` on a slower cadence.
@@ -875,7 +875,7 @@ And remove their entries from `config.example.yml`.
 - **External CI harness / pytest wrapper** — `dump_path` + a small CI script can read the JSON; bridge-to-pytest is separate work.
 - **Migration guide for users** — documented in Phase 6 commit message; not part of the test framework itself.
 
-For each of these, the documentation surface (README / CLAUDE.md / commit messages) remains authoritative; the test framework focuses exclusively on runtime behavior of a started Plexus.
+For each of these, the documentation surface (README / `docs/` / commit messages) remains authoritative; the test framework focuses exclusively on runtime behavior of a started Plexus.
 
 ---
 
