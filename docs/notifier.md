@@ -1,6 +1,6 @@
 # Notifier and Events
 
-*Last updated for Plexus 0.74.0*
+*Last updated for Plexus 0.81.0*
 
 Deep dive on the topic-based event system. The user-facing Plugin
 methods are covered in [api_reference.md](./api_reference.md); this page
@@ -149,8 +149,9 @@ Validation of `topic_vars`:
 - Type: `Dict[str, str]` or `None`.
 - Keys must NOT collide with reserved load-time names (`prefix`,
   `plugin_name`, `hostname`, `plugin_uuid`).
-- Values must NOT contain `/`, must not be empty / whitespace-only, must
-  not have leading/trailing whitespace.
+- Values must NOT contain `/` or `*` (wildcards are subscriber-side
+  only), must not be empty / whitespace-only, must not have
+  leading/trailing whitespace.
 - Missing keys for `{var}` placeholders raise `ValueError`.
 - Extra keys not used by the template log a warning.
 - Static topic + non-empty `topic_vars` logs a warning (likely confused
@@ -489,8 +490,10 @@ The `GatedExecutor` gives the pool two independent budgets (see
   (`_plugin_executor`, also a `GatedExecutor`). The two pools do not
   contend, so a slow sync subscriber cannot starve sync `execute()` calls.
 - Shutdown happens AFTER the 30 s in-flight drain in
-  `Plexus.close()`, with a 30 s budget; falls back to `wait=False`
-  on timeout.
+  `Plexus.close()`, with a 30 s budget. On timeout it logs and
+  continues, leaving the in-flight shutdown task running — there is
+  no forced second `wait=False` shutdown (a second call from the loop
+  thread would race the worker).
 
 There is a SECOND `SyncDispatcher`, `sync_stream_dispatcher`, dedicated to
 sync STREAM handlers (a plain `def` handler that yields chunks). Each `next()`

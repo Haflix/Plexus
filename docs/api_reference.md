@@ -1,6 +1,6 @@
 # API Reference
 
-*Last updated for Plexus 0.74.0*
+*Last updated for Plexus 0.81.0*
 
 Reference manual for the public surface of `Plugin` (in `plexus.utils`) — the methods and attributes a plugin author calls from inside their own class. Methods on `Plexus` itself are covered at the end for tooling and harness authors.
 
@@ -68,7 +68,7 @@ Set by `Plugin.__init__` before `on_load` runs, then partially overwritten by th
 |----------------------|------------------|-------------------------------------------------------------------------------------------------------------------|
 | `self._plexus`  | `Plexus`     | Back-reference to the running core. Prefer the wrapper methods below over reaching into it directly.              |
 | `self._logger`       | `logging.Logger` | Plugin-scoped logger (`{root}.{plugin_name}`).                                                                    |
-| `self.plugin_name`   | `str`            | Name from `config.yml` (NOT the class name). Set after `on_load` returns.                                         |
+| `self.plugin_name`   | `str`            | Name from `config.yml` (NOT the class name). Passed to `__init__`, so it is already correct **inside** `on_load`.                                         |
 | `self.plugin_uuid`   | `str`            | uuid4 hex; unique per instance, regenerated on every load and reload.                                             |
 | `self.arguments`     | `Any`            | Raw merged `arguments:` from manifest plus overrides.                                                             |
 | `self.endpoints`     | `dict`           | Same dict the framework uses. Keyed by access_name.                                                               |
@@ -112,11 +112,11 @@ Each method below has signature, args, return, raises, and behaviour notes. The 
 | `blocked_hosts` | `str \| list \| None` | `None` | Same shape as `hosts`. |
 | `author` | `str \| None` | `None` | Caller-side author identity for filter chains. When `None`, substituted with the calling plugin's own `plugin_name`. |
 | `author_id` | `str \| None` | `None` | Caller-side author uuid. When `None`, substituted with the calling plugin's own `plugin_uuid`. |
-| `timeout` | `float \| None` | `None` | Per-call deadline. A value of `0` means no timeout (unbounded), the same as `None`. Framework-level default if `None`. |
+| `timeout` | `float \| None` | `None` | Per-call deadline. A value of `0` means no timeout (unbounded). `None` is the same thing — there is no framework-level per-call default, so `None` waits indefinitely on a wedged handler. |
 
 **Returns** Whatever the endpoint returns.
 
-**Raises** `RequestException` on any error (target not found, target not ready, type mismatch, target raised, network failure). `NetworkRequestException` and `NoLocalSubException` are subclasses, so a single `except RequestException` covers both. When the endpoint raises a non-`RequestException`, the surfaced message is prefixed with the exception type name (e.g. a handler `raise ValueError("bad input")` arrives as `RequestException("ValueError: bad input")`); a `RequestException` raised by the handler is passed through verbatim.
+**Raises** `ValueError` before dispatch for a structurally invalid `hosts` / `blocked_hosts` value (empty list, `"any"` combined with a name, `blocked_hosts="any"`), and `RequestException` on any dispatch error (target not found, target not ready, type mismatch, target raised, network failure). `NetworkRequestException` and `NoLocalSubException` are subclasses, so a single `except RequestException` covers both. When the endpoint raises a non-`RequestException`, the surfaced message is prefixed with the exception type name (e.g. a handler `raise ValueError("bad input")` arrives as `RequestException("ValueError: bad input")`); a `RequestException` raised by the handler is passed through verbatim.
 
 **Decorator** `@async_log_errors`.
 
@@ -164,7 +164,7 @@ Fire-and-forget 1:N broadcast. Returns the number of subscribers (local + remote
 
 **Returns** `int` — count of subscribers scheduled.
 
-**Raises** `ValueError` / `TypeError` for malformed `topic_vars` (see [`topic_vars` constraints](#topic_vars-constraints)). `RequestException` for unknown `event_id` or other framework-level errors. Subscriber-side errors are logged, not raised. Disabled events silently drop with a debug log and return `0`.
+**Raises** `ValueError` / `TypeError` for malformed `topic_vars` (see [`topic_vars` constraints](#topic_vars-constraints)). `ValueError` for an unknown or empty `event_id` — note this is **not** a `RequestException` subclass, so `except RequestException` will not catch a typo'd `event_id`; the same applies to `request_event` and `request_event_stream`. `RequestException` (and its `RateLimitException` / `CapabilityException` subclasses) for framework-level errors. Subscriber-side errors are logged, not raised. Disabled events silently drop with a debug log and return `0`.
 
 If `payload=None` is passed, subscribers receive an empty dict `{}` rather than None. This ensures a consistent dict shape for subscribers.
 
@@ -223,7 +223,7 @@ Sync equivalent. Pre-start guard fires at call time.
 
 - Type: `Dict[str, str]` or `None`. A non-dict, non-None value raises `TypeError`.
 - Keys must be `str` (`TypeError` otherwise) and must NOT be in `{"prefix", "plugin_name", "hostname", "plugin_uuid"}` (`ValueError`).
-- Values must be `str` (`TypeError` otherwise), must NOT contain `/`, must not be empty or whitespace-only, must not have leading/trailing whitespace (`ValueError`).
+- Values must be `str` (`TypeError` otherwise), must NOT contain `/`, must NOT contain `*` (wildcards are subscriber-side only), must not be empty or whitespace-only, must not have leading/trailing whitespace (`ValueError`).
 - Missing keys for `{var}` placeholders → `ValueError`.
 - Extra keys not used by the template → warning logged.
 - Static topic with non-empty `topic_vars` → warning logged.
@@ -253,7 +253,7 @@ Register a subscription at runtime (in addition to the declarative `subscription
 
 **Raises**
 - `TypeError` if `target_access_name` is not a string.
-- `ValueError` if `target_access_name` is empty or whitespace-only, for malformed topic patterns, or for invalid filter values — validated by `_validate_subscription_topic` and a `target_access_name` re-check on the Plexus side. Topic and filter values are validated identically to YAML load. All three validation layers (`Plugin.subscribe`, `Plexus.subscribe_event`, `TopicRegistry.subscribe`) agree on these exception types (R4-XX-4).
+- `ValueError` if `target_access_name` is empty or whitespace-only, for malformed topic patterns, or for invalid filter values — validated by `_validate_subscription_topic` and a `target_access_name` re-check on the Plexus side. Topic and filter values are validated identically to YAML load. `Plugin.subscribe` and `TopicRegistry.subscribe` raise `TypeError` for a non-string `target_access_name`, but `Plexus.subscribe_event` collapses the non-string and empty cases into `ValueError`, so the three layers agree except on that one input.
 
 > **Do not use** the legacy `handler=` keyword form — it was removed. Runtime subs always route to a NAMED endpoint via `target_access_name`.
 
@@ -342,7 +342,7 @@ All eight error-handling decorators live in `plexus.decorators`. They come in ma
 | Decorator                              | Function shape       | Behaviour on raise                                          |
 |----------------------------------------|----------------------|-------------------------------------------------------------|
 | `log_errors(logger=None)`              | sync                 | Log via injected logger or `args[0]._logger`. Re-raise.     |
-| `handle_errors(default_return=None, logger=None)` | sync         | Log. Swallow. Return `default_return`.                      |
+| `handle_errors(*, default_return=None, logger=None)` | sync         | Log. Swallow. Return `default_return`.                      |
 | `async_log_errors`                     | async                | Log. Re-raise. Dual-dispatch: bare (`@async_log_errors`) and parens (`@async_log_errors()`) both work. |
 | `async_handle_errors(default_return=None)` | async             | Log. Swallow. Return `default_return`. **`RequestException` always propagates** so callers can still catch plugin-call errors. |
 | `gen_log_errors(logger=None)`          | sync generator       | Log. Re-raise.                                              |
@@ -389,9 +389,9 @@ From `plexus.exceptions` (also re-exported from the top-level `plexus` package).
 | `NoLocalSubException`     | `RequestException` | Peer signals "no local sub matched" on a remote `request_event` / `request_event_stream`. Distinct subclass so request-event fall-through preserves order. |
 | `CapabilityException`     | `RequestException` | Raised by the capability gate on a denied identity assertion. See [capabilities](./capabilities.md).                                                      |
 | `RateLimitException`      | `RequestException` | Raised on a rate-limit reject (OUT and 1:1 IN paths). See [rate limiting](./rate_limiting.md).                                                            |
-| `NodeException`           | `Exception`        | Generic node-level error (e.g. unknown / disabled node).                                                                                                 |
+| `NodeException`           | `Exception`        | Defined and serialisable, but **never raised** anywhere in `plexus/`. Do not write `except NodeException`.                                                                                                 |
 | `PluginTypeMismatchError`| `Exception`        | A `decorators.py` decorator is applied to a function whose sync/async/gen/async-gen kind does not match.                                                 |
-| `PluginDependencyError`   | `Exception`        | Raised at boot by the dependency resolver when a plugin's `dependencies:` constraint cannot be satisfied — missing required dep, version mismatch, dep in `FAILED_LOAD` state, or a dependency cycle. |
+| `PluginDependencyError`   | `Exception`        | Defined and used as a *label* in `last_errors` records for an unsatisfied dependency (missing dep, version mismatch, dep in `FAILED_LOAD`, or a cycle), but **never raised** — the resolver transitions the plugin to `FAILED_LOAD` instead. Do not write `except PluginDependencyError`. |
 
 In practice, catch `RequestException` — it covers `execute*`, `request_event*`, and their network counterparts.
 
@@ -472,9 +472,9 @@ The methods below are on `Plexus` itself. Plugin authors use the `Plugin` wrappe
 | `await plx.request_event(publisher, event_id, ...)` | Underlying request path. |
 | `plx.request_event_sync(...)` | Sync. |
 | `await plx.request_event_stream(publisher, event_id, ...)` | Streaming request path. |
-| `await plx.subscribe_event(topic, plugin_name, plugin_uuid, target_access_name, ...)` | Runtime sub registration with full validation and delta broadcast. |
-| `await plx.unsubscribe_event(sub_uuid) -> bool` | With remove-delta broadcast. |
-| `await plx.set_subscription_enabled(sub_uuid, enabled) -> bool` | Toggle a subscription's enabled flag. Broadcasts add/remove-delta on transition; emits `_core/subscription/state_changed`. |
+| `await plx.subscribe_event(topic, plugin_name, plugin_uuid, target_access_name, ...)` | Runtime sub registration with full validation. No delta push to peers — netcore propagates the change via the pull-based content-hash directory snapshot at heartbeat cadence. |
+| `await plx.unsubscribe_event(sub_uuid) -> bool` | No remove-delta push; peers converge on the next directory pull. |
+| `await plx.set_subscription_enabled(sub_uuid, enabled) -> bool` | Toggle a subscription's enabled flag. No delta push on transition (peers converge on the next directory pull); emits `_core/subscription/state_changed`. |
 | `await plx.set_event_enabled(plugin_name, event_id, enabled) -> bool` | Toggle an event's enabled flag. Local-only — emits `_core/event/state_changed` on change. |
 | `plx.internal_observe(plugin_uuid, topic, callback)` | Register a sync observer `callback(topic, payload_dict)` for a `_core/...` framework topic. Plugin wrapper auto-fills `plugin_uuid`. |
 | `plx.internal_unobserve(plugin_uuid, topic, callback) -> bool` | Remove an observer registration. `True` if one was removed. |

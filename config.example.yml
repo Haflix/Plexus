@@ -88,9 +88,12 @@ general:
 networking:
     enabled: false
     port: 2510
-    discover_nodes: true
-    direct_discoverable: true
-    auto_discoverable: true
+    # Opt in to vouch-discovery (a peer may learn about other peers from the
+    # ones it is configured with). Defaults to false; an edge forms only when
+    # BOTH ends set it. The legacy spellings auto_discoverable /
+    # direct_discoverable are still accepted as aliases, and discover_nodes is
+    # retired and ignored.
+    discoverable: false
     # peers:
     #   - hostname: other-node
     #     address: 10.0.0.5:9876

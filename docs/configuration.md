@@ -1,6 +1,6 @@
 # Configuration
 
-*Last updated for Plexus 0.74.0*
+*Last updated for Plexus 0.81.0*
 
 Reference for the top-level `config.yml` — the file Plexus reads on
 startup to find plugins, configure the runtime, and (when enabled) wire
@@ -49,9 +49,10 @@ raises `ConfigException` on startup if any of the three is missing.
 
 ## `plugins:` (list of dicts)
 
-Each entry describes one plugin to load. Order matters for shutdown:
-plugins are disabled in **reverse config order**, so list dependencies
-before their dependents.
+Each entry describes one plugin to load. Config order does **not**
+control shutdown: plugins are disabled in reverse **dependency** order
+(the reverse of the resolved topological order), so express ordering
+with a `dependencies:` declaration rather than list position.
 
 ```yaml
 plugins:
@@ -190,17 +191,19 @@ overrides:
 ```
 
 Load fails with a `ConfigException` naming the unknown subkey. The
-same applies to typos *inside* a known endpoint:
+This strictness covers endpoint **names** only. Keys *inside* a known
+endpoint are not validated:
 
 ```yaml
 overrides:
   endpoints:
     send_message:
-      remoet: true                   # typo for "remote" — fail-load
+      remoet: true                   # typo for "remote" — silently merged in
 ```
 
-Use this strictness deliberately: misspelled override keys never reach
-production silently. Reserved endpoint `access_name` values follow the
+A misspelled key inside an endpoint body is added to the merged endpoint
+with a DEBUG log and no error, and the endpoint keeps its real `remote`
+value. Check override bodies against the plugin's manifest yourself. Reserved endpoint `access_name` values follow the
 same forbidden list as plugin names: `system`, `general`, `any`,
 `remote`, `local`, `plexus`.
 
@@ -270,16 +273,19 @@ Shutdown's per-plugin cap is hardcoded 30s separately and is not
 affected by this knob.
 
 If `on_disable` raises, times out, or returns, the framework still
-flips `enabled = False` and unregisters the plugin's subs — bookkeeping
-is in `try/finally`. The timeout exists so a hanging `on_disable` does
+transitions the plugin to `INACTIVE` and unregisters its subs —
+bookkeeping is in `try/finally`. (`enabled` is a read-only property
+derived from state; assigning to it raises `AttributeError`.) The timeout exists so a hanging `on_disable` does
 not block reload of other plugins.
 
 ### `plugin_enable_timeout` (default 30.0)
 
 Per-plugin cap on `on_enable` execution during runtime enable / load
 (`_enable_plugin_under_lock`). If `on_enable` exceeds this budget the
-plugin is force-rolled back to `INACTIVE` and `last_errors[Phase.ENABLE]`
-is populated with the `asyncio.TimeoutError`.
+plugin is force-rolled back to `INACTIVE`. Note that
+`last_errors[Phase.ENABLE]` is **not** written in this case —
+`asyncio.TimeoutError` is excluded from the error record along with
+`CancelledError`, so a hung enable leaves no entry behind.
 
 Bookkeeping (subscription/observer cleanup) still runs via the same
 `try/finally` chain as the success path, so a hung `on_enable` does not
@@ -373,7 +379,7 @@ Survival semantics:
 
 - **Plugin-source runtime overrides survive config reloads** — a
   `load_config_yaml` does not wipe them.
-- They ARE auto-cleared on `on_disable`, hot-swap, pop, purge, and
+- They ARE auto-cleared on hot-swap, pop, purge, and
   shutdown — the framework tracks them by `(plugin_name, plugin_uuid)`.
 - Each plugin's overrides are independent — clearing one plugin's
   override does not affect another plugin's override of the same
@@ -403,7 +409,10 @@ networking:
   peers:
     - hostname: "node-b"
       address: "10.0.0.2"
-      cert_file: "_keys/node-b.cert.pem"
+      cert_pem: |
+        -----BEGIN CERTIFICATE-----
+        MIIBIjANBg...
+        -----END CERTIFICATE-----
       fingerprint: "sha256:abcd..."
 ```
 
@@ -413,7 +422,7 @@ networking:
 |---|---|---|---|
 | `enabled` | bool | `false` | Toggles all networking. When `false`, `NetworkManager` is not created. |
 | `port` | int | `2510` | Default TCP port for the mTLS server. Per-peer port overrides via `address: ip:port`. |
-| `hostname` | str | `socket.gethostname()` | Node's networking hostname. Separate from `general.hostname` if needed for tests. |
+| `hostname` | str | — | **Not read.** Retained only as a rebuild-trigger field for backward compatibility; netcore takes its identity from `general.hostname`. Setting it has no effect on the wire hostname. |
 | `keys_dir` | str | `"keys"` | Where this node's `cert.pem` / `key.pem` live (auto-generated on first run). Resolved relative to the config file's directory if not absolute. |
 | `peers` | list[dict] | `[]` | Peer trust list (see below). Empty is tolerated: the acceptor binds and swaps in the live TLS context on the first `add_peer`; the SPKI pin + roster gate still reject any unpinned inbound. |
 | `discoverable` | bool | `false` | Opt in to §4.7 vouch-discovery: accept peers vouched by an already-trusted peer, so a star can grow edges. Explicit `peers:` pins work regardless of this. Legacy `auto_discoverable` / `direct_discoverable` are accepted as aliases (either `true` → `discoverable`). |
@@ -449,8 +458,7 @@ warning for the legacy keys.
 |---|---|---|---|
 | `hostname` | str | YES | Canonical routing key (survives reconnect / IP change). |
 | `address` | str | YES | `ip` or `ip:port`. Bare IP uses cluster default port. |
-| `cert_file` | str | one of | Path to the peer's PEM-encoded certificate, relative to the config file. |
-| `cert_pem` | str | one of | Inline PEM string. Pick `cert_file` OR `cert_pem`. |
+| `cert_pem` | str | YES | Inline PEM string (YAML block scalar). The only supported form — there is no `cert_file` option for a peer; an entry without `cert_pem` is rejected as malformed and skipped with a warning. |
 | `fingerprint` | str | optional | `sha256:<hex>` of the SubjectPublicKeyInfo DER. Derived from the cert at parse time; if supplied, must match (mismatch is a hard error). |
 | `system_caller` | bool | optional | When `true`, this peer's calls inherit `"system"` author privileges (bypasses author whitelists). Default `false`. |
 | `dial` | str | optional | Per-edge dialer override for a NAT edge. Its PRESENCE (any value) flips this side into a dialer when hostname-lex election would otherwise make it the acceptor; the peer is dialed at its configured `address` (the `dial` value itself is never read). Rarely needed. |
@@ -459,7 +467,10 @@ warning for the legacy keys.
 peers:
   - hostname: alpha
     address: "10.0.0.1"              # bare IP -> cluster default port
-    cert_file: _keys/peers/alpha.pem
+    cert_pem: |
+      -----BEGIN CERTIFICATE-----
+      MIIBIjANBg...
+      -----END CERTIFICATE-----
     system_caller: false
 
   - hostname: beta
@@ -490,7 +501,7 @@ fingerprint and cert so you can populate the other nodes' `peers:`.
 
 When migrating an older config, replace the top-level `node_ips:` list
 with a `peers:` list (one entry per peer with `hostname`, `address`,
-and either `cert_file` or `cert_pem`).
+and `cert_pem`).
 
 ---
 
@@ -556,7 +567,10 @@ networking:
   peers:
     - hostname: beta
       address: "10.0.0.2:2510"
-      cert_file: "_keys/peers/beta.pem"
+      cert_pem: |
+        -----BEGIN CERTIFICATE-----
+        MIIBIjANBg...
+        -----END CERTIFICATE-----
     - hostname: gamma
       address: "10.0.0.3:2511"
       cert_pem: |
@@ -579,11 +593,11 @@ those cert files.
 validates it, and re-applies it. The async wrapper is
 `async_load_config_yaml(path)`. Behaviour:
 
-- Top-level `plugins:` entries that newly appear get loaded.
-- Entries that disappear get popped.
-- Entries whose `overrides` change materially trigger a hot-swap of the
-  affected plugin (via `_reload_plugin` — the `on_disable` + fresh
-  `__init__` + `on_enable` path).
+- The `plugins:` list is **not** reconciled. Entries that newly appear are
+  not loaded, entries that disappear are not popped, and a changed
+  `overrides:` block does not trigger a hot-swap. To add, remove or
+  reload a specific plugin, call `_reload_plugin` or `pop_plugin` +
+  `load_plugin_with_conf` explicitly.
 - Plugin-source per-logger runtime overrides survive the reload (they
   are auto-cleared only on disable / pop / purge / shutdown).
 - **Networking** knobs are read once at `NetworkManager` construction. A reload

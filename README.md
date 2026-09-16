@@ -1,6 +1,6 @@
 # Plexus
 
-*Last updated for Plexus 0.66.0*
+*Last updated for Plexus 0.81.0*
 
 An async Python plugin framework with multi-node mTLS networking and pub/sub
 event routing. PyPI package: [`plexus-core`](https://pypi.org/project/plexus-core/).
@@ -71,8 +71,8 @@ pip install plexus-core[fastloop]
 From source (for developing on the framework itself):
 
 ```bash
-git clone https://github.com/Haflix/AIO_Assistant_Core.git
-cd AIO_Assistant_Core
+git clone https://github.com/Haflix/Plexus.git
+cd Plexus
 python -m venv .venv
 .venv/Scripts/activate          # Windows
 # source .venv/bin/activate     # Linux / macOS

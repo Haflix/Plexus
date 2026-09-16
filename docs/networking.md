@@ -1,16 +1,16 @@
 # Networking
 
-*Last updated for Plexus 0.74.0*
+*Last updated for Plexus 0.81.0*
 
 Plexus ships with an optional `NetworkManager` that bridges plugin calls between nodes over an mTLS-pinned TCP protocol. With networking enabled, calling `await self.execute("OtherPlugin", ...)` works whether `OtherPlugin` is on this node or another node. The same applies to `publish_event` and `request_event` (and their streaming variants).
 
-The current implementation lives in the `plexus/netcore/` package. The old import path `plexus.networking` is now a thin compatibility shim that re-exports `plexus.netcore.NetworkManager` plus a handful of legacy symbols (`PeerSpec`, `Node`, `RemotePlugin`, `safe_loads`, `generate_keypair`, `FINGERPRINT_CLI_CMD`, and a retired `AdvertSub` placeholder) so existing importers keep working. The old advert-push / connection-pool / `MSG_*` machinery is gone by design.
+The current implementation lives in the `plexus/netcore/` package. The old import path `plexus.networking` is now a thin compatibility shim that re-exports `plexus.netcore.NetworkManager` plus a handful of legacy symbols (`PeerSpec`, `Node`, `RemotePlugin`, `safe_loads`, `generate_keypair`, `FINGERPRINT_CLI_CMD`, a retired `AdvertSub` placeholder, and nine `DEFAULT_*` timing constants) so existing importers keep working. Two of those constants are still live rather than vestigial: `plexus/utils.py` imports `DEFAULT_HEARTBEAT_INTERVAL` and `DEFAULT_LIVENESS_TIMEOUT` from this path, so the shim cannot simply be deleted. The old advert-push / connection-pool / `MSG_*` machinery is gone by design.
 
 This document covers the trust model, peer configuration, per-node port handling, the content-hash directory-pull model, liveness, discovery, the remote-reachability gate, how remote dispatch flows, and the wire protocol for advanced readers.
 
 For the full configuration block reference, see [configuration](./configuration.md). For local notifier semantics that the remote `publish_event` / `request_event` paths extend, see [notifier](./notifier.md).
 
-The netcore package is split into six behavioural modules that this document maps onto:
+The netcore package is split into seven modules that this document maps onto:
 
 | Module | Responsibility |
 |---|---|
@@ -20,7 +20,7 @@ The netcore package is split into six behavioural modules that this document map
 | `netcore/directory.py` | The content-hash directory: local snapshot derivation, remote-snapshot reconcile, the `route_*` routing seam. |
 | `netcore/transport.py` | One bidirectional link per peer: dial election + supervisor, the write-pump, reassembly budgets, the flap guard, SPKI authentication, `InboundReject`. |
 | `netcore/dispatch.py` | The cross-node CALL senders, error mapping, and the inbound authorize/dispatch seam. |
-| `netcore/manager.py` | The `NetworkManager` root that composes the five above, parses config peers, and exposes `route_*` / the `*_remote` senders / `snapshot()` to core. |
+| `netcore/manager.py` | The `NetworkManager` root that composes four of the above (`Directory`, `Membership`, `Dispatch`, `Transport`; `types` and `wire` are shared support modules), parses config peers, and exposes `route_*` / the `*_remote` senders / `snapshot()` to core. |
 
 ---
 
@@ -50,13 +50,19 @@ networking:
   port: 2510                  # cluster default port; per-peer overrides allowed
   hostname: ""                # empty = socket.gethostname()
   keys_dir: "keys"            # where this node's cert.pem / key.pem live
+  # NOTE: there is no effective `hostname:` key here. netcore takes its
+  # identity from general.hostname; a networking.hostname value is ignored
+  # (it survives only as a rebuild trigger for backward compatibility).
   discoverable: false         # opt in to vouch-discovery (legacy
                               # auto_discoverable / direct_discoverable accepted as aliases)
 
   peers:
     - hostname: alpha
       address: "10.0.0.1"
-      cert_file: "_keys/peers/alpha.pem"
+      cert_pem: |
+        -----BEGIN CERTIFICATE-----
+        MIIBIjANBg...
+        -----END CERTIFICATE-----
       fingerprint: "sha256:abcd...ef"  # optional; if set must match derived
       system_caller: false             # optional
 
@@ -71,9 +77,8 @@ networking:
 | Field            | Type    | Required | Notes                                                                                                          |
 |------------------|---------|----------|----------------------------------------------------------------------------------------------------------------|
 | `hostname`       | `str`   | yes      | Peer's logical name and the routing key. Reconnects / IP changes never invalidate routing state, which keys on hostname. |
-| `address`        | `str`   | yes      | `"ip"` or `"ip:port"`. A bare IP uses the cluster default port; a single-colon `ip:port` overrides the port.    |
-| `cert_file`      | `str`   | one of   | Path to the peer's PEM cert. Resolved relative to the config file's directory if not absolute.                  |
-| `cert_pem`       | `str`   | one of   | Inline PEM body (YAML block scalar). Pick `cert_file` OR `cert_pem`.                                            |
+| `address`        | `str`   | yes      | `"ip"` or `"ip:port"`. A bare IP uses the cluster default port; a trailing `:port` overrides it. The split is on the LAST colon with a digits-only suffix, so a bracketless IPv6 literal such as `::1` is misparsed — bracket it or give it an explicit port.    |
+| `cert_pem`       | `str`   | yes      | Inline PEM body (YAML block scalar). This is the only supported form — there is no `cert_file` option; an entry without `cert_pem` is rejected as malformed and skipped with a warning. |
 | `fingerprint`    | `str`   | optional | `sha256:<hex>`. If set, must match the fingerprint derived from the cert, else the entry is rejected.           |
 | `system_caller`  | `bool`  | optional | Default `false`. When `true`, this peer's inbound calls may act as the privileged `"system"` identity. See [Cross-node identity](#cross-node-identity-and-the-system-caller). |
 | `dial`           | `str`   | optional | Per-edge dialer override for a NAT edge. Its PRESENCE (any value) flips this side into a dialer when hostname-lex election would otherwise make it the acceptor; it dials the peer at its configured `address` (the field's value is never read). Rarely needed. |
@@ -248,7 +253,7 @@ The streaming variant (`request_event_stream`) has identical fall-through semant
 
 ### `publish_event`
 
-Local subscribers are dispatched in-process. For remote fan-out, core asks `route_publish(topic)`, which GROUPS matching subs per peer: `(hostname, list[RemoteSub])`. Core applies its predicates per sub, sums the surviving matches into the scheduled count, and sends **one** `CALL{mode=FANOUT}` frame per peer (not one per sub). The return value is the scheduled count (local plus the sum of matching remote subs across reachable peers), not a completion count. A FANOUT has no reply channel: an inbound reject at the callee stays SILENT, and a down peer is dropped silently.
+Local subscribers are dispatched in-process. For remote fan-out, core asks `route_publish(topic)`, which GROUPS matching subs per peer: `(hostname, list[RemoteSub])`. Core applies its predicates per sub, sums the surviving matches into the scheduled count, and sends **one** `CALL{mode=FANOUT}` frame per peer (not one per sub). The return value is the scheduled count (local plus the sum of matching remote subs across reachable peers), not a completion count. A FANOUT has no reply channel, so the caller observes nothing either way and a down peer is dropped silently. On the wire it is not strictly silent: a reject raised during header authorization (rate limit, spoof, revoked peer, per-peer cid cap) still emits an `ERROR` frame, which the sender discards because no `Pending` was registered. Rejects after the args arrive are mode-checked and genuinely suppressed.
 
 ### Error mapping
 
@@ -347,7 +352,7 @@ Reassembly is bounded at three levels; the config knob names match [configuratio
 | across all in-flight messages from one peer | 16 MB | `per_peer_reassembly_cap` |
 | aggregate across all peers | 128 MB | `node_reassembly_cap` |
 
-The largest single value you can receive is `min(per_cid, per_peer)`. A per-peer guaranteed minimum (2 MB) is always admitted regardless of the node-wide total, so a newcomer can always start SOME reassembly. Independently, one peer may have at most `per_peer_cid_cap` (default 64) concurrent inbound CALLs open at once; a CALL past that cap gets an immediate `ERROR{NETWORK}` before any arg is buffered. Two per-reassembly deadlines also bound a slow drip: an absolute 60 s deadline (armed at the first chunk) and a per-chunk idle deadline (`stream_idle_deadline`, default 30 s), both on the monotonic clock.
+The largest single value you can receive is `min(per_cid, per_peer)`. A per-peer guaranteed minimum (2 MB) is always admitted regardless of the node-wide total, so a newcomer can always start SOME reassembly. Independently, one peer may have at most `per_peer_cid_cap` (default 64) concurrent inbound CALLs open at once; a CALL past that cap gets an immediate `ERROR{NETWORK}` before any arg is buffered. Two per-reassembly deadlines also bound a slow drip: an absolute 60 s deadline (armed at the CALL header, not at the first chunk, so a peer that opens a cid and then withholds every arg chunk is still bounded) and a per-chunk idle deadline (`stream_idle_deadline`, default 30 s), both on the monotonic clock.
 
 ### Tear vs. cancel
 
@@ -406,9 +411,9 @@ The netcore modules emit `_core/*` events through the core notifier's internal o
 
 Once at least one node already has a `cert.pem` and is in another node's `peers:` list, the normal mTLS pinning flow applies. To add a new node:
 
-1. Decide the new node's hostname (`networking.hostname`, or empty for `socket.gethostname()`) and port (`networking.port`, default `2510`).
-2. Obtain the new node's `cert.pem` and SPKI fingerprint via the networking CLI fingerprint helper.
-3. On every existing node, add a `peers:` entry for the new node with hostname, address, and `cert_file:` (or inline `cert_pem:`). Optionally pin `fingerprint:` for defense in depth.
+1. Decide the new node's hostname (`general.hostname`, or empty for `socket.gethostname()` — note `networking.hostname` is **not** read by netcore) and port (`networking.port`, default `2510`).
+2. Obtain the new node's SPKI fingerprint with the networking CLI fingerprint helper, and read the certificate body straight out of `keys_dir/cert.pem`.
+3. On every existing node, add a `peers:` entry for the new node with hostname, address, and the inline `cert_pem:` block. Optionally pin `fingerprint:` for defense in depth.
 4. On the new node, add `peers:` entries for every existing node (each with its cert and address).
 5. Set `networking.enabled: true` on the new node and confirm the existing nodes still have it enabled.
 6. Restart the new node (or hot-reload config). Existing nodes can pick up the new peer via config reload as well. Each side now pins the other; the mTLS handshake succeeds, the directory pull runs on the next heartbeat, and calls flow.
@@ -426,14 +431,14 @@ Standing up a brand-new cluster from zero certificates follows a one-shot first-
 For each node, in any order:
 
 1. Install the framework and write `config.yml` with `networking.enabled: true` and an empty `peers: []`.
-2. Run the application once. Identity is loaded or generated into `keys_dir` (default `keys/`) and the fingerprint plus cert PEM are logged at INFO. An empty `peers:` list does not error — the node just waits for peers — so you can grab the fingerprint and cert from the logs to populate the OTHER nodes.
-3. Copy the `sha256:...` fingerprint and the cert PEM block from the log. The same data can be re-read with the networking CLI fingerprint helper.
-4. Exchange fingerprints and cert PEMs between nodes out of band. Each node's `peers:` block needs at least one entry per other node it wants to reach, with that peer's `hostname`, `address`, `cert_file` or `cert_pem`, and optionally `fingerprint`.
+2. Run the application once. Identity is loaded or generated into `keys_dir` (default `keys/`). An empty `peers:` list does not error — the node just waits for peers — so a first start is productive: it materialises `cert.pem` and `key.pem` for you to copy to the OTHER nodes.
+3. Read the `sha256:...` fingerprint with the networking CLI fingerprint helper, and copy the certificate body from `keys_dir/cert.pem`. Neither value is logged at startup, so the files and the CLI are the only sources.
+4. Exchange fingerprints and cert PEMs between nodes out of band. Each node's `peers:` block needs at least one entry per other node it wants to reach, with that peer's `hostname`, `address`, `cert_pem`, and optionally `fingerprint`.
 5. Start each node again. With `peers:` populated, each node builds its SSL contexts, binds the listener, seeds its peers, and starts the heartbeat pulse.
 
 ### Getting this node's fingerprint on first start
 
-Identity is loaded (or generated) at `NetworkManager` construction, before anything is served, so even a node with an empty `peers:` list comes up and logs its fingerprint and cert PEM. That is the data you need to populate `peers:` on the OTHER nodes, so a first start is productive even before this node has any peers of its own. The fingerprint and cert PEM are logged at INFO; if the console is at WARNING+ they appear only in the file log.
+Identity is loaded (or generated) at `NetworkManager` construction, before anything is served, so even a node with an empty `peers:` list comes up and writes `cert.pem` / `key.pem` into `keys_dir`. That is the data you need to populate `peers:` on the OTHER nodes, so a first start is productive even before this node has any peers of its own. Note that neither the fingerprint nor the cert PEM is logged — read them from `keys_dir/cert.pem` and the networking CLI fingerprint helper.
 
 ---
 

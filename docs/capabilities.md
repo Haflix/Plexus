@@ -1,6 +1,6 @@
 # Capabilities and Caller Identity
 
-*Last updated for Plexus 0.74.0*
+*Last updated for Plexus 0.81.0*
 
 Every call in Plexus carries a **caller identity**: the framework knows which
 plugin initiated each operation and the chain of plugins it passed through.
@@ -8,7 +8,7 @@ Normally a plugin acts as itself. The **capabilities** system is the operator's
 opt-in grant that lets a specific plugin act under a *different* identity, either
 to impersonate another plugin or to act as the privileged `system` caller.
 
-This is off by default and fail-closed. With no `capabilities:` configured, the
+This is off by default. With no `capabilities:` configured, the
 gate is inert, every plugin is simply itself, and there is zero per-dispatch
 overhead. The rate limiter uses the same caller-identity machinery to decide who
 a call is charged to, see [rate_limiting.md](./rate_limiting.md).
@@ -102,8 +102,16 @@ the sync bridge).
 
 ## Rules the gate enforces
 
-- **Default deny.** An assertion with no matching grant is denied. The gate fails
-  closed.
+- **Default deny, when a caller frame is present.** An assertion evaluated
+  against a grant that does not permit it is denied, and the gate fails closed.
+- **Known gap (B-105).** The gate is a pass-through when the caller chain is
+  empty, on the assumption that an empty chain means framework origin. A thread a
+  plugin starts itself inherits neither the `ContextVar` nor the thread-local that
+  carry the chain, so an assertion made from such a thread — the ordinary shape
+  for a tier-1 plugin wrapping a blocking driver — is never evaluated. The
+  cross-node leg is hardened separately and is not affected. Until this is closed,
+  treat the gate as constraining calls that originate from a plugin's own task,
+  not as an unconditional guarantee.
 - **No chaining.** An identity that was itself asserted cannot be used as the
   basis for a further assertion. You cannot launder a claim through a second hop:
   the gate reasons about the *real* caller chain, not a previously-asserted label.
@@ -172,7 +180,9 @@ no plugin frame and are exempt from per-plugin charges. See
 
 ## Quick reference
 
-- Off by default, fail-closed; opt in with `capabilities:`.
+- Off by default; opt in with `capabilities:`. Fail-closed for calls that carry a
+  caller frame — see the B-105 gap above for calls made from a plugin-created
+  thread.
 - `system_caller: true` grants the privileged `system` identity.
 - `impersonation_allowed: caller | ancestor | [names]` grants impersonation scope.
 - A plugin asserts via `execute(..., author=, author_id=)`; an ungranted

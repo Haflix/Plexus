@@ -1,6 +1,6 @@
 # Plugin Authoring Guide
 
-*Last updated for Plexus 0.74.0*
+*Last updated for Plexus 0.81.0*
 
 Write a plugin from scratch. This page walks through the moving parts in
 the order an author meets them; reference details live in
@@ -133,10 +133,9 @@ with this unpacking rule:
 
 | `arguments:` value | `on_load` call |
 |---|---|
-| `[1, 2]` (list/tuple) | `on_load(1, 2)` |
 | `{"x": 1, "y": 2}` (dict) | `on_load(x=1, y=2)` |
 | `null` / missing | `on_load()` |
-| anything else | `on_load()` (value dropped) |
+| anything else (list, tuple, scalar) | **fail-load** — raises `ConfigException` and aborts the boot |
 
 Use `**kwargs` if you want robust handling regardless of YAML shape:
 
@@ -301,8 +300,10 @@ Resolution behavior (at boot, after `get_plugins` and before
 
 **Known limitations** (documented in `dependencies.py` and `core.py`):
 
-- Boot-time only. Hot-reloading a plugin with new `dependencies:` does
-  NOT re-run resolution; restart the framework to enforce changed deps.
+- Resolution re-runs on hot-reload. `_reload_plugin` recomputes the
+  dependency graph before re-enabling, so a reloaded plugin whose
+  `dependencies:` no longer resolve is caught by the reload itself and
+  can be marked `FAILED_LOAD` without a restart.
 - Cross-node deps are NOT supported. Dependencies must be satisfied
   within the same Plexus process; depending on a plugin running only on
   a peer node reports as "missing".
@@ -627,7 +628,7 @@ Each plugin tracked by the framework follows a 6-state machine:
 | `ENABLING` | `on_enable` in progress. |
 | `ENABLED` | `on_enable` returned. Endpoints dispatchable. |
 | `DISABLING` | `on_disable` in progress. |
-| `FAILED_LOAD` | `on_load` raised, a config/manifest validation failure (bad `path:`, malformed manifest, bad `endpoints`/`dependencies`/`events`/`subscriptions`/`rate_limits`, rejected override), or a dependency constraint failed (missing, version-mismatch, or cycle). No instance. An `on_load` raise or a config/manifest failure aborts the boot outright (plugins listed after it never load) and records `last_errors[Phase.LOAD]`; a dependency-resolution failure instead marks only the affected plugin(s) `FAILED_LOAD` while the rest of the boot proceeds, and leaves `last_errors[Phase.LOAD]` empty. Keep `on_load` unfailable and put anything that can fail in `on_enable`. See [architecture.md](./architecture.md#on_loadself-args-kwargs--synchronous). |
+| `FAILED_LOAD` | `on_load` raised, a config/manifest validation failure (bad `path:`, malformed manifest, bad `endpoints`/`dependencies`/`events`/`subscriptions`/`rate_limits`, rejected override), or a dependency constraint failed (missing, version-mismatch, or cycle). The instance is `None` only in the `on_load` and config-failure cases — a plugin the dependency resolver rejected was already constructed and keeps its instance. An `on_load` raise or a config/manifest failure aborts the boot outright (plugins listed after it never load) and records `last_errors[Phase.LOAD]`; a dependency-resolution failure instead marks only the affected plugin(s) `FAILED_LOAD` while the rest of the boot proceeds, and leaves `last_errors[Phase.LOAD]` empty. (The separate enable-time dependency cascade does record a `PluginDependencyError` there.) Keep `on_load` unfailable and put anything that can fail in `on_enable`. See [architecture.md](./architecture.md#on_loadself-args-kwargs--synchronous). |
 
 Read state with `plx.plugin_states[name].state`. The state enum lives in
 [`plexus/plugin_state.py`](../plexus/plugin_state.py); import as
@@ -679,7 +680,7 @@ Some operations emit multiple state-change events in rapid succession:
 | `plx.pop_plugin(name)` on ENABLED | `ENABLED → DISABLING → INACTIVE → UNLOADED` |
 | `plx.pop_plugin(name)` on INACTIVE | `INACTIVE → UNLOADED` |
 | `plx._reload_plugin(name)` on ENABLED | `ENABLED → DISABLING → INACTIVE → UNLOADED → INACTIVE → ENABLING → ENABLED` |
-| `plx.enable_plugin(name)` on UNLOADED | `UNLOADED → INACTIVE → ENABLING → ENABLED` |
+| `plx.enable_plugin(name)` on UNLOADED | no transition — silent no-op. `INACTIVE` is the only valid starting state for enable; load the plugin first with `load_plugin_with_conf`. |
 
 Observers reacting to INACTIVE alone may take action assuming the plugin
 is just disabled (re-enableable) and then immediately see UNLOADED.

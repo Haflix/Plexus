@@ -1,6 +1,6 @@
 # Rate Limiting
 
-*Last updated for Plexus 0.74.0*
+*Last updated for Plexus 0.81.0*
 
 Plexus has a built-in, multi-dimensional token-bucket rate limiter. It is
 **opt-in and off by default**: a node with no `rate_limits:` configured pays
@@ -33,7 +33,10 @@ Two properties matter:
   once (for example an endpoint call charges both its per-endpoint and its
   per-plugin bucket). The limiter checks them all first and only deducts if every
   bucket can pay. If any one is empty, nothing is deducted and that bucket is
-  reported as the binding limit. A reject never half-drains the others.
+  reported as the binding limit. A reject never half-drains the others — with one
+  exception: on the inbound peer path `nodes_in` and `framework_in` are charged by
+  two separate admits, so a `framework_in` reject leaves the peer's `nodes_in`
+  token already deducted (tracked as B-108).
 
 ---
 
@@ -86,7 +89,9 @@ its own endpoint) charges both its `plugin_out` at OUT and its `plugin_in` at IN
 
 **Remote operations** add Nodes-IN. When a call arrives from a remote peer, the
 inbound networking handler charges `nodes_in(peer)` once; the global
-`framework_in` is charged exactly once per remote operation as well (via the
+`framework_in` is charged once per remote operation on every path except a remote
+`request_event_stream`, which is charged twice — once at `authorize_inbound` and
+again on the re-entry's OUT admit (tracked as B-107). Otherwise it is charged via the
 handler's re-entry into the local dispatch for execute, or directly in the event
 handlers). Per-peer flooding is reported as the `nodes_in` dimension rather than
 the global cap.
@@ -100,9 +105,12 @@ capability to act as `X` and asserts it, the `plugin_out` charge lands on `X`, n
 
 Two framework-origin cases differ:
 
-- **Lifecycle scope** (`on_load` / `on_enable` / `on_disable` and the calls they
-  make) is stamped *exempt* and skips the limiter entirely, `framework_in`
-  included, so a plugin's startup burst cannot rate-limit the boot sequence.
+- **Lifecycle scope** (`on_enable` / `on_disable` and the calls they make) is
+  stamped *exempt* and skips the limiter entirely, `framework_in` included, so a
+  plugin's startup burst cannot rate-limit the boot sequence. Note `on_load` is
+  **not** stamped — it runs inside `Plugin.__init__` with no scope, so a bus call
+  issued from `on_load` (reachable on a hot-reload, when the loop is already
+  bound) is charged against `framework_in` like any other call.
   Framework-internal `_core/` events are likewise structurally exempt.
 - **System-origin / empty-chain** operations (a direct framework `execute`, a
   remote re-entry) are NOT exempt. They carry no plugin frame, so there is no name
@@ -235,8 +243,10 @@ stream open always costs 1.
 
 ## Observability
 
-- **Every reject names itself.** The dry bucket's dimension and key are in the
-  exception message, so "why was this blocked?" is always one line.
+- **Every reject names itself** — except across the wire. The dry bucket's
+  dimension and key are in the exception message for every locally raised reject.
+  An inbound peer reject arrives at the caller as a bare
+  `RateLimitException("remote rate limit")` with neither (tracked as B-106).
 - **Per-bucket counters.** Each bucket tracks lifetime `charged` and `rejected`
   counts. `RateLimiter.stats()` returns a snapshot list of
   `{dim, key, charged, rejected, tokens, max, last, rate}` records, the read
@@ -248,14 +258,19 @@ stream open always costs 1.
   wall-clock.
 - **Reject-log suppression.** A runaway caller hitting a cap thousands of times a
   second would otherwise emit thousands of WARNING lines. Instead, the first
-  reject per `(dimension, key)` per ~10s window logs a WARNING; further rejects in
+  reject per `(dimension, key)` per ~10s window logs a WARNING (the per-peer
+  `nodes_in` dimension is the exception — it is rejected inside the networking
+  layer and never reaches this logger at all, so a peer flood produces no
+  `[RATELIMIT]` lines; see B-106); further rejects in
   that window only bump the counter; the next reject after the window logs a
   one-line summary of how many were suppressed. The counters carry the true
   volume; the logs carry the signal. The capability gate's security audit events
   are de-duplicated the same way (see [capabilities.md](./capabilities.md)).
 - **Reject event (`_core/ratelimit/rejected`).** To consume rejects
   programmatically (a live dashboard, a metrics sink), observe the internal-bus
-  topic `_core/ratelimit/rejected` via `internal_observe`. It fires on the SAME
+  topic `_core/ratelimit/rejected` via `internal_observe`. This feed covers the six
+  locally charged dimensions; `nodes_in` never appears on it (B-106) — for per-peer
+  rejects observe `_core/net/reject` or read `Bucket.rejected` from `stats()`. It fires on the SAME
   first-per-window gate as the WARNING above (one emit per `(dimension, key)` per
   window, so a reject flood cannot spam the bus), and the emit fast-paths out when
   no observer is registered. Payload:
@@ -274,8 +289,10 @@ When no limit is configured, the charge path short-circuits on a single branch
 and the caller-identity machinery stays inert, so a default node pays nothing.
 When limits are active, the hot path iterates a precomputed list of bucket
 references (no key building or dict walks per call) and reads the clock once per
-operation. The only per-call allocation is the first-contact creation of a
-`nodes_in` bucket for a newly-seen peer.
+operation. The only per-call allocation on the plain path is the first-contact creation of a
+`nodes_in` bucket for a newly-seen peer. When an identity is asserted the OUT admit
+takes the dynamic branch instead, building a fresh bucket list plus one or two
+registry lookups and an `event_key` string on every call.
 
 ---
 

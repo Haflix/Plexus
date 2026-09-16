@@ -1,6 +1,6 @@
 # Architecture
 
-*Last updated for Plexus 0.74.0*
+*Last updated for Plexus 0.81.0*
 
 This document describes the runtime shape of a Plexus process: how Plexus loads plugins, how the lifecycle hooks fire, what guarantees the framework gives during hot-swap and shutdown, and how the three-tier discipline organises the plugins themselves.
 
@@ -44,13 +44,19 @@ Plugins themselves are subclasses of `utils.Plugin`. They never construct Plexus
 
 ## Plugin layout
 
-A plugin is a directory containing exactly two files:
+A plugin is a directory containing two required files:
 
 ```
 MyPlugin/
     plugin.py             # one class subclassing utils.Plugin
     plugin_config.yml     # description, version, endpoints, events, subscriptions
 ```
+
+Those two are required, but they are not a maximum: a plugin may ship extra
+modules or sub-packages beside them. The loader appends the plugin directory to
+`sys.path` and passes `submodule_search_locations`, so `plugin.py` can import
+them, and every module a plugin owns is tracked so it can be unloaded when the
+plugin is popped.
 
 The directory name is conventional — what binds the plugin into the running process is the entry in `config.yml`:
 
@@ -79,9 +85,9 @@ Called inside `Plugin.__init__`, immediately after the framework attributes are 
 
 | `arguments:` value | Call site                |
 |--------------------|--------------------------|
-| list / tuple       | `on_load(*args)`         |
 | dict               | `on_load(**kwargs)`      |
-| anything else      | `on_load()` (no args)    |
+| omitted / `null`   | `on_load()` (no args)    |
+| anything else      | fail-load (`ConfigException`) |
 
 Constraints:
 
@@ -91,7 +97,7 @@ Constraints:
 - No `*_sync` calls. `execute_sync`, `publish_event_sync`, and `request_event_sync` will raise `RequestException("Framework not started — sync APIs require running event loop")` until the main event loop is bound.
 - Use it to declare instance variables (empty containers, defaults).
 
-After `on_load` returns, Plexus overwrites `plugin_name`, `version`, `remote`, `description`, `arguments`, `prefix`, `verbose_notifier`, `endpoints`, `events`, and `subscriptions` from the merged manifest plus `overrides:` block. So `on_load` sees framework defaults; everything outside `on_load` sees the real values.
+After `on_load` returns, Plexus overwrites `version`, `remote`, `description`, `prefix`, `verbose_notifier`, `endpoints`, `events`, and `subscriptions` from the merged manifest plus `overrides:` block, so `on_load` sees framework defaults for those and everything outside `on_load` sees the real values. `plugin_name` and `arguments` are deliberate exceptions: both are passed to `__init__` and are already correct **inside** `on_load`.
 
 **A raise in `on_load` aborts startup — by design.** The plugin is transitioned to `FAILED_LOAD` with its `Phase.LOAD` `ErrorRecord` recorded, then the exception propagates out of the boot load loop and the process exits. Plexus does not come up degraded: a plugin that cannot construct is treated as a deployment error, not a runtime condition. Two consequences worth knowing:
 
@@ -114,7 +120,7 @@ Order of operations inside `_enable_plugin_under_lock`:
 4. Because the `subscriptions:` registered in step 2 change what this node exports, its directory snapshot (and content hash) now differ; peers pick the change up on their next heartbeat pull. There is no per-subscription push to peers (the old instant add-delta broadcast was removed in the netcore rewrite).
 5. `on_enable` is called, wrapped in `asyncio.wait_for(timeout=plugin_enable_timeout)` (default 30s; configurable via `general.plugin_enable_timeout`). On timeout the enable is treated as a failure and the rollback in step 7 runs, so a hung `on_enable` cannot pin the lifecycle lock indefinitely.
 6. On success: the framework sets `_lifecycle_ready` and transitions `ENABLING` → `ENABLED`. Cross-plugin callers waiting on the readiness gate proceed.
-7. On failure (raise or cancel): `_lifecycle_ready` stays cleared, `ready` is reset, `on_disable` is called defensively, subscriptions are unregistered, and the state transitions `ENABLING` → `INACTIVE`. `last_errors[Phase.ENABLE]` is populated for non-cancellation exceptions.
+7. On failure (raise or cancel): `_lifecycle_ready` stays cleared, `ready` is reset, `on_disable` is called defensively, subscriptions are unregistered, and the state transitions `ENABLING` → `INACTIVE`. `last_errors[Phase.ENABLE]` is populated for genuine exceptions only — both `asyncio.CancelledError` and `asyncio.TimeoutError` are excluded, so a rollback caused by the enable timeout records no error.
 
 Use `on_enable` to:
 
@@ -136,7 +142,7 @@ Order of operations inside `_disable_plugin_under_lock`:
 4. Whether `on_disable` returns, raises, or times out, the framework guarantees:
    - Subscriptions are unregistered from the `TopicRegistry`. This sweep covers BOTH YAML-declared subs and runtime subs created via `self.subscribe(...)` — both are keyed by `plugin_uuid`. Authors only need to unsubscribe manually if they want to remove a subscription mid-lifecycle.
    - The state transitions `DISABLING` → `INACTIVE`.
-   - The plugin's per-logger threshold overrides are cleared.
+   - The plugin's per-logger threshold overrides are **not** cleared here. They survive a plain disable and are cleared only on pop, reload, purge, or shutdown.
 
 `last_errors[Phase.DISABLE]` is populated for non-cancellation, non-timeout exceptions raised by `on_disable`.
 
@@ -219,13 +225,13 @@ Each plugin tracked in `plx.plugins` (and config-disabled plugins tracked in `pl
 | `ENABLING` | `on_enable` in progress. |
 | `ENABLED` | `on_enable` returned successfully. Endpoints dispatchable. |
 | `DISABLING` | `on_disable` in progress. |
-| `FAILED_LOAD` | `on_load` raised, or the dependency resolver rejected the plugin. Instance is `None`. `last_errors[Phase.LOAD]` populated for the `on_load` case. Reached at boot only transiently — an `on_load` raise aborts startup (see [`on_load`](#on_loadself-args-kwargs--synchronous)); the state is durable for runtime loads and for dependency failures. |
+| `FAILED_LOAD` | `on_load` raised, or the dependency resolver rejected the plugin. Instance is `None` only in the `on_load` case; a plugin the dependency resolver rejected was already constructed and keeps its instance. `last_errors[Phase.LOAD]` populated for the `on_load` case. Reached at boot only transiently — an `on_load` raise aborts startup (see [`on_load`](#on_loadself-args-kwargs--synchronous)); the state is durable for runtime loads and for dependency failures. |
 
 Every state mutation funnels through `plx._transition_plugin(name, new_state)`, which emits `_core/plugin/state_changed` on the internal event bus. Observers must NOT acquire `plugin_lock` / `lifecycle_lock` / `request_lock` during dispatch (sync observer contract — see [`api_reference.md`](./api_reference.md)).
 
 `Plugin.enabled` is a read-only `@property` that returns `True` for state in `{ENABLING, ENABLED}` (matches pre-v0.26 semantics). To distinguish "fully ready" from "mid-enable" externally, read `plx.plugin_states[name].state` directly.
 
-The dispatch paths carry per-task recursion guards (`runtime.py`) so a runaway chain aborts instead of exhausting a thread pool or looping forever. The internal event bus caps emit nesting at depth 5 (`_EMIT_DEPTH`), and the synchronous execute path caps nesting at depth 16 (`_EXECUTE_DEPTH`, kept below the sync-endpoint worker count so other framework work still gets pool slots). Both are per-task counters, isolated between tasks via context variables.
+The dispatch paths carry per-task recursion guards (`runtime.py`) so a runaway chain aborts instead of exhausting a thread pool or looping forever. The internal event bus caps emit nesting at depth 5 (`_MAX_EMIT_DEPTH`), and the synchronous execute path caps nesting at depth 16 (`_MAX_EXECUTE_DEPTH`, kept below the sync-endpoint worker count so other framework work still gets pool slots). Both are per-task counters, isolated between tasks via context variables.
 
 Public lifecycle API: `await plx.enable_plugin(name)` / `await plx.disable_plugin(name)`. Direct writes to `plugin.enabled` raise `AttributeError`.
 
@@ -267,7 +273,7 @@ Nothing leaks across the swap. The instance attributes a plugin set in its previ
 
 1. Wait up to 30 seconds for in-flight tracked tasks; cancel survivors.
 2. Drain the fire-and-forget task pool (per-peer publish dereg and other short cleanup work spawned by done-callbacks after the step 1 snapshot) for up to 5 seconds, then cancel survivors. This is a separate pool from the tracked tasks in step 1.
-3. **Disable plugins in REVERSE dependency order** (the reverse of `_dep_topo_order`, so dependents wind down before their dependencies). Each `on_disable` gets a 30-second cap (hardcoded for shutdown). Different plugins do not block each other — their per-plugin lifecycle locks are independent.
+3. **Disable plugins in REVERSE dependency order** (the reverse of `_dep_topo_order`, so dependents wind down before their dependencies). Each `on_disable` gets a 30-second cap (hardcoded for shutdown). The per-plugin lifecycle locks are independent, but the shutdown loop itself is sequential: N hung plugins cost N × 30s, and a hung plugin delays every plugin after it. Size a service stop-timeout accordingly.
 4. Sweep stranded plugin-source per-logger thresholds.
 5. Shut down BOTH sync dispatchers (the event-handler pool, then the streaming pool) with `wait=True` and a 30-second budget each; on timeout the in-flight shutdown is left running and `close()` continues. They drain AFTER the disable loop so a sync `on_disable` that publishes an event still has a pool to run on.
 6. Stop `NetworkManager` if present.
