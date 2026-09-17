@@ -1,5 +1,5 @@
-from utils import Plugin
-from decorators import log_errors, async_log_errors
+from plexus.utils import Plugin
+from plexus.decorators import log_errors, async_log_errors
 
 
 class InteropCaller(Plugin):
@@ -8,19 +8,17 @@ class InteropCaller(Plugin):
     @log_errors
     def on_load(self, *args, **kwargs):
         self.plugin_name = "InteropCaller"
-        self.version = "0.0.1"
+        self.version = "0.0.2"
         self.description = (
             "Runs sync/async and generator interop tests against InteropTarget"
         )
 
     @async_log_errors
     async def on_enable(self):
-        self.enabled = True
         self._logger.debug("InteropCaller.on_enable")
 
     @async_log_errors
     async def on_disable(self):
-        self.enabled = False
         self._logger.debug("InteropCaller.on_disable")
 
     async def _log_case(self, case_id: str, passed: bool, detail: str = ""):

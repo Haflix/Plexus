@@ -1,25 +1,54 @@
-description: Phase 5 fixture — remote=True endpoints + streaming generators for wire-bug repros
-version: 0.1.0
+description: Phase 5 fixture — remote=True endpoints + topic handlers used by TestRemoteSuite cases (+ Step 6 rate-limit control + reverse-call + wave-1 cross-node gap coverage)
+version: 0.5.3
 remote: True
 arguments:
+subscriptions:
+  # B-024 huge-item: subscribed at runtime in on_enable (default hosts="any")
+  # so the parent's REMOTE request_event_stream reaches it. A config-block
+  # subscription here was not reached over the wire in this fixture.
+  open_sub:
+    topic: "test/r/open"
+    target_access_name: r_topic_open
+    hosts: "local"
 endpoints:
   r_open:
     internal_name: r_open
     tags:
+      - r_probe
     remote: True
     accessible_by_other_plugins: True
     description: Plain remote-callable endpoint
     arguments:
       - name: value
 
-  r_remote_only:
-    internal_name: r_remote_only
+  r_rl_configure:
+    internal_name: r_rl_configure
     tags:
     remote: True
-    accessible_by_other_plugins: False
-    description: remote=True but accessible_by_other_plugins=False
+    accessible_by_other_plugins: True
+    description: Step 6 control endpoint — apply/clear a rate_limits config live on this node (drives the two-node throttle without a static config)
     arguments:
-      - name: value
+      - name: rate_limits
+
+  r_rl_stats:
+    internal_name: r_rl_stats
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Step 6 readback — this node's RateLimiter.stats() over the wire (exact per-bucket charge counts)
+    arguments:
+
+  r_call_parent:
+    internal_name: r_call_parent
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Step 6 reverse-call — execute a parent endpoint n times and return an ok/throttled tally (drives the per-peer isolation e2e where the parent is the receiver)
+    arguments:
+      - name: parent_hostname
+      - name: target_plugin
+      - name: method
+      - name: n
 
   r_async_gen:
     internal_name: r_async_gen
@@ -44,33 +73,139 @@ endpoints:
     tags:
     remote: True
     accessible_by_other_plugins: True
-    topic: test/r/huge_stream
-    description: Async gen subscribed to test/r/huge_stream — yields one bytes item bigger than CHUNK_SIZE for B-024 via request_topic_stream
+    description: Async gen subscribed at runtime to test/r/huge_stream — yields one item bigger than MAX_MESSAGE_SIZE for the B-024 cross-node chunking guard
     arguments:
+      - name: event
 
   r_async_gen_raises_after:
     internal_name: r_async_gen_raises_after
     tags:
     remote: True
     accessible_by_other_plugins: True
-    description: Async gen yielding N items then raising (B-025 driver)
+    description: Async gen yielding N items then raising
     arguments:
       - name: n_yielded
-
-  r_hang:
-    internal_name: r_hang
-    tags:
-    remote: True
-    accessible_by_other_plugins: True
-    description: Awaits asyncio.Event().wait() forever (B-028 driver)
-    arguments:
 
   r_topic_open:
     internal_name: r_topic_open
     tags:
     remote: True
     accessible_by_other_plugins: True
-    topic: test/r/open
-    description: Config-driven topic handler subscribed to test/r/open
+    description: Config-driven topic handler subscribed to test/r/open (via subscriptions block)
     arguments:
-      - name: payload
+      - name: event
+
+  r_hang_topic_handler:
+    internal_name: r_hang_topic_handler
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Hang handler subscribed at runtime to test/r/hang (B-020 + Stage N timeout-honored driver)
+    arguments:
+      - name: event
+
+  r_request_basic_handler:
+    internal_name: r_request_basic_handler
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Stage N (PR4) — happy-path request_event handler subscribed at runtime to test/r/req_basic; echoes payload back
+    arguments:
+      - name: event
+
+  r_request_raise_handler:
+    internal_name: r_request_raise_handler
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Stage N (PR4) — request_event handler subscribed at runtime to test/r/req_raise; raises ValueError with marker
+    arguments:
+      - name: event
+
+  r_request_stream_basic_handler:
+    internal_name: r_request_stream_basic_handler
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Stage N (PR4) — request_event_stream async-gen handler subscribed at runtime to test/r/req_stream_basic; yields 3 chunks
+    arguments:
+      - name: event
+
+  r_request_stream_raise_handler:
+    internal_name: r_request_stream_raise_handler
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Stage N (PR4) — request_event_stream handler subscribed at runtime to test/r/req_stream_raise; yields 2 chunks then raises ValueError with marker
+    arguments:
+      - name: event
+
+  r_request_stream_raise_reqexc_handler:
+    internal_name: r_request_stream_raise_reqexc_handler
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: request_event_stream handler subscribed at runtime to test/r/req_stream_raise_reqexc; yields 2 chunks then raises RequestException (covers the except-RequestException mid-stream branch)
+    arguments:
+      - name: event
+
+  # ── Wave-1 cross-node gap coverage ─────────────────────────────────
+  r_huge_result:
+    internal_name: r_huge_result
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: TP-13 — a >100MB UNARY execute result (101MB) to prove byte-exact round-trip of a large unary result
+    arguments:
+
+  r_order_handler:
+    internal_name: r_order_handler
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: TP-16 — appends each publish_event payload to an ordered log (subscribed at runtime to test/r/order)
+    arguments:
+      - name: event
+
+  r_read_order:
+    internal_name: r_read_order
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: TP-16 readback — returns the recorded per-peer publish order
+    arguments:
+
+  r_reset_order:
+    internal_name: r_reset_order
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: TP-16 — clears the order log before a fresh publish sequence
+    arguments:
+
+  r_request_stream_empty_handler:
+    internal_name: r_request_stream_empty_handler
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: TP-12 — async-gen handler subscribed at runtime to test/r/req_stream_empty; yields zero items (clean close)
+    arguments:
+      - name: event
+
+  r_request_stream_one_handler:
+    internal_name: r_request_stream_one_handler
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: TP-12 control — async-gen handler subscribed at runtime to test/r/req_stream_one; yields one item
+    arguments:
+      - name: event
+
+  r_request_stream_hang_handler:
+    internal_name: r_request_stream_hang_handler
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: TG-11 (B-045) — async-gen handler subscribed at runtime to test/r/req_stream_hang; yields one chunk then hangs forever
+    arguments:
+      - name: event

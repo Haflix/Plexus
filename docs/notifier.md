@@ -1,0 +1,574 @@
+# Notifier and Events
+
+*Last updated for Plexus 0.81.1*
+
+Deep dive on the topic-based event system. The user-facing Plugin
+methods are covered in [api_reference.md](./api_reference.md); this page
+explains how those methods work, the matching algorithm, the filter
+chain, and the topic-templating rules.
+
+For the cross-node side of fan-out and `request_event` fall-through,
+see [networking.md](./networking.md). For where subscriptions and events
+sit in a plugin's lifecycle, see [plugin_authoring.md](./plugin_authoring.md).
+
+---
+
+## The three call shapes
+
+| Shape | Method | Returns | Failure mode |
+|---|---|---|---|
+| 1:N fire-and-forget | `publish_event` | count of subs scheduled (int) | Errors inside subscribers are logged, never raised. Returns 0 on no match. Can still raise `RateLimitException` at the outbound throttle BEFORE any fan-out (see [rate_limiting.md](./rate_limiting.md)); the never-raised guarantee covers the subscriber-delivery side only. |
+| 1:1 ask | `request_event` | first matching handler's return value | Raises `RequestException` if no subscriber matches. |
+| 1:1 stream | `request_event_stream` | async generator of chunks | Pre-first-chunk: same fall-through as `request_event`. Post-first-chunk: committed to that producer. |
+
+All three resolve their topic from a publisher-declared `events:` entry —
+the `event_id` argument is a key into that block. The resulting topic
+flows through the matching algorithm to find candidate subscriptions,
+applies the filter chain, then dispatches.
+
+---
+
+## Topic syntax
+
+A topic is a `/`-separated string of segments.
+
+- `messages/incoming` — two segments.
+- `sensor/livingroom/temperature` — three segments.
+
+A subscription pattern can use `*` to match exactly one segment:
+
+- `messages/*` matches `messages/incoming`, `messages/outgoing`. Does NOT
+  match `messages/incoming/private` (different segment count).
+- `sensor/*/temperature` matches `sensor/kitchen/temperature` and
+  `sensor/livingroom/temperature`.
+
+Validation rules:
+
+- Empty middle segments are rejected (`a//b` is invalid).
+- Mid-segment `*` is rejected (`mes*ages` is not a wildcard).
+- Event topics (publisher-declared) MAY NOT contain `*`. Subscription
+  topics MAY.
+- Topics MAY NOT start with `_`. The `_core/` prefix is reserved for
+  framework-internal events; a topic beginning with `_` is rejected at
+  config-load time and at runtime `subscribe()`.
+
+Topic matching is **case-insensitive**. Every subscription pattern is
+lowercased when registered (`TopicRegistry.register`) and every resolved
+publish/request topic is lowercased before dispatch
+(`_resolve_topic_for_event`), so `Chat/Messages` and `chat/messages` are
+the same topic. Declare topics in lowercase; mixed case is silently
+folded and shows lowercased in logs and introspection.
+
+The matcher (`_topic_matches` in `plexus.notifier`) splits both
+strings on `/` and matches segment-by-segment, requiring identical
+segment counts. `*` matches exactly one non-empty segment.
+
+### Wildcards in events vs subscriptions
+
+`events:` topics MAY NOT contain `*`. Subscription topics MAY. The
+validator runs at YAML load and at runtime `subscribe(...)`.
+
+---
+
+## YAML-declared events and subscriptions
+
+A publisher declares events in `plugin_config.yml`:
+
+```yaml
+events:
+  message_received:
+    topic: "{prefix}/messages/incoming"
+    hosts: "any"
+    enabled: true
+```
+
+A subscriber declares subscriptions:
+
+```yaml
+subscriptions:
+  on_incoming:
+    topic: "ChatPlugin/messages/incoming"
+    target_access_name: handle_incoming
+    hosts: "any"
+    authors: ["ChatPlugin"]
+```
+
+`target_access_name` must name a declared endpoint on this plugin (or, if
+`target_plugin` is set, on the named plugin). When `target_plugin` is
+unset or empty, the sub self-routes — the framework substitutes the
+owner's `plugin_name` (`effective_target_plugin = target_plugin or plugin_name`).
+
+Subscriptions are registered with the topic registry BEFORE `on_enable`
+runs, by `_register_yaml_subscriptions`. Subscriptions added at runtime
+via `await self.subscribe(...)` follow the YAML registrations in
+insertion order.
+
+---
+
+## Topic templating
+
+Two kinds of placeholders are supported in event and subscription topics.
+
+### Load-time placeholders (resolved when the YAML is parsed)
+
+Resolved once, when the plugin loads, by `_resolve_load_time_template`:
+
+| Placeholder | Substituted with |
+|---|---|
+| `{prefix}` | The plugin's `prefix` field (defaults to `plugin_name`). |
+| `{plugin_name}` | The plugin's name from `config.yml`. |
+| `{hostname}` | The node's hostname (from `general.hostname` or `socket.gethostname()`). |
+| `{plugin_uuid}` | The plugin instance's `plugin_uuid` (regenerated on every load/reload). |
+
+These resolve once, at plugin load. After load, `plugin.events` and
+`plugin.subscriptions` hold concrete topics — no placeholders remain
+except runtime ones.
+
+### Runtime placeholders (resolved per-publish via `topic_vars`)
+
+ANY other `{var}` placeholder is filled at publish time from the
+`topic_vars` argument:
+
+```yaml
+events:
+  user_message:
+    topic: "messages/{user_id}/incoming"
+```
+
+```python
+await self.publish_event(
+    "user_message",
+    payload="hello",
+    topic_vars={"user_id": "alice"},
+)
+# Resolves to topic "messages/alice/incoming".
+```
+
+Validation of `topic_vars`:
+
+- Type: `Dict[str, str]` or `None`.
+- Keys must NOT collide with reserved load-time names (`prefix`,
+  `plugin_name`, `hostname`, `plugin_uuid`).
+- Values must NOT contain `/` or `*` (wildcards are subscriber-side
+  only), must not be empty / whitespace-only, must not have
+  leading/trailing whitespace.
+- Missing keys for `{var}` placeholders raise `ValueError`.
+- Extra keys not used by the template log a warning.
+- Static topic + non-empty `topic_vars` logs a warning (likely confused
+  `payload` and `topic_vars`).
+
+### Why subscriptions reject runtime `{var}`
+
+Runtime placeholders only make sense on the publish side — the
+publisher knows what value to fill in. On the subscribe side, `{var}`
+cannot be resolved at load time and would never match anything at
+dispatch time. The subscription validator
+(`_validate_subscription_topic`) rejects them. A subscriber that wants
+to handle every user uses a wildcard:
+
+```yaml
+subscriptions:
+  on_user_message:
+    topic: "messages/*/incoming"
+    target_access_name: handle_user_message
+```
+
+---
+
+## The Subscription dataclass
+
+Every YAML or runtime sub becomes a `Subscription` in the topic
+registry. Defined in `plexus.notifier`.
+
+| Field | Type | Notes |
+|---|---|---|
+| `sub_uuid` | `str` | Canonical identity. uuid4 hex. |
+| `declared_id` | `Optional[str]` | YAML key for declared subs; `None` for runtime. Becomes `Event.subscription_id` for declared subs. |
+| `topic_pattern` | `str` | The literal or wildcard topic pattern. |
+| `plugin_name` / `plugin_uuid` | str / str | OWNER (the plugin that declared/registered the sub). |
+| `target_plugin` / `target_access_name` | str / str | Routing target. Defaults to self-routing (`target_plugin == plugin_name`) when `target_plugin` is unset. |
+| `target_plugin_uuid` | `Optional[str]` | Optional instance pin. |
+| `hosts` | `str / list / None` | Receiver-side host filter. Default `"any"`. |
+| `blocked_hosts` | `str / list / None` | Receiver-side host blacklist. |
+| `authors` / `blocked_authors` | str / list / None | Author whitelist / blacklist. |
+| `enabled` | `bool` | Default `True`. Disabled subs stay registered but are skipped at match time. |
+
+**Owner vs target.** The owner is the plugin that wrote the YAML or
+called `subscribe()`. The target is the plugin whose endpoint actually
+receives the dispatched `Event`. For most subs they are the same.
+
+Cross-plugin orchestrator subs set `target_plugin` to a different
+plugin — useful for an orchestrator that wants to route certain topics
+to a specific base plugin's endpoint without that base plugin declaring
+the subscription itself.
+
+---
+
+## The matching algorithm
+
+The topic registry (`TopicRegistry` in `plexus.notifier`) stores
+subscriptions in a single insertion-ordered dict keyed by `sub_uuid`.
+
+- `find_all(topic)` iterates all subs in insertion order and returns every
+  enabled sub whose `topic_pattern` matches. This is a TOPIC match only —
+  it does **not** apply the host / author / blocked filter chain (that is
+  the dispatcher's job, see below).
+
+Request-by-topic (`request_event` / `request_event_stream`) does **not**
+just take the first topic match. It walks `find_all` in insertion order
+and selects the first candidate that *also* passes the full filter chain,
+so a non-eligible sub earlier in the order (e.g. one that blocks the
+publisher) is **skipped**, not allowed to block an eligible later one.
+(There is an internal, filter-blind `_find_first` helper used only for
+introspection/tests — never route off it.)
+
+There is **no exact-then-wildcard split.** Insertion order alone
+determines tie-breaks. For example, with two subs in this order:
+
+1. `messages/*` (registered first)
+2. `messages/incoming` (registered second)
+
+A publish to `messages/incoming` matches both. `request_event` returns
+sub 1 (the wildcard) because it was registered first *and* passes the
+filters; if sub 1 were filtered out (it blocks the publisher, wrong host,
+etc.) request_event falls through to sub 2. If you want the exact match
+to win unconditionally, register it first.
+
+Disabled subs (`enabled: false`) are skipped at match time and excluded
+from the directory snapshot this node exports to peers, but stay in the
+registry for introspection.
+
+---
+
+## The filter chain
+
+For every candidate subscription found by `find_all`, the
+framework runs a chain of filters. Any filter that rejects drops the
+candidate; only candidates that survive every filter actually receive
+the event. Each filter is a separate predicate so the rules compose
+cleanly.
+
+### 1. Sub owner active
+
+`_sub_owner_active` drops any candidate whose owner plugin is not currently
+ENABLED or ENABLING. A subscription stays in the registry across its owner's
+lifecycle, but it only delivers while that owner is live; a sub whose owner is
+disabled or has failed is skipped before the host and author filters run.
+
+### 2. Publisher hosts gate
+
+`_publisher_targets_local` decides whether
+this publish should target local subs at all. The publisher's effective
+`hosts` and `blocked_hosts` (manifest, optionally overridden per-call)
+gate this. Default `hosts="local"` if the publisher omits it. `"any"`,
+`"local"`, the publisher's own hostname, or a list containing any of
+those accepts. `blocked_hosts` excludes.
+
+### 3. Sub-level local accept
+
+`_sub_accepts_local`. Whether the subscriber wants local events. The
+sub's `hosts` must accept `"local"`, own hostname, or `"any"`; the
+sub's `blocked_hosts` must not block them. Default sub `hosts="any"`
+accepts everything.
+
+### 4. Sub-level remote-publisher accept
+
+`_sub_accepts_remote_publisher`. For inbound peer publishes only. A sub
+with `hosts="local"` rejects remote publishers. Otherwise the sub's
+`hosts` / `blocked_hosts` are checked against the remote publisher's
+`author_host`.
+
+### 5. Author filter
+
+`_sub_accepts_author`. `authors` is a whitelist; `blocked_authors` is a
+blacklist. The publisher's `plugin_name` is checked against both.
+
+### The `"system"` author bypass
+
+The pseudo-author `"system"` is used for framework-originated calls
+(framework-internal dispatch, and peers configured with
+`system_caller: true`). It is NOT the default for a plugin's own
+`execute()` / `publish_event()` — those default the author to the
+calling plugin's own `plugin_name`. A sub's
+`authors:` whitelist accepts `"system"` automatically — UNLESS
+`"system"` is explicitly named in `blocked_authors`. This is
+intentional: it lets framework dispatch reach legitimately gated subs
+without the author having to remember to include `"system"` in every
+whitelist.
+
+```yaml
+# Whitelist that ALSO accepts "system":
+authors: ["AI_Interaction"]
+
+# Whitelist that REJECTS "system":
+authors: ["AI_Interaction"]
+blocked_authors: ["system"]
+```
+
+---
+
+## Disabled events vs disabled subs
+
+Both have an `enabled: false` knob. Behaviour is symmetric but not
+identical.
+
+**Disabled events** (publisher side):
+
+- `publish_event` silently drops and returns 0.
+- `request_event` raises `RequestException("event ... disabled (C2)")`.
+- `request_event_stream` raises the same.
+
+Useful when a plugin's publisher should be turned off in some
+deployment without removing the YAML.
+
+**Disabled subs** (subscriber side):
+
+- Stay in the registry, visible to introspection, but EXCLUDED from the
+  directory snapshot this node exports to peers (the export filter drops a
+  disabled sub), so peers do not route to it.
+- Skipped by `find_all` at match time.
+
+Useful for feature flags: a disabled sub is local-only and invisible to
+peers until it is enabled.
+
+### Toggling at runtime
+
+The `enabled` flag can be flipped after registration without
+unsubscribing. From plugin code:
+
+```python
+await self.set_subscription_enabled(sub_uuid, False)  # disable
+await self.set_subscription_enabled(sub_uuid, True)   # re-enable
+await self.set_event_enabled("my_event_id", False)    # disable own event
+```
+
+Sync mirrors `set_subscription_enabled_sync` / `set_event_enabled_sync`
+exist for worker-thread callers. Returns `True` on success (including
+no-op when already at target value), `False` on unknown id.
+
+There is no delta broadcast to peers. Toggling a subscription's `enabled`
+flag changes what this node exports in its directory snapshot, hence its
+content hash, so peers pick the change up when they next PULL the directory
+on the heartbeat. Events are local-only (publishers are not exported in the
+directory). Both surfaces emit `_core/subscription/state_changed` or
+`_core/event/state_changed` on actual change — TUI and other observers can
+react.
+
+---
+
+## What handlers receive
+
+Subscriber endpoints receive ONE positional argument: an `Event`
+dataclass (`plexus.Event`).
+
+```python
+@async_log_errors
+async def handle_event(self, event):
+    # event.topic           -- literal topic that fired
+    # event.payload         -- whatever the publisher passed
+    # event.author          -- publisher plugin_name (or "system")
+    # event.author_id       -- publisher plugin_uuid
+    # event.author_host     -- publisher hostname
+    # event.subscription_id -- declared_id (YAML) OR sub_uuid (runtime)
+    # event.timestamp       -- epoch seconds at publish time
+    return {"ok": True}
+```
+
+| Field | Type | Notes |
+|---|---|---|
+| `topic` | `str` | The literal topic that fired (post-resolution). |
+| `payload` | `Any` | Whatever was passed to `publish_event` / `request_event`. |
+| `author` | `str` | Publisher plugin_name (or `"system"`). |
+| `author_id` | `str` | Publisher plugin_uuid. |
+| `author_host` | `str` | Publisher hostname. |
+| `subscription_id` | `str` | `declared_id` for YAML subs, `sub_uuid` for runtime subs. |
+| `timestamp` | `float` | Epoch seconds at publish time. |
+
+Note: endpoints called via `execute()` receive raw unpacked args, NOT
+an `Event`. The same method can serve both call paths — but it must
+handle a single `Event` argument when invoked through publish/request,
+and the unpacked arguments when invoked through `execute()`. In practice,
+endpoints are usually one or the other.
+
+---
+
+## Declarative YAML vs runtime subscribe
+
+Use YAML when the subscription set is static — known at plugin load
+time. The framework registers YAML subs before `on_enable` runs, so the
+subscription is live from the moment the plugin enables.
+
+Use `await self.subscribe(...)` when the subscription set is dynamic —
+e.g. an orchestrator that subscribes to a per-user topic when a user
+appears.
+
+```python
+async def on_enable(self):
+    # Register dynamic subs.
+    self._sub = await self.subscribe(
+        "messages/*",
+        target_access_name="handle_message",
+        hosts="any",
+        authors=["ChatPlugin"],
+    )
+```
+
+`subscribe()` returns a `sub_uuid`. `unsubscribe(sub_uuid)` removes it.
+Runtime subs use `sub_uuid` as `Event.subscription_id`; declared subs
+use the YAML key (`declared_id`).
+
+Both YAML and runtime subs are auto-cleared by
+`_unregister_plugin_subscriptions` when the owner is disabled or
+hot-swapped — cleanup is keyed by `plugin_uuid`, so you do not need to
+manually `unsubscribe` in `on_disable` for lifecycle parity. Call
+`unsubscribe` only when you want a sub removed earlier than the
+plugin's own teardown.
+
+The legacy `handler=...` kwarg form was removed. Runtime subs always
+route to a declared endpoint named via `target_access_name`.
+
+---
+
+## Insertion-order tie-break (request_event)
+
+`request_event` returns the first matching handler's result. With
+multiple matching subs, insertion order picks the winner.
+
+Local subs are tried first. On no local match, remote candidates are
+tried in **hostname-lexicographic** order (then declaration order within
+a peer). Netcore has no advert push: each node PULLS its peers' exported
+subscription snapshots on the heartbeat, so the candidate order is by peer
+hostname, not by when a peer told us about a sub. The one exception: a
+request whose publisher resolves to
+`hosts="local"` does NOT fall through to remote. It short-circuits before
+the peer loop and raises `RequestException` on a no-local-match, since a
+local-only request was never meant to reach network peers. The same
+short-circuit applies to `request_event_stream`. A remote candidate that
+fails with `NoLocalSubException` (the
+peer signaled "no sub matched on my side either") or `NetworkRequestException`
+(connection error) is skipped and the next candidate is tried. A
+generic `RequestException` from a remote peer propagates — the candidate
+matched but its handler raised, so we surface that error rather than
+papering over it with another peer's response.
+
+This fall-through preserves strict semantics: a `request_event` either
+returns a real handler's result or raises; it never silently continues
+past a real failure to a second-best peer.
+
+For `request_event_stream`, fall-through applies pre-first-chunk only.
+Once the producer yields its first chunk, the consumer is committed —
+later errors do not redirect to a different peer.
+
+---
+
+## SyncDispatcher
+
+A subscriber endpoint can be `async def` or plain `def`. The framework
+runs each kind on a different executor:
+
+- Async handlers run on the main event loop directly.
+- Sync handlers are submitted to a dedicated `SyncDispatcher`, backed by a
+  `GatedExecutor` (a `concurrent.futures.Executor` wrapping a private
+  `ThreadPoolExecutor`, thread-name prefix `sync-notifier`) separate from
+  the framework's general-purpose plugin executor.
+
+The `GatedExecutor` gives the pool two independent budgets (see
+[configuration.md](configuration.md) for the full model):
+
+- **Execution concurrency (E)** — how many sync handlers run at once.
+  Default 4, via `general.sync_dispatcher_workers`. A handler that itself
+  makes a sync-bridge call and parks releases its E slot while waiting, so
+  nested sync calls can never deadlock the pool.
+- **Thread ceiling (M)** — the hard cap on live threads before the pool
+  loud-rejects with `RequestException` instead of spawning more. Default
+  32, via `general.sync_dispatcher_thread_ceiling`. Auto-raised to E if
+  set lower.
+- Min 1 worker (clamped via `max(1, int(workers))`). With `workers=1`
+  you get serialization of all sync subscriber handlers — useful when
+  handlers share non-thread-safe state.
+- Sync `execute()` endpoints use a SEPARATE shared pool
+  (`_plugin_executor`, also a `GatedExecutor`). The two pools do not
+  contend, so a slow sync subscriber cannot starve sync `execute()` calls.
+- Shutdown happens AFTER the 30 s in-flight drain in
+  `Plexus.close()`, with a 30 s budget. On timeout it logs and
+  continues, leaving the in-flight shutdown task running — there is
+  no forced second `wait=False` shutdown (a second call from the loop
+  thread would race the worker).
+
+There is a SECOND `SyncDispatcher`, `sync_stream_dispatcher`, dedicated to
+sync STREAM handlers (a plain `def` handler that yields chunks). Each `next()`
+of a sync stream generator submits to this pool, kept separate from the RPC
+sync-subscriber pool above so one slow stream cannot saturate it. It has its
+own budgets: `general.sync_stream_workers` (default 4) and
+`general.sync_stream_thread_ceiling` (default 16), with thread-name prefix
+`sync-stream-notifier`.
+
+---
+
+## Logging
+
+Subscribe / unsubscribe events ALWAYS log at INFO regardless of
+`verbose_notifier`. Dispatch logging (per-publish match details, target
+counts) is gated by `plugin.verbose_notifier`. Set
+`verbose_notifier: true` on a plugin temporarily when debugging why a
+particular event isn't reaching a particular sub. It is noisy in
+production.
+
+---
+
+## Cross-node behaviour (preview)
+
+Each node's remote-eligible subscriptions are exported in its directory
+snapshot, which peers PULL by content hash on every heartbeat (there is no
+advert push, delta, or ack). When a publisher fires, the framework fans out
+to local subscribers AND sends one `CALL{mode=FANOUT}` frame to each peer
+with a matching exported sub. For `request_event`, on no local match, the
+framework tries candidate peers in hostname-lexicographic order and sends a
+`CALL{mode=FIRST}` over the wire. See [networking.md](./networking.md) for
+the full picture.
+
+**`authors:` / `blocked_authors:` (and `hosts:`) are a routing and matching
+convenience, not a cross-node security boundary.** A peer-originated call is
+attributed from the authenticated SPKI-pinned identity, and `author="system"`
+is granted only from the callee's own `system_caller` record for that peer,
+never from the wire. The trust boundary is the pin plus the roster gate plus
+the anti-spoof check; the author/host filters only decide which subscription
+matches once a call has already been authenticated.
+
+---
+
+## Decision tree
+
+```
+   Need to send data from plugin A to plugin B?
+   |
+   |-- Do I know B by name and want a direct call?
+   |       --> await self.execute("B", "method", args=...)
+   |
+   |-- Does the message have N potential listeners (any number, including zero)?
+   |       --> await self.publish_event("event_id", payload=...)
+   |
+   |-- Do I want one answer, but I don't care which subscriber gives it?
+   |       --> result = await self.request_event("event_id", payload=...)
+   |
+   |-- Do I want a stream of chunks back?
+   |       --> async for chunk in self.request_event_stream("event_id", ...):
+   |
+   `-- Do I want to register a listener at runtime (not via YAML)?
+           --> sub_uuid = await self.subscribe("topic/*", target_access_name="handler")
+```
+
+---
+
+## Quick checklist for getting an event to fire
+
+1. Publisher's manifest has an `events:` entry with the right `topic:`.
+2. Publisher calls `await self.publish_event(event_id, payload=...)`
+   (or `request_event` / `request_event_stream`).
+3. Subscriber's manifest has a `subscriptions:` entry whose `topic:`
+   matches (literal or wildcard).
+4. Subscriber's manifest has the matching endpoint under `endpoints:`
+   with the same name as `target_access_name`.
+5. Both subs and event are `enabled: true` (the default).
+6. The filter chain accepts: publisher hosts, sub hosts, author filter.
+7. The plugins are loaded and enabled (`enabled: true` in `config.yml`).

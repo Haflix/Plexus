@@ -1,0 +1,62 @@
+description: Demo data source -- a fake sensor that emits readings (pairs with AveragePlugin)
+version: 1.0.0
+remote: False  # local-only demo
+arguments:  # Optional: forwarded to on_load (none needed here)
+
+# A plugin may declare its OWN rate limits here (the "plugin-declared" layer).
+# The operator's main config.yml `rate_limits:` can override any of these per
+# (dimension, key) -- main always wins. A plugin can only declare limits for
+# ITSELF (the keys are namespaced to this plugin's name). `framework_in` /
+# `nodes_in` are operator-global and belong in main config, not here.
+# Allowed sub-keys: out, in, endpoints, events, subs. Each bucket is
+# { max: <number>, window: <seconds> } (unquoted numbers, both required).
+rate_limits:
+  out: { max: 100, window: 1 }        # plugin_out(SensorPlugin): 100 fires/sec
+  endpoints:
+    read: { max: 50, window: 1 }      # endpoint_in(SensorPlugin, read)
+  events:
+    reading: { max: 30, window: 1 }   # event_out(SensorPlugin, reading)
+
+# Events this plugin PUBLISHES. `publish_event("reading", ...)` fires this entry
+# (referenced by the event id, not the raw topic). Subscribers bind to the topic.
+events:
+  reading:
+    topic: "sensor/reading"
+    hosts: "local"                    # default is "local"; use "any" for cross-node
+
+endpoints:
+  # Endpoints are a dict keyed by access_name (what callers use). `internal_name`
+  # defaults to the key. Add `required: True` to an argument other plugins must
+  # always pass.
+  read:
+    internal_name: read
+    tags: ["demo-sensor"]             # discoverable via find_endpoints_by_tag
+    remote: False
+    accessible_by_other_plugins: True
+    description: Return the current sensor reading
+    arguments: []
+
+  emit_reading:
+    internal_name: emit_reading
+    tags: []
+    remote: False
+    accessible_by_other_plugins: True
+    description: Publish a reading to the sensor/reading topic (1:N fire-and-forget)
+    arguments:
+      - name: value
+        type: float
+        description: Reading to emit; omit to use the next generated value
+        required: False
+
+  read_stream:
+    internal_name: read_stream
+    tags: ["demo-sensor"]
+    remote: False
+    accessible_by_other_plugins: True
+    stream_weight: 2                  # opening this stream costs 2 IN tokens
+    description: Stream `count` sequential readings
+    arguments:
+      - name: count
+        type: int
+        description: Number of readings to yield
+        required: False

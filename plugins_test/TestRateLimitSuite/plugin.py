@@ -1,0 +1,1374 @@
+"""Rate-limit charge-set precompute (Step 3b) + OUT-admit (Step 3c) suite.
+
+Step 3b proves that ``_rebuild_charge_sets`` attaches the CORRECT precomputed
+buckets to the Plexus-owned side-tables, asserting exact ``Bucket`` OBJECT
+IDENTITY. Step 3c drives the OUT (attempt) admit END-TO-END through real
+``execute()`` / ``publish_event()`` dispatches, proving the wiring: the admit
+fires at the dispatch sites, charges the right identity, raises
+``RateLimitException``, and is skipped for exempt (lifecycle) frames.
+
+Config is injected directly into ``_rate_limit_config`` /
+``_rate_limit_sub_config`` (Step 4 will flatten the YAML ``rate_limits:`` section
+into them). Each case starts from a FRESH limiter so prior test buckets don't
+leak; ``run`` restores the boot limiter + config + flags in ``finally``. The
+OUT cases use a large ``window`` so continuous refill is negligible across a
+tight call loop (deterministic, no sleeps).
+
+Cases (3b):
+- endpoint_in_set: endpoint IN-set == [endpoint_in, plugin_in]; unconfigured dim skipped.
+- event_out: the event_out bucket is stored by (plugin, event_id).
+- cross_plugin_sub: a sub owned by the suite but targeting another plugin keys its
+  IN-set on the TARGET (+ declared_id -> sub_uuid resolution).
+- runtime_sub_fallback: a runtime sub (no declared_id) gets no Sub-IN and its
+  charge-set is built on subscribe; unsubscribe tears it down.
+- teardown_sub_bucket: _rl_teardown_sub removes the Sub-IN bucket + the entry.
+- empty_config: a default node has empty side-tables and _rate_limits_active False.
+- empty_config_prunes_orphans: empty config + a NON-empty limiter (last declared-only
+  limit removed) prunes the orphan bucket and turns _rate_limits_active off (the
+  early-return must not skip the prune).
+- idempotent: rebuilding twice does not double the attachments.
+- orphan_prune: a static bucket for a non-loaded plugin is pruned on rebuild.
+
+Cases (3c, OUT admit):
+- out_self_plugin_out: a self-call charges plugin_out keyed on the in-chain caller;
+  rejects the (max+1)th with RateLimitException (raised at the real OUT site).
+- out_framework_in: a direct dispatch charges the global framework_in bucket;
+  rejects after max (RateLimitException surfaces as its real type to the caller).
+- out_event_out: publish_event charges event_out(publisher, event); rejects after max.
+- out_lifecycle_exempt: an exempt (lifecycle) caller frame skips the OUT admit even
+  when the bucket is dry; a non-exempt frame hits it.
+- out_asserted_attribution: an asserted (impersonation) identity wins the charge
+  attribution over the chain caller (plugin_out keyed on the asserted name).
+
+Cases (Step 4, config load):
+- config_load_end_to_end: a YAML ``rate_limits:`` section flows through
+  ``_load_rate_limits`` into the three base dicts and ``_rebuild_charge_sets``
+  builds the buckets (all static dims + nodes_in sideband + declared-id Sub-IN).
+- plugin_declared_merge: a plugin's self-declared limit (no main config) produces
+  a bucket via the declared layer; it lands in the declared dict, not the base.
+- main_overrides_declared: main config wins over a plugin-declared value on an
+  overlapping (dim, key) (base checked before the declared layer).
+
+Cases (Step 5, observability):
+- reject_log_suppression: the first reject per (dim, key) logs a WARNING, further
+  in-window rejects are suppressed (counter still tracks them), and the first
+  reject after the window emits a suppressed-count summary + a fresh WARNING.
+- stats_snapshot: RateLimiter.stats() reflects real charged/rejected/tokens/max
+  after a live admit+reject dispatch sequence.
+"""
+import asyncio
+import sys
+import time
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from typing import Any, Dict, List, Optional  # noqa: E402
+
+from plexus.utils import Plugin  # noqa: E402
+from plexus.decorators import async_gen_log_errors, async_log_errors, log_errors  # noqa: E402
+from plexus.exceptions import RateLimitException, RequestException  # noqa: E402
+from plexus.runtime import CallerIdentity, caller_chain_scope  # noqa: E402
+from plexus.core import RL_REJECT_LOG_WINDOW  # noqa: E402
+from plexus.ratelimiter import (  # noqa: E402
+    RateLimiter, endpoint_key, event_key,
+    DIM_PLUGIN_IN, DIM_PLUGIN_OUT, DIM_ENDPOINT_IN, DIM_EVENT_OUT, DIM_SUB_IN,
+    DIM_FRAMEWORK_IN, DIM_NODES_IN, FRAMEWORK_IN_KEY,
+)
+
+from _test_helpers import CaseRecorder  # noqa: E402
+
+SUITE_VERSION = "0.14.0"
+SUITE = "TestRateLimitSuite"
+TARGET = "TestRateLimitTarget"
+
+
+class TestRateLimitSuite(Plugin):
+    @log_errors
+    def on_load(self, *args, **kwargs):
+        pass
+
+    @async_log_errors
+    async def on_enable(self):
+        pass
+
+    @async_log_errors
+    async def on_disable(self):
+        pass
+
+    @async_log_errors
+    async def ep_a(self, value: Any = None) -> str:
+        return "ep_a"
+
+    @async_gen_log_errors
+    async def ep_stream(self, value: Any = None):
+        """Streaming probe (async generator) for the IN stream_weight case. Its
+        manifest declares stream_weight=2, so one open costs 2 IN tokens."""
+        yield "s1"
+        yield "s2"
+
+    @async_log_errors
+    async def _rl_drive(self, target: str = None, method: str = None) -> Dict[str, Any]:
+        """Perform ONE nested execute so a real caller frame (this suite) exists
+        at the OUT admit -- the plugin_out / self-call charge keys on the
+        in-chain caller, which only exists one dispatch level deep. Catch the
+        RateLimitException HERE (it is raised as its real type at the OUT site,
+        before the request is created) and report it. (Since #2 unified typing the
+        outer dispatch also preserves the subtype, but this helper catches at the
+        inner OUT site regardless.)"""
+        try:
+            await self.execute(target, method)
+            return {"rate_limited": False}
+        except RateLimitException as e:
+            return {"rate_limited": True, "msg": str(e)}
+
+    @async_log_errors
+    async def _rl_drive_as(self, target: str = None, method: str = None,
+                           author: str = None, author_id: str = None) -> Dict[str, Any]:
+        """Like ``_rl_drive`` but ASSERTS ``author``/``author_id`` on the nested
+        execute, so a granted impersonation charges plugin_out(ASSERTED) at the
+        inner OUT admit. Runs one dispatch deep so this suite is the real caller
+        frame the gate sees."""
+        try:
+            await self.execute(target, method, author=author, author_id=author_id)
+            return {"rate_limited": False}
+        except RateLimitException as e:
+            return {"rate_limited": True, "msg": str(e)}
+
+    def _apply(self, cfg: Dict, subcfg: Optional[Dict] = None) -> None:
+        """Reset to a FRESH limiter (drop prior test buckets) + inject config.
+        Caller awaits ``_rebuild_charge_sets`` after."""
+        px = self._plexus
+        px._rate_limiter = RateLimiter()
+        px._rate_limit_config = dict(cfg)
+        px._rate_limit_sub_config = dict(subcfg or {})
+
+    async def _xsub_uuid(self) -> str:
+        subs = await self._plexus.topic_registry.get_plugin_subscriptions(
+            self.plugin_uuid
+        )
+        for s in subs:
+            if s.declared_id == "xsub":
+                return s.sub_uuid
+        raise AssertionError("declared sub 'xsub' not found on the suite")
+
+    @async_log_errors
+    async def run(
+        self,
+        category: Optional[str] = None,
+        host: Optional[str] = None,
+        case_ids: Optional[List[str]] = None,
+        bug_ids: Optional[List[str]] = None,
+        skip_slow: bool = False,
+        allow_destructive: bool = True,
+    ) -> Dict[str, Any]:
+        rec = CaseRecorder("TestRateLimitSuite", SUITE_VERSION, self._plexus)
+        kw = dict(
+            case_ids_filter=case_ids, bug_ids_filter=bug_ids,
+            category_filter=category, host_filter=host,
+            skip_slow=skip_slow, allow_destructive=allow_destructive,
+            remote_available=False,
+        )
+        px = self._plexus
+        orig_limiter = px._rate_limiter
+        orig_cfg = px._rate_limit_config
+        orig_subcfg = px._rate_limit_sub_config
+        orig_active = px._rate_limits_active
+        orig_id = px._identity_active
+        orig_nodes_cfg = px._rate_limit_nodes_in_config
+        # Step 4: the plugin-declared layer. The declared dicts are recomputed
+        # from plugin attrs by _rebuild_charge_sets, but the suite's own
+        # _declared_rate_limits attr is mutated by the merge cases -- restore it
+        # before the finally rebuild so the recompute lands the boot-time value.
+        orig_decl_cfg = px._rate_limit_config_declared
+        orig_decl_sub = px._rate_limit_sub_config_declared
+        orig_suite_decl = getattr(self, "_declared_rate_limits", ({}, {}))
+        runtime_subs: List[str] = []
+        try:
+            await self._case_endpoint_in_set(rec, kw)
+            await self._case_event_out(rec, kw)
+            await self._case_cross_plugin_sub(rec, kw)
+            await self._case_runtime_sub_fallback(rec, kw, runtime_subs)
+            await self._case_b051_subscribe_serializes_vs_rebuild(rec, kw, runtime_subs)
+            await self._case_teardown_sub_bucket(rec, kw)
+            await self._case_empty_config(rec, kw)
+            await self._case_empty_config_prunes_orphans(rec, kw)
+            await self._case_idempotent(rec, kw)
+            await self._case_orphan_prune(rec, kw)
+            # Step 3c -- OUT admit (end-to-end through real dispatch).
+            await self._case_out_self_plugin_out(rec, kw)
+            await self._case_out_framework_in(rec, kw)
+            await self._case_out_event_out(rec, kw)
+            await self._case_out_lifecycle_exempt(rec, kw)
+            await self._case_out_asserted_attribution(rec, kw)
+            await self._case_out_asserted_attribution_e2e(rec, kw)
+            await self._case_out_multi_dim_order(rec, kw)
+            # Step 3d -- IN admit.
+            await self._case_in_endpoint_in(rec, kw)
+            await self._case_in_plugin_in(rec, kw)
+            await self._case_in_self_plugin_in(rec, kw)
+            await self._case_in_sub_in_selection(rec, kw)
+            await self._case_in_stream_weight(rec, kw)
+            await self._case_in_publish_skip(rec, kw)
+            # Step 3e -- Nodes-IN inbound admit (white-box; the end-to-end
+            # two-node throttle lives in the remote suite once Step 4 makes the
+            # subnode's nodes_in config injectable).
+            await self._case_nodes_in_admit(rec, kw)
+            # Step 4 -- config load (YAML -> the three flat dicts) + the
+            # plugin-declared merge layer (main wins on overlapping keys).
+            await self._case_config_load_end_to_end(rec, kw)
+            await self._case_plugin_declared_merge(rec, kw)
+            await self._case_main_overrides_declared(rec, kw)
+            # Step 5 -- observability (reject-log suppression + stats()).
+            await self._case_reject_log_suppression(rec, kw)
+            await self._case_stats_snapshot(rec, kw)
+            await self._case_reject_event_emit(rec, kw)
+            # Step 6 -- coverage sweep (local gap: Framework-IN charged once per
+            # 1:N publish, NOT once per delivered sub).
+            await self._case_framework_in_fanout_once(rec, kw)
+        finally:
+            for su in runtime_subs:
+                try:
+                    await px.unsubscribe_event(su)
+                except Exception:
+                    pass
+            px._rate_limiter = orig_limiter
+            px._rate_limit_config = orig_cfg
+            px._rate_limit_sub_config = orig_subcfg
+            px._rate_limit_nodes_in_config = orig_nodes_cfg
+            # Restore the suite's declared block BEFORE the rebuild so the
+            # declared-layer recompute reproduces the boot-time state.
+            self._declared_rate_limits = orig_suite_decl
+            px._rate_limit_config_declared = orig_decl_cfg
+            px._rate_limit_sub_config_declared = orig_decl_sub
+            await px._rebuild_charge_sets()
+            px._rate_limits_active = orig_active
+            px._identity_active = orig_id
+            # Step 5: drop suppression state accumulated by the reject cases so it
+            # does not leak across runs (benign, but keeps the table boot-clean).
+            px._rl_reject_log.clear()
+        return rec.to_dict()
+
+    async def _case_endpoint_in_set(self, rec, kw):
+        async def body(c):
+            px = self._plexus
+            self._apply({
+                (DIM_ENDPOINT_IN, endpoint_key(SUITE, "ep_a")): {"max": 20, "window": 1},
+                (DIM_PLUGIN_IN, SUITE): {"max": 100, "window": 1},
+            })
+            await px._rebuild_charge_sets()
+            ep_b = px._rate_limiter.get(DIM_ENDPOINT_IN, endpoint_key(SUITE, "ep_a"))
+            pin_b = px._rate_limiter.get(DIM_PLUGIN_IN, SUITE)
+            if ep_b is None or pin_b is None:
+                raise AssertionError("endpoint_in / plugin_in buckets not configured")
+            cs = px._rl_endpoint_in.get((SUITE, "ep_a"))
+            if cs != [ep_b, pin_b]:
+                raise AssertionError(
+                    f"endpoint IN-set must be [endpoint_in, plugin_in] (exact "
+                    f"objects, pinned order); got {cs!r}"
+                )
+            # Unconfigured endpoint_in -> the IN-set skips it (only plugin_in).
+            self._apply({(DIM_PLUGIN_IN, SUITE): {"max": 100, "window": 1}})
+            await px._rebuild_charge_sets()
+            pin2 = px._rate_limiter.get(DIM_PLUGIN_IN, SUITE)
+            cs2 = px._rl_endpoint_in.get((SUITE, "ep_a"))
+            if cs2 != [pin2]:
+                raise AssertionError(
+                    f"unconfigured endpoint_in must be skipped -> [plugin_in]; got {cs2!r}"
+                )
+        await rec.run_case("ratelimit.endpoint_in_set", body, **kw)
+
+    async def _case_event_out(self, rec, kw):
+        async def body(c):
+            px = self._plexus
+            self._apply({(DIM_EVENT_OUT, event_key(SUITE, "ev_x")): {"max": 30, "window": 1}})
+            await px._rebuild_charge_sets()
+            b = px._rate_limiter.get(DIM_EVENT_OUT, event_key(SUITE, "ev_x"))
+            # S1: _rl_event_out now holds the precomputed OUT charge-set
+            # [plugin_out, event_out, framework_in] (unconfigured dims skipped).
+            # Only event_out is configured here, so the set is exactly [event_out].
+            stored = px._rl_event_out.get((SUITE, "ev_x"))
+            if b is None or stored != [b]:
+                raise AssertionError(
+                    f"event_out set must be the precomputed [event_out] charge-set; "
+                    f"got {stored!r}"
+                )
+        await rec.run_case("ratelimit.event_out", body, **kw)
+
+    async def _case_cross_plugin_sub(self, rec, kw):
+        async def body(c):
+            px = self._plexus
+            # TARGET's IN buckets + a Sub-IN limit staged by declared_id. The sub
+            # is OWNED by the suite but TARGETS another plugin.
+            self._apply(
+                {
+                    (DIM_ENDPOINT_IN, endpoint_key(TARGET, "sink")): {"max": 10, "window": 1},
+                    (DIM_PLUGIN_IN, TARGET): {"max": 50, "window": 1},
+                },
+                {(SUITE, "xsub"): {"max": 5, "window": 1}},
+            )
+            await px._rebuild_charge_sets()
+            uuid = await self._xsub_uuid()
+            sub_b = px._rate_limiter.get(DIM_SUB_IN, uuid)
+            ep_b = px._rate_limiter.get(DIM_ENDPOINT_IN, endpoint_key(TARGET, "sink"))
+            pin_b = px._rate_limiter.get(DIM_PLUGIN_IN, TARGET)
+            if sub_b is None:
+                raise AssertionError("declared_id Sub-IN limit did not resolve to a sub_uuid bucket")
+            cs = px._rl_sub_in.get(uuid)
+            if cs != [sub_b, ep_b, pin_b]:
+                raise AssertionError(
+                    f"cross-plugin sub IN-set must be [sub_in, TARGET endpoint_in, "
+                    f"TARGET plugin_in] (keyed on target, not owner); got {cs!r}"
+                )
+        await rec.run_case("ratelimit.cross_plugin_sub", body, **kw)
+
+    async def _case_runtime_sub_fallback(self, rec, kw, runtime_subs):
+        async def body(c):
+            px = self._plexus
+            # TARGET buckets configured, NO sub config. A runtime sub (no
+            # declared_id) gets no Sub-IN -> IN-set falls back to [endpoint_in,
+            # plugin_in]. subscribe_event builds the charge-set on the fly.
+            self._apply({
+                (DIM_ENDPOINT_IN, endpoint_key(TARGET, "sink")): {"max": 10, "window": 1},
+                (DIM_PLUGIN_IN, TARGET): {"max": 50, "window": 1},
+            })
+            await px._rebuild_charge_sets()
+            su = await px.subscribe_event(
+                topic="ratelimit/runtime", plugin_name=self.plugin_name,
+                plugin_uuid=self.plugin_uuid, target_access_name="sink",
+                target_plugin=TARGET, hosts="local",
+            )
+            runtime_subs.append(su)
+            ep_b = px._rate_limiter.get(DIM_ENDPOINT_IN, endpoint_key(TARGET, "sink"))
+            pin_b = px._rate_limiter.get(DIM_PLUGIN_IN, TARGET)
+            cs = px._rl_sub_in.get(su)
+            if cs != [ep_b, pin_b]:
+                raise AssertionError(
+                    f"runtime sub (no declared_id) IN-set must fall back to "
+                    f"[endpoint_in, plugin_in] (no sub_in); got {cs!r}"
+                )
+            # Teardown: unsubscribe drops the cached charge-set entry.
+            await px.unsubscribe_event(su)
+            runtime_subs.remove(su)
+            if su in px._rl_sub_in:
+                raise AssertionError("unsubscribe must drop the sub's charge-set entry")
+        await rec.run_case("ratelimit.runtime_sub_fallback", body, **kw)
+
+    async def _case_b051_subscribe_serializes_vs_rebuild(self, rec, kw, runtime_subs):
+        async def body(c):
+            px = self._plexus
+            # HUNT-051 regression. The bug: subscribe_event's Sub-IN charge-set
+            # build (_rl_build_sub) ran UNSERIALIZED against _rebuild_charge_sets'
+            # snapshot->clear->repopulate, so a sub added during a rebuild could
+            # lose its _rl_sub_in entry -> _rl_admit_in returns None = admit
+            # WITHOUT charge. The fix serializes both under _rl_rebuild_lock.
+            #
+            # Deterministic discriminator (no timing race): hold _rl_rebuild_lock
+            # exactly as _rebuild_charge_sets does across its whole body. With the
+            # fix, a concurrent subscribe_event registers its sub (lock-free) but
+            # its build BLOCKS on the held lock -> no _rl_sub_in entry appears while
+            # the lock is held. Without the fix, the build runs immediately -> the
+            # entry is present while the lock is held (the exact unserialized write
+            # a rebuild could then wipe).
+            self._apply({
+                (DIM_ENDPOINT_IN, endpoint_key(TARGET, "sink")): {"max": 10, "window": 1},
+                (DIM_PLUGIN_IN, TARGET): {"max": 50, "window": 1},
+            })
+            await px._rebuild_charge_sets()
+
+            await px._rl_rebuild_lock.acquire()
+            task = asyncio.create_task(px.subscribe_event(
+                topic="ratelimit/b051", plugin_name=self.plugin_name,
+                plugin_uuid=self.plugin_uuid, target_access_name="sink",
+                target_plugin=TARGET, hosts="local", declared_id="b051sub",
+            ))
+            lock_held = True
+            try:
+                # Wait until the sub is REGISTERED in topic_registry (lock-free, so
+                # this completes under the held lock in BOTH fixed and unfixed code).
+                su = None
+                for _ in range(1000):
+                    await asyncio.sleep(0)
+                    subs = await px.topic_registry.get_plugin_subscriptions(
+                        self.plugin_uuid
+                    )
+                    match = [s.sub_uuid for s in subs if s.declared_id == "b051sub"]
+                    if match:
+                        su = match[0]
+                        break
+                if su is None:
+                    raise AssertionError(
+                        "subscribe_event did not register the sub within the poll budget"
+                    )
+                # Give an UNSERIALIZED build (unfixed code) ample event-loop turns to
+                # complete. The fix keeps the build blocked on the held lock no matter
+                # how many turns pass, so this cannot flake green.
+                for _ in range(50):
+                    await asyncio.sleep(0)
+                built_while_lock_held = su in px._rl_sub_in
+
+                # Release BEFORE asserting so the blocked build proceeds and the task
+                # is never orphaned.
+                px._rl_rebuild_lock.release()
+                lock_held = False
+                su_final = await task
+                runtime_subs.append(su_final)
+
+                if built_while_lock_held:
+                    raise AssertionError(
+                        "HUNT-051: subscribe_event built the Sub-IN charge-set while "
+                        "_rl_rebuild_lock was held -> the build is NOT serialized "
+                        "against _rebuild_charge_sets, so a concurrent rebuild can "
+                        "wipe it (admit-without-charge)."
+                    )
+                if su_final not in px._rl_sub_in:
+                    raise AssertionError(
+                        "after _rl_rebuild_lock released, the serialized "
+                        "subscribe_event build must complete and populate _rl_sub_in"
+                    )
+                await px.unsubscribe_event(su_final)
+                runtime_subs.remove(su_final)
+            finally:
+                if lock_held:
+                    px._rl_rebuild_lock.release()
+                if not task.done():
+                    task.cancel()
+        await rec.run_case("ratelimit.b051_subscribe_serializes_vs_rebuild", body, **kw)
+
+    async def _case_teardown_sub_bucket(self, rec, kw):
+        async def body(c):
+            px = self._plexus
+            self._apply({}, {})
+            # _rl_teardown_sub is gated on _rate_limits_active; force it on for
+            # the fabricated bucket below.
+            px._rate_limits_active = True
+            px._rate_limiter.configure(DIM_SUB_IN, "fake-uuid", 5, 1)
+            px._rl_sub_in["fake-uuid"] = [px._rate_limiter.get(DIM_SUB_IN, "fake-uuid")]
+            px._rl_teardown_sub("fake-uuid")
+            if px._rate_limiter.get(DIM_SUB_IN, "fake-uuid") is not None:
+                raise AssertionError("teardown must remove the Sub-IN bucket")
+            if "fake-uuid" in px._rl_sub_in:
+                raise AssertionError("teardown must drop the cached charge-set entry")
+        await rec.run_case("ratelimit.teardown_sub_bucket", body, **kw)
+
+    async def _case_empty_config(self, rec, kw):
+        async def body(c):
+            px = self._plexus
+            self._apply({}, {})
+            await px._rebuild_charge_sets()
+            if (px._rl_endpoint_in or px._rl_sub_in or px._rl_event_out
+                    or px._rl_plugin_out or px._rl_framework_out
+                    or px._rl_framework_in is not None):
+                raise AssertionError("empty config must leave all side-tables empty")
+            if px._rate_limits_active:
+                raise AssertionError("empty config must leave _rate_limits_active False")
+        await rec.run_case("ratelimit.empty_config", body, **kw)
+
+    async def _case_empty_config_prunes_orphans(self, rec, kw):
+        async def body(c):
+            # Regression: a rebuild with EMPTY config but a NON-empty limiter
+            # (the last plugin-declared-only limit was just removed on unload)
+            # must fall through to the prune, not early-return -- else the orphan
+            # static bucket leaks and _rate_limits_active stays pinned True.
+            px = self._plexus
+            self._apply({}, {})  # fresh empty limiter + empty config
+            # Simulate a bucket left behind by a now-removed declared-only plugin.
+            px._rate_limiter.configure(DIM_PLUGIN_OUT, "GhostPlugin", 5, 1)
+            if len(px._rate_limiter) != 1:
+                raise AssertionError("setup: ghost bucket must exist before rebuild")
+            await px._rebuild_charge_sets()
+            if px._rate_limiter.get(DIM_PLUGIN_OUT, "GhostPlugin") is not None:
+                raise AssertionError(
+                    "empty config + non-empty limiter must PRUNE the orphan static "
+                    "bucket (the early-return must not skip the prune)"
+                )
+            if px._rate_limits_active:
+                raise AssertionError(
+                    "_rate_limits_active must be False once the last bucket is pruned"
+                )
+        await rec.run_case("ratelimit.empty_config_prunes_orphans", body, **kw)
+
+    async def _case_idempotent(self, rec, kw):
+        async def body(c):
+            px = self._plexus
+            self._apply({
+                (DIM_ENDPOINT_IN, endpoint_key(SUITE, "ep_a")): {"max": 20, "window": 1},
+                (DIM_PLUGIN_IN, SUITE): {"max": 100, "window": 1},
+            })
+            await px._rebuild_charge_sets()
+            n1 = len(px._rl_endpoint_in)
+            await px._rebuild_charge_sets()
+            n2 = len(px._rl_endpoint_in)
+            cs2 = px._rl_endpoint_in.get((SUITE, "ep_a"))
+            if n1 != n2:
+                raise AssertionError(f"rebuild not idempotent: counts {n1} -> {n2}")
+            if len(cs2) != 2:
+                raise AssertionError(f"rebuild doubled the IN-set: {cs2!r}")
+        await rec.run_case("ratelimit.idempotent", body, **kw)
+
+    async def _case_orphan_prune(self, rec, kw):
+        async def body(c):
+            px = self._plexus
+            # A live plugin's bucket is configured; a bucket for a plugin that is
+            # NOT loaded is pre-created as an orphan. The rebuild must prune the
+            # orphan (it isn't re-configured) and keep the live one -- so
+            # len(limiter), which drives _rate_limits_active, stays honest.
+            self._apply({(DIM_PLUGIN_IN, SUITE): {"max": 100, "window": 1}})
+            px._rate_limiter.configure(DIM_PLUGIN_IN, "GhostPlugin", 9, 1)
+            await px._rebuild_charge_sets()
+            if px._rate_limiter.get(DIM_PLUGIN_IN, "GhostPlugin") is not None:
+                raise AssertionError(
+                    "rebuild must prune a static bucket for a non-existent plugin"
+                )
+            if px._rate_limiter.get(DIM_PLUGIN_IN, SUITE) is None:
+                raise AssertionError("rebuild must keep the live plugin's bucket")
+        await rec.run_case("ratelimit.orphan_prune", body, **kw)
+
+    async def _case_out_self_plugin_out(self, rec, kw):
+        async def body(c):
+            px = self._plexus
+            # plugin_out(SUITE) only; framework_in unconfigured so plugin_out is
+            # the sole binding dimension. Large window -> negligible refill.
+            self._apply({(DIM_PLUGIN_OUT, SUITE): {"max": 3, "window": 1000}})
+            await px._rebuild_charge_sets()
+            # Each _rl_drive invocation runs ONE nested self-execute (SUITE.ep_a)
+            # whose OUT admit charges plugin_out(SUITE) once. The OUTER dispatch
+            # into _rl_drive is charged to the empty run() chain (-> None ->
+            # plugin_out skipped), so it does not consume the budget. framework_in
+            # is unconfigured, so plugin_out(SUITE) is the ONLY binding dimension.
+            # Reaching a {"rate_limited": ...} marker on every iteration also
+            # proves the OUTER call is never charged: if it were, the 4th outer
+            # dispatch would raise RateLimitException uncaught (before entering
+            # _rl_drive) and crash the loop instead of returning a marker.
+            results = []
+            for _ in range(4):
+                m = await self.execute(
+                    SUITE, "_rl_drive",
+                    args={"target": SUITE, "method": "ep_a"},
+                )
+                results.append(m["rate_limited"])
+            if results != [False, False, False, True]:
+                raise AssertionError(
+                    f"self-call must charge plugin_out(SUITE) on the in-chain "
+                    f"caller and reject the 4th; got {results}"
+                )
+        await rec.run_case("ratelimit.out_self_plugin_out", body, **kw)
+
+    async def _case_out_framework_in(self, rec, kw):
+        async def body(c):
+            px = self._plexus
+            # framework_in only. The isolation relies on the dispatch being
+            # framework-origin: a direct execute from run() has an empty caller
+            # chain (-> charged None -> plugin_out skipped), so only the global
+            # framework_in bucket binds. The RateLimitException is raised at the
+            # OUT site before the request is created, so it reaches this await as
+            # its real type (not re-wrapped).
+            self._apply({(DIM_FRAMEWORK_IN, FRAMEWORK_IN_KEY): {"max": 3, "window": 1000}})
+            await px._rebuild_charge_sets()
+            oks = 0
+            rejected = False
+            for _ in range(4):
+                try:
+                    await self.execute(TARGET, "sink")
+                    oks += 1
+                except RateLimitException:
+                    rejected = True
+                    break
+            if oks != 3 or not rejected:
+                raise AssertionError(
+                    f"framework_in must admit 3 then reject the 4th with "
+                    f"RateLimitException; oks={oks} rejected={rejected}"
+                )
+        await rec.run_case("ratelimit.out_framework_in", body, **kw)
+
+    async def _case_out_event_out(self, rec, kw):
+        async def body(c):
+            px = self._plexus
+            # event_out(SUITE, ev_x) only; plugin_out + framework_in unconfigured.
+            self._apply({(DIM_EVENT_OUT, event_key(SUITE, "ev_x")): {"max": 3, "window": 1000}})
+            await px._rebuild_charge_sets()
+            oks = 0
+            rejected = False
+            for _ in range(4):
+                try:
+                    await self.publish_event("ev_x", {"n": 1})
+                    oks += 1
+                except RateLimitException:
+                    rejected = True
+                    break
+            if oks != 3 or not rejected:
+                raise AssertionError(
+                    f"event_out must admit 3 publishes then reject the 4th; "
+                    f"oks={oks} rejected={rejected}"
+                )
+        await rec.run_case("ratelimit.out_event_out", body, **kw)
+
+    async def _case_out_lifecycle_exempt(self, rec, kw):
+        async def body(c):
+            px = self._plexus
+            # A dry plugin_out(SUITE) bucket: a non-exempt frame hits it, but an
+            # exempt (lifecycle-origin) frame must skip the admit entirely. This
+            # proves the admit RESPECTS an exempt frame; that the framework
+            # actually stamps lifecycle entries exempt=True is proven end-to-end
+            # by TestIdentitySuite (identity.lifecycle.exempt). caller_chain_scope
+            # here is the same primitive core.py uses at those lifecycle entries.
+            self._apply({(DIM_PLUGIN_OUT, SUITE): {"max": 1, "window": 1000}})
+            await px._rebuild_charge_sets()
+            b = px._rate_limiter.get(DIM_PLUGIN_OUT, SUITE)
+            b.tokens = 0.0
+            exempt = CallerIdentity(SUITE, self.plugin_uuid, exempt=True)
+            with caller_chain_scope(exempt, True):
+                dry_exempt = px._rl_admit_out(None, now=time.monotonic())
+            charged = CallerIdentity(SUITE, self.plugin_uuid, exempt=False)
+            with caller_chain_scope(charged, True):
+                dry_charged = px._rl_admit_out(None, now=time.monotonic())
+            if dry_exempt is not None:
+                raise AssertionError(
+                    "an exempt lifecycle frame must skip the OUT admit (no charge)"
+                )
+            if dry_charged is not b:
+                raise AssertionError(
+                    "a non-exempt frame must hit the dry plugin_out bucket"
+                )
+        await rec.run_case("ratelimit.out_lifecycle_exempt", body, **kw)
+
+    async def _case_out_asserted_attribution(self, rec, kw):
+        async def body(c):
+            px = self._plexus
+            # plugin_out keyed on an ASSERTED identity, not the chain caller. The
+            # asserted identity must win the attribution (impersonation charges
+            # the impersonated name). The impersonated name is NOT a loaded
+            # plugin, so _rebuild_charge_sets would never configure (and would
+            # prune) its bucket -- configure it directly on a cleared limiter and
+            # force the master switch on. framework_in stays None so plugin_out
+            # is the sole binding dimension.
+            self._apply({})
+            await px._rebuild_charge_sets()  # clears side-tables, _rl_framework_in=None
+            b = px._rate_limiter.configure(DIM_PLUGIN_OUT, "ImpersonatedX", 1, 1000)
+            b.tokens = 0.0
+            px._rate_limits_active = True
+            asserted = CallerIdentity("ImpersonatedX", "imp-uuid", exempt=False)
+            with caller_chain_scope(CallerIdentity(SUITE, self.plugin_uuid), True):
+                dry = px._rl_admit_out(asserted, now=time.monotonic())
+            if dry is not b:
+                raise AssertionError(
+                    "impersonation must charge plugin_out(asserted), not the "
+                    "chain caller"
+                )
+        await rec.run_case("ratelimit.out_asserted_attribution", body, **kw)
+
+    async def _case_out_asserted_attribution_e2e(self, rec, kw):
+        async def body(c):
+            px = self._plexus
+            # END-TO-END complement to out_asserted_attribution (which pokes
+            # _rl_admit_out directly): a REAL granted impersonating execute must
+            # charge plugin_out(ASSERTED), not plugin_out(the caller). The suite
+            # impersonates the real TARGET plugin (the asserted identity must be a
+            # loaded plugin -- the dispatch resolves the effective author); only
+            # plugin_out(TARGET) is configured, so a live execute(author=TARGET)
+            # routed through the gate must reject on plugin_out:TARGET after the
+            # budget -- proving the asserted identity flows gate -> OUT admit
+            # through real dispatch, and is NOT charged to the SUITE caller.
+            self._apply({(DIM_PLUGIN_OUT, TARGET): {"max": 3, "window": 1000}})
+            await px._rebuild_charge_sets()
+            target_uuid = px.plugins[TARGET].plugin_uuid
+            orig_grants = px._capability_grants
+            orig_cap = px._capability_active
+            orig_id = px._identity_active  # _recompute_capability_active flips this on
+            px._capability_grants = {SUITE: {"impersonation": [TARGET]}}
+            px._recompute_capability_active()
+            try:
+                results, msgs = [], []
+                for _ in range(4):
+                    m = await self.execute(
+                        SUITE, "_rl_drive_as",
+                        args={"target": SUITE, "method": "ep_a",
+                              "author": TARGET, "author_id": target_uuid},
+                    )
+                    results.append(m["rate_limited"])
+                    if m["rate_limited"]:
+                        msgs.append(m.get("msg", ""))
+                if results != [False, False, False, True]:
+                    raise AssertionError(
+                        f"impersonating execute must charge plugin_out({TARGET}) "
+                        f"and reject the 4th; got {results}"
+                    )
+                if not msgs or f"plugin_out:{TARGET}" not in msgs[0]:
+                    raise AssertionError(
+                        f"reject must name plugin_out:{TARGET} (the asserted "
+                        f"identity), not the caller; got {msgs!r}"
+                    )
+            finally:
+                px._capability_grants = orig_grants
+                px._capability_active = orig_cap
+                px._identity_active = orig_id
+        await rec.run_case("ratelimit.out_asserted_attribution_e2e", body, **kw)
+
+    async def _case_out_multi_dim_order(self, rec, kw):
+        async def body(c):
+            px = self._plexus
+            # Pinned admit order (Section 5): plugin_out, event_out, framework_in.
+            # Configure all THREE for a publish, each max 1. The first publish
+            # drains all three; the second finds all dry -- admit must report the
+            # PINNED-FIRST dry dimension (plugin_out), not event_out/framework_in.
+            self._apply({
+                (DIM_PLUGIN_OUT, SUITE): {"max": 1, "window": 1000},
+                (DIM_EVENT_OUT, event_key(SUITE, "ev_x")): {"max": 1, "window": 1000},
+                (DIM_FRAMEWORK_IN, FRAMEWORK_IN_KEY): {"max": 1, "window": 1000},
+            })
+            await px._rebuild_charge_sets()
+            await self.publish_event("ev_x", {"n": 1})  # drains all three
+            # All three MUST be dry now, else the pin-order check below is vacuous
+            # (plugin_out would bind first merely by being the only dry/configured
+            # dim). Assert the multi-dry precondition the case is meant to test.
+            for dim, key in (
+                (DIM_PLUGIN_OUT, SUITE),
+                (DIM_EVENT_OUT, event_key(SUITE, "ev_x")),
+                (DIM_FRAMEWORK_IN, FRAMEWORK_IN_KEY),
+            ):
+                b = px._rate_limiter.get(dim, key)
+                if b is None or b.tokens >= 1:
+                    raise AssertionError(
+                        f"setup: {dim}:{key} must be dry after the first publish "
+                        f"(got {None if b is None else b.tokens}); the pin-order "
+                        f"assertion is only meaningful with ALL three dry"
+                    )
+            msg = None
+            try:
+                await self.publish_event("ev_x", {"n": 1})
+            except RateLimitException as e:
+                msg = str(e)
+            if msg is None:
+                raise AssertionError("second publish (all dims dry) must reject")
+            if "plugin_out:" not in msg:
+                raise AssertionError(
+                    f"multi-dim reject must name the pinned-FIRST dry dim "
+                    f"(plugin_out), got {msg!r}"
+                )
+        await rec.run_case("ratelimit.out_multi_dim_order", body, **kw)
+
+    async def _case_in_endpoint_in(self, rec, kw):
+        async def body(c):
+            px = self._plexus
+            # endpoint_in(TARGET:sink) only. A direct execute(TARGET, sink) charges
+            # the IN-set at _call_endpoint (endpoint_in + plugin_in; plugin_in
+            # unconfigured -> skipped). The IN reject is raised at _call_endpoint
+            # as a RateLimitException; #2 unified exception typing PRESERVES that
+            # type end-to-end (the object is stored + re-raised, no longer
+            # stringified into a plain RequestException on the IN-local path).
+            self._apply({
+                (DIM_ENDPOINT_IN, endpoint_key(TARGET, "sink")): {"max": 3, "window": 1000},
+            })
+            await px._rebuild_charge_sets()
+            oks = 0
+            outcome = None
+            for _ in range(4):
+                try:
+                    await self.execute(TARGET, "sink")
+                    oks += 1
+                except RateLimitException as e:
+                    outcome = "ratelimit" if "endpoint_in" in str(e) else f"rl?{e}"
+                    break
+                except RequestException as e:
+                    outcome = f"req?{e}"  # #2: IN reject now surfaces as the subtype
+                    break
+            if oks != 3 or outcome != "ratelimit":
+                raise AssertionError(
+                    f"endpoint_in must admit 3 then reject the 4th as a typed "
+                    f"RateLimitException naming endpoint_in; oks={oks} outcome={outcome!r}"
+                )
+        await rec.run_case("ratelimit.in_endpoint_in", body, **kw)
+
+    async def _case_in_plugin_in(self, rec, kw):
+        async def body(c):
+            px = self._plexus
+            # plugin_in(TARGET) only; endpoint_in skipped -> plugin_in is the sole
+            # binding IN dimension.
+            self._apply({(DIM_PLUGIN_IN, TARGET): {"max": 3, "window": 1000}})
+            await px._rebuild_charge_sets()
+            oks = 0
+            named = False
+            for _ in range(4):
+                try:
+                    await self.execute(TARGET, "sink")
+                    oks += 1
+                except RequestException as e:
+                    named = "plugin_in" in str(e)
+                    break
+            if oks != 3 or not named:
+                raise AssertionError(
+                    f"plugin_in must admit 3 then reject naming plugin_in; "
+                    f"oks={oks} named={named}"
+                )
+        await rec.run_case("ratelimit.in_plugin_in", body, **kw)
+
+    async def _case_in_self_plugin_in(self, rec, kw):
+        async def body(c):
+            px = self._plexus
+            # Section 4 self-call: a plugin executing its OWN endpoint charges
+            # plugin_out(P) at OUT (proven in 3c) AND plugin_in(P) at IN. Here a
+            # direct execute(SUITE, ep_a) targets the suite itself; with only
+            # plugin_in(SUITE) configured, the IN admit binds on it.
+            self._apply({(DIM_PLUGIN_IN, SUITE): {"max": 3, "window": 1000}})
+            await px._rebuild_charge_sets()
+            oks = 0
+            named = False
+            for _ in range(4):
+                try:
+                    await self.execute(SUITE, "ep_a")
+                    oks += 1
+                except RequestException as e:
+                    named = "plugin_in" in str(e)
+                    break
+            if oks != 3 or not named:
+                raise AssertionError(
+                    f"self-call must charge plugin_in(SUITE) at IN and reject the "
+                    f"4th; oks={oks} named={named}"
+                )
+        await rec.run_case("ratelimit.in_self_plugin_in", body, **kw)
+
+    async def _case_in_sub_in_selection(self, rec, kw):
+        async def body(c):
+            px = self._plexus
+            # _rl_admit_in must select the SUB IN-set (_rl_sub_in[sub_uuid]) when a
+            # sub_uuid is given, and the ENDPOINT IN-set otherwise. Drive the helper
+            # directly (driving a real sub fan-out end-to-end needs a publisher
+            # event whose topic matches the sub; the publish-1:N skip itself rides
+            # the existing fire-and-forget swallow). Build a sub via the declared
+            # xsub + a tight sub_in, then assert the charge-set selection + that a
+            # dry sub_in binds, while an exempt frame skips.
+            self._apply(
+                {
+                    (DIM_ENDPOINT_IN, endpoint_key(TARGET, "sink")): {"max": 50, "window": 1000},
+                    (DIM_PLUGIN_IN, TARGET): {"max": 50, "window": 1000},
+                },
+                {(SUITE, "xsub"): {"max": 1, "window": 1000}},
+            )
+            await px._rebuild_charge_sets()
+            uuid = await self._xsub_uuid()
+            sub_b = px._rate_limiter.get(DIM_SUB_IN, uuid)
+            if sub_b is None:
+                raise AssertionError("sub_in bucket not configured for xsub")
+            # sub_uuid path -> sub IN-set; drain the tight sub_in and expect a dry
+            # bucket that IS the sub_in bucket.
+            d1 = px._rl_admit_in(TARGET, "sink", uuid, 1.0, None)   # admits (1->0)
+            d2 = px._rl_admit_in(TARGET, "sink", uuid, 1.0, None)   # sub_in dry
+            if d1 is not None or d2 is not sub_b:
+                raise AssertionError(
+                    f"sub_uuid must select the sub IN-set and bind on sub_in; "
+                    f"d1={d1!r} d2={d2!r}"
+                )
+            # sub_uuid=None -> endpoint IN-set (endpoint_in+plugin_in, both large)
+            # -> admits.
+            if px._rl_admit_in(TARGET, "sink", None, 1.0, None) is not None:
+                raise AssertionError("endpoint IN-set (no sub_uuid) should admit")
+            # exempt frame -> skip regardless of dry sub_in.
+            from plexus.runtime import CallerIdentity, caller_chain_scope
+            with caller_chain_scope(CallerIdentity(SUITE, self.plugin_uuid, exempt=True), True):
+                if px._rl_admit_in(TARGET, "sink", uuid, 1.0, None) is not None:
+                    raise AssertionError("an exempt frame must skip the IN admit")
+        await rec.run_case("ratelimit.in_sub_in_selection", body, **kw)
+
+    async def _case_in_stream_weight(self, rec, kw):
+        async def body(c):
+            px = self._plexus
+            # ep_stream declares stream_weight=2. With endpoint_in(SUITE:ep_stream)
+            # max=2, one stream open costs 2 (drains to 0) and the next open is
+            # IN-rejected at _process_request_stream -> the gen-request resolves
+            # with an error -> consuming raises a RequestException naming
+            # endpoint_in. Proves the stream IN site + cost=stream_weight.
+            self._apply({
+                (DIM_ENDPOINT_IN, endpoint_key(SUITE, "ep_stream")): {"max": 2, "window": 1000},
+            })
+            await px._rebuild_charge_sets()
+            # first open admits (cost 2 -> 0) and yields.
+            chunks = []
+            async for x in self.execute_stream(SUITE, "ep_stream"):
+                chunks.append(x)
+            if chunks != ["s1", "s2"]:
+                raise AssertionError(f"first stream open should yield fully; got {chunks}")
+            # second open: cost 2, bucket 0 -> reject before the first chunk.
+            # #2 stream type parity: the stream IN reject now surfaces as a typed
+            # RateLimitException (not a plain RequestException), matching the
+            # non-stream IN reject.
+            named = False
+            typed = False
+            try:
+                async for _ in self.execute_stream(SUITE, "ep_stream"):
+                    pass
+            except RateLimitException as e:
+                typed = True
+                named = "endpoint_in" in str(e)
+            except RequestException as e:
+                named = "endpoint_in" in str(e)
+            if not (typed and named):
+                raise AssertionError(
+                    "second stream open must reject (cost=stream_weight=2 vs 0 "
+                    "tokens) as a typed RateLimitException naming endpoint_in "
+                    f"(#2 stream type parity); typed={typed} named={named}"
+                )
+        await rec.run_case("ratelimit.in_stream_weight", body, **kw)
+
+    async def _case_in_publish_skip(self, rec, kw):
+        async def body(c):
+            px = self._plexus
+            # End-to-end 1:N fan-out skip: publishing ev_sub (topic matches the
+            # declared xsub sub) fans out to TestRateLimitTarget.sink. With a tight
+            # sub_in(SUITE,xsub) the FIRST delivery lands and the SECOND is
+            # IN-rejected at _call_endpoint -> the per-sub fire-and-forget Request
+            # errors and is SWALLOWED (publish still returns its scheduled count;
+            # the handler is NOT invoked for the throttled delivery). This also
+            # pins the origin_sub_uuid wiring: the fan-out must stamp sub.sub_uuid
+            # for the sub IN-set lookup to bind.
+            target = px.plugins.get(TARGET)
+            target._sink_calls = 0
+            # sub_in(xsub) only -> the sub IN-set is [sub_in] (endpoint_in /
+            # plugin_in unconfigured -> skipped). max=1: one delivery, then dry.
+            self._apply({}, {(SUITE, "xsub"): {"max": 1, "window": 1000}})
+            await px._rebuild_charge_sets()
+
+            async def _wait_until(pred, ticks):
+                for _ in range(ticks):
+                    if pred():
+                        return True
+                    await asyncio.sleep(0.005)
+                return pred()
+
+            n1 = await self.publish_event("ev_sub", {"n": 1})
+            # Let the first fan-out delivery land (sink_calls -> 1).
+            await _wait_until(lambda: target._sink_calls >= 1, 200)
+            n2 = await self.publish_event("ev_sub", {"n": 2})
+            # Give the second delivery a chance to (NOT) land; it must stay at 1.
+            await _wait_until(lambda: target._sink_calls >= 2, 60)
+
+            if target._sink_calls != 1:
+                raise AssertionError(
+                    f"the IN-throttled second sub delivery must be skipped "
+                    f"(handler not invoked); sink_calls={target._sink_calls}"
+                )
+            if n1 != 1 or n2 != 1:
+                raise AssertionError(
+                    f"publish must return its SCHEDULED count (1 matched sub) "
+                    f"regardless of the per-sub IN reject; n1={n1} n2={n2}"
+                )
+        await rec.run_case("ratelimit.in_publish_skip", body, **kw)
+
+    async def _case_nodes_in_admit(self, rec, kw):
+        async def body(c):
+            px = self._plexus
+            # White-box exercise of _rl_admit_inbound (the networking inbound
+            # admit). Drives the helper directly: a real two-node throttle (the
+            # handlers calling it) lives in the remote suite -- the subnode is a
+            # separate process whose nodes_in config is not injectable until
+            # Step 4's YAML plumbing lands. Start from a fresh limiter; the
+            # sideband + framework_in are restored by run()'s finally.
+            px._rate_limiter = RateLimiter()
+            px._rate_limit_sub_config = {}
+            px._rate_limit_nodes_in_config = {
+                "default": {"max": 2, "window": 1000},
+                "peerB": {"max": 1, "window": 1000},   # per-peer override
+            }
+            # framework_in for the include_framework path.
+            px._rate_limit_config = {(DIM_FRAMEWORK_IN, FRAMEWORK_IN_KEY): {"max": 3, "window": 1000}}
+            await px._rebuild_charge_sets()  # builds _rl_framework_in
+            now = time.monotonic()
+
+            # peer=None -> no-op (defensive direct-call path).
+            if px._rl_admit_inbound(None, False, now) is not None:
+                raise AssertionError("peer=None must no-op the Nodes-IN admit")
+
+            # Lazy get-or-create from "default" (max 2) for peerA; 3rd rejects.
+            r1 = px._rl_admit_inbound("peerA", False, now)
+            r2 = px._rl_admit_inbound("peerA", False, now)
+            nb_a = px._rate_limiter.get(DIM_NODES_IN, "peerA")
+            r3 = px._rl_admit_inbound("peerA", False, now)
+            if nb_a is None:
+                raise AssertionError("first contact must lazily create the peer bucket")
+            if r1 is not None or r2 is not None or r3 is not nb_a:
+                raise AssertionError(
+                    f"default max=2 -> admit 2 then reject on nodes_in(peerA); "
+                    f"r1={r1!r} r2={r2!r} r3={r3!r}"
+                )
+
+            # Per-peer ISOLATION + override: peerB has its own bucket (override
+            # max=1), unaffected by peerA being dry.
+            rb1 = px._rl_admit_inbound("peerB", False, now)
+            rb2 = px._rl_admit_inbound("peerB", False, now)
+            nb_b = px._rate_limiter.get(DIM_NODES_IN, "peerB")
+            if rb1 is not None or rb2 is not nb_b:
+                raise AssertionError(
+                    f"peerB override max=1 -> admit 1 then reject; isolated from "
+                    f"peerA; rb1={rb1!r} rb2={rb2!r}"
+                )
+            if nb_b is nb_a:
+                raise AssertionError("each peer must get a DISTINCT Nodes-IN bucket")
+
+            # include_framework=True -> atomic [nodes_in, framework_in]. Drain
+            # framework_in (max 3) via a fresh peer so nodes_in is not the binder.
+            fb = px._rl_framework_in
+            if fb is None:
+                raise AssertionError("framework_in bucket must be built")
+            fb.tokens = 0.0  # force framework_in dry
+            dry = px._rl_admit_inbound("peerC", True, now)
+            loc = px._rate_limiter.locate(dry) if dry is not None else None
+            if dry is not fb:
+                raise AssertionError(
+                    f"include_framework must charge framework_in; bound bucket "
+                    f"should be framework_in, got loc={loc!r}"
+                )
+
+            # Empty sideband -> no-op (zero-overhead-off for Nodes-IN).
+            px._rate_limiter = RateLimiter()
+            px._rate_limit_nodes_in_config = {}
+            px._rate_limit_config = {}
+            await px._rebuild_charge_sets()
+            if px._rl_admit_inbound("peerA", True, now) is not None:
+                raise AssertionError("empty nodes_in + no framework_in must no-op")
+        await rec.run_case("ratelimit.nodes_in_admit", body, **kw)
+
+    async def _case_config_load_end_to_end(self, rec, kw):
+        async def body(c):
+            px = self._plexus
+            # End-to-end Step 4: a YAML rate_limits: section -> _load_rate_limits
+            # flattens it into the three base dicts -> _rebuild_charge_sets builds
+            # the buckets. Covers all the static dims + nodes_in sideband + the
+            # declared-id Sub-IN resolution, driven from real YAML shape.
+            px._rate_limiter = RateLimiter()
+            saved_yaml = px.yaml_config.get("rate_limits")
+            try:
+                px.yaml_config["rate_limits"] = {
+                    "framework_in": {"max": 1000, "window": 1},
+                    "nodes_in": {
+                        "default": {"max": 200, "window": 1},
+                        "peers": {"nodeB": {"max": 9, "window": 1}},
+                    },
+                    "plugins": {
+                        SUITE: {
+                            "in": {"max": 100, "window": 1},
+                            "endpoints": {"ep_a": {"max": 20, "window": 1}},
+                            "events": {"ev_x": {"max": 30, "window": 1}},
+                            "subs": {"xsub": {"max": 40, "window": 1}},
+                        },
+                    },
+                }
+                px._load_rate_limits()
+                await px._rebuild_charge_sets()
+                # 1) the flatten landed in the base dicts.
+                if px._rate_limit_config.get((DIM_FRAMEWORK_IN, FRAMEWORK_IN_KEY)) != {"max": 1000, "window": 1}:
+                    raise AssertionError("framework_in not flattened into the base config")
+                if px._rate_limit_nodes_in_config.get("nodeB") != {"max": 9, "window": 1}:
+                    raise AssertionError("nodes_in peer not flattened into the sideband")
+                if px._rate_limit_nodes_in_config.get("default") != {"max": 200, "window": 1}:
+                    raise AssertionError("nodes_in default not flattened into the sideband")
+                if px._rate_limit_sub_config.get((SUITE, "xsub")) != {"max": 40, "window": 1}:
+                    raise AssertionError("declared-id sub limit not flattened into the sub config")
+                # 2) the buckets were actually built from that config.
+                if px._rl_framework_in is None:
+                    raise AssertionError("framework_in bucket not built from YAML")
+                if px._rate_limiter.get(DIM_ENDPOINT_IN, endpoint_key(SUITE, "ep_a")) is None:
+                    raise AssertionError("endpoint_in bucket not built from YAML")
+                if px._rate_limiter.get(DIM_EVENT_OUT, event_key(SUITE, "ev_x")) is None:
+                    raise AssertionError("event_out bucket not built from YAML")
+                uuid = await self._xsub_uuid()
+                if px._rate_limiter.get(DIM_SUB_IN, uuid) is None:
+                    raise AssertionError("sub_in bucket not built/resolved from the declared-id YAML limit")
+                if not px._rate_limits_active:
+                    raise AssertionError("a configured rate_limits: section must flip _rate_limits_active on")
+            finally:
+                if saved_yaml is None:
+                    px.yaml_config.pop("rate_limits", None)
+                else:
+                    px.yaml_config["rate_limits"] = saved_yaml
+        await rec.run_case("ratelimit.config_load_end_to_end", body, **kw)
+
+    async def _case_plugin_declared_merge(self, rec, kw):
+        async def body(c):
+            px = self._plexus
+            # A plugin's SELF-declared limit (no main/base config) must produce a
+            # bucket: _rebuild_charge_sets reads _declared_rate_limits off the
+            # loaded plugin and _rl_configure falls back to the declared layer.
+            self._apply({}, {})                       # empty BASE (main/test) config
+            self._declared_rate_limits = (
+                {(DIM_PLUGIN_IN, SUITE): {"max": 7, "window": 1000}}, {}
+            )
+            await px._rebuild_charge_sets()
+            b = px._rate_limiter.get(DIM_PLUGIN_IN, SUITE)
+            if b is None:
+                raise AssertionError("a plugin-declared limit must produce a bucket")
+            if b.max != 7.0:
+                raise AssertionError(f"declared bucket max should be 7; got {b.max}")
+            if not px._rate_limits_active:
+                raise AssertionError("a declared-only limit must flip _rate_limits_active on")
+            # Layering: the declared limit lands in the DECLARED dict, never the
+            # base dict (so direct test/main injection is never clobbered).
+            if (DIM_PLUGIN_IN, SUITE) in px._rate_limit_config:
+                raise AssertionError("a declared limit must NOT leak into the base config dict")
+            if px._rate_limit_config_declared.get((DIM_PLUGIN_IN, SUITE)) != {"max": 7, "window": 1000}:
+                raise AssertionError("a declared limit must land in the declared-layer dict")
+        await rec.run_case("ratelimit.plugin_declared_merge", body, **kw)
+
+    async def _case_main_overrides_declared(self, rec, kw):
+        async def body(c):
+            px = self._plexus
+            # Main (base) config AND a plugin-declared limit BOTH set
+            # plugin_in(SUITE). Main must WIN by precedence (_rl_configure checks
+            # the base dict before the declared layer).
+            self._apply({(DIM_PLUGIN_IN, SUITE): {"max": 3, "window": 1000}}, {})
+            self._declared_rate_limits = (
+                {(DIM_PLUGIN_IN, SUITE): {"max": 99, "window": 1000}}, {}
+            )
+            await px._rebuild_charge_sets()
+            b = px._rate_limiter.get(DIM_PLUGIN_IN, SUITE)
+            if b is None or b.max != 3.0:
+                raise AssertionError(
+                    f"main config (max=3) must win over the plugin-declared value "
+                    f"(max=99); got max={b.max if b else None}"
+                )
+        await rec.run_case("ratelimit.main_overrides_declared", body, **kw)
+
+    async def _case_reject_log_suppression(self, rec, kw):
+        async def body(c):
+            import logging
+            px = self._plexus
+            # framework_in max=1: first execute admits, the rest reject at the OUT
+            # site (RateLimitException raised to the caller). Drives the Step 5
+            # suppression state machine end-to-end through a real dispatch.
+            self._apply({(DIM_FRAMEWORK_IN, FRAMEWORK_IN_KEY): {"max": 1, "window": 1000}})
+            await px._rebuild_charge_sets()
+            px._rl_reject_log.clear()
+            loc = (DIM_FRAMEWORK_IN, FRAMEWORK_IN_KEY)
+
+            captured = []
+
+            class _Cap(logging.Handler):
+                def emit(self, r):
+                    try:
+                        msg = r.getMessage()
+                    except Exception:
+                        msg = ""
+                    if "[RATELIMIT]" in msg:
+                        captured.append(msg)
+
+            handler = _Cap(level=logging.WARNING)
+            px._logger.addHandler(handler)
+            try:
+                await self.execute(TARGET, "sink")        # admit (framework_in 1 -> 0)
+                rejects = 0
+                for _ in range(3):                        # 3 in-window rejects
+                    try:
+                        await self.execute(TARGET, "sink")
+                    except RateLimitException:
+                        rejects += 1
+                if rejects != 3:
+                    raise AssertionError(f"expected 3 rejects; got {rejects}")
+                # First reject logs ONCE; the next two are suppressed.
+                if len(captured) != 1:
+                    raise AssertionError(
+                        f"in-window must emit exactly 1 WARNING (first reject); "
+                        f"got {len(captured)}: {captured}"
+                    )
+                st = px._rl_reject_log.get(loc)
+                if st is None or st["rejected_at_warn"] != 1:
+                    raise AssertionError(
+                        f"first reject must record suppression state "
+                        f"(rejected_at_warn=1); got {st!r}"
+                    )
+
+                # Force the window to have elapsed, then one more reject: it must
+                # emit a SUMMARY of the 2 suppressed + a fresh first-of-window
+                # WARNING (2 new records).
+                captured.clear()
+                st["last_warn"] -= (RL_REJECT_LOG_WINDOW + 1.0)
+                try:
+                    await self.execute(TARGET, "sink")
+                except RateLimitException:
+                    pass
+                if len(captured) != 2:
+                    raise AssertionError(
+                        f"post-window reject must emit a suppressed-count summary "
+                        f"+ a new WARNING (2 records); got {len(captured)}: {captured}"
+                    )
+                if not any("further" in m for m in captured):
+                    raise AssertionError(
+                        f"post-window must emit the suppressed-count summary; "
+                        f"got {captured}"
+                    )
+                # The summary names the count actually suppressed (2).
+                if not any("2 further" in m for m in captured):
+                    raise AssertionError(
+                        f"summary must report 2 suppressed rejects; got {captured}"
+                    )
+            finally:
+                px._logger.removeHandler(handler)
+        await rec.run_case("ratelimit.reject_log_suppression", body, **kw)
+
+    async def _case_stats_snapshot(self, rec, kw):
+        async def body(c):
+            px = self._plexus
+            # stats() must reflect real charge/reject volume after live dispatch.
+            # framework_in max=2: 2 admits then rejects.
+            self._apply({(DIM_FRAMEWORK_IN, FRAMEWORK_IN_KEY): {"max": 2, "window": 1000}})
+            await px._rebuild_charge_sets()
+            px._rl_reject_log.clear()
+            oks = 0
+            rejects = 0
+            for _ in range(4):
+                try:
+                    await self.execute(TARGET, "sink")
+                    oks += 1
+                except RateLimitException:
+                    rejects += 1
+            recs = px._rate_limiter.stats()
+            fw = next(
+                (r for r in recs
+                 if r["dim"] == DIM_FRAMEWORK_IN and r["key"] == FRAMEWORK_IN_KEY),
+                None,
+            )
+            if fw is None:
+                raise AssertionError(f"stats() must include the framework_in bucket; got {recs}")
+            if fw["charged"] != 2 or fw["rejected"] != 2:
+                raise AssertionError(
+                    f"stats() must report charged=2/rejected=2 after 2 admits + 2 "
+                    f"rejects; got charged={fw['charged']} rejected={fw['rejected']}"
+                )
+            # tokens is "effectively drained" rather than exactly 0.0: stats()
+            # does a refill-for-show against time.monotonic(), so the few ms
+            # between the drain and this snapshot credit a microscopic amount
+            # (rate=0.002 tok/s -> ~3e-5 tokens for ~16ms of elapsed time).
+            # Assert a small tolerance so a correct drain never flakes; a real
+            # leftover (>= 1 token) still fails loudly (1e-3 tolerance = ~0.5s of
+            # slack at this rate, far below one token).
+            if fw["max"] != 2.0 or fw["tokens"] >= 1e-3:
+                raise AssertionError(
+                    f"stats() must report max=2 and drained tokens~0 (<1e-3); "
+                    f"got max={fw['max']} tokens={fw['tokens']}"
+                )
+            # Section 13: stats() also exposes last + rate for refill-for-show.
+            if "last" not in fw or "rate" not in fw:
+                raise AssertionError(
+                    f"stats() must expose last+rate; got keys {sorted(fw)}"
+                )
+            if fw["rate"] != 2.0 / 1000.0:
+                raise AssertionError(
+                    f"stats() rate must be max/window (=0.002); got {fw['rate']}"
+                )
+            if oks != 2 or rejects != 2:
+                raise AssertionError(f"expected 2 admit + 2 reject; got {oks}/{rejects}")
+        await rec.run_case("ratelimit.stats_snapshot", body, **kw)
+
+    async def _case_reject_event_emit(self, rec, kw):
+        async def body(c):
+            px = self._plexus
+            # Section 13: the _core/ratelimit/rejected bus emit rides the SAME
+            # first-per-window gate as the reject WARNING -- one emit on the
+            # first reject, in-window repeats suppressed (NO emit), and the
+            # post-window emit carries the suppressed count. Same driver as
+            # reject_log_suppression, asserting the event instead of the log.
+            self._apply({(DIM_FRAMEWORK_IN, FRAMEWORK_IN_KEY): {"max": 1, "window": 1000}})
+            await px._rebuild_charge_sets()
+            px._rl_reject_log.clear()
+            loc = (DIM_FRAMEWORK_IN, FRAMEWORK_IN_KEY)
+
+            events = []
+
+            def _obs(topic, payload):
+                events.append(dict(payload))
+
+            self.internal_observe("_core/ratelimit/rejected", _obs)
+            try:
+                await self.execute(TARGET, "sink")        # admit (1 -> 0)
+                for _ in range(3):                        # 3 in-window rejects
+                    try:
+                        await self.execute(TARGET, "sink")
+                    except RateLimitException:
+                        pass
+                if len(events) != 1:
+                    raise AssertionError(
+                        f"first reject must emit exactly ONE event (next 2 "
+                        f"suppressed); got {len(events)}: {events}"
+                    )
+                ev = events[0]
+                if ev.get("dim") != loc[0] or ev.get("key") != loc[1]:
+                    raise AssertionError(f"event must name the binding bucket; got {ev}")
+                for field in ("tokens", "max", "cost", "suppressed", "ts"):
+                    if field not in ev:
+                        raise AssertionError(f"event payload missing {field!r}; got {ev}")
+                if ev["suppressed"] != 0 or ev["max"] != 1.0 or ev["cost"] != 1.0:
+                    raise AssertionError(
+                        f"first emit must carry suppressed=0/max=1/cost=1; got {ev}"
+                    )
+                # Force the window to elapse, then one more reject -> a 2nd emit
+                # carrying the 2 in-window rejects it collapsed.
+                events.clear()
+                px._rl_reject_log[loc]["last_warn"] -= (RL_REJECT_LOG_WINDOW + 1.0)
+                try:
+                    await self.execute(TARGET, "sink")
+                except RateLimitException:
+                    pass
+                if len(events) != 1 or events[0].get("suppressed") != 2:
+                    raise AssertionError(
+                        f"post-window emit must carry suppressed=2; got {events}"
+                    )
+            finally:
+                self.internal_unobserve("_core/ratelimit/rejected", _obs)
+        await rec.run_case("ratelimit.reject_event_emit", body, **kw)
+
+    async def _case_framework_in_fanout_once(self, rec, kw):
+        async def body(c):
+            px = self._plexus
+            # Framework-IN is charged ONCE at the publish OUT admit, NOT once per
+            # delivered subscriber. A 1:N fan-out (here N=2: the declared xsub plus
+            # a 2nd runtime sub on the SAME topic, both -> TARGET.sink) from ONE
+            # publish must consume exactly ONE Framework-IN token. (in_publish_skip
+            # configures no framework_in, so it cannot prove this -- review gap.)
+            target = px.plugins.get(TARGET)
+            target._sink_calls = 0
+            # framework_in generous so the publish admits; IN-sets unconfigured so
+            # BOTH deliveries land (proving 2 deliveries vs 1 framework_in charge).
+            self._apply({(DIM_FRAMEWORK_IN, FRAMEWORK_IN_KEY): {"max": 100, "window": 1000}})
+            await px._rebuild_charge_sets()
+            fb = px._rl_framework_in
+            if fb is None:
+                raise AssertionError("framework_in bucket must be built")
+            charged0 = fb.charged
+            su = await px.subscribe_event(
+                topic="ratelimit/xsub/topic", plugin_name=self.plugin_name,
+                plugin_uuid=self.plugin_uuid, target_access_name="sink",
+                target_plugin=TARGET, hosts="local",
+            )
+            try:
+                async def _wait_until(pred, ticks):
+                    for _ in range(ticks):
+                        if pred():
+                            return True
+                        await asyncio.sleep(0.005)
+                    return pred()
+
+                n = await self.publish_event("ev_sub", {"n": 1})
+                # Framework-IN is charged SYNCHRONOUSLY at the publish OUT admit,
+                # BEFORE the fan-out tasks run -- capture the delta NOW so a
+                # background charge during the delivery-wait below cannot skew it.
+                # The two deliveries charge their IN-sets at _call_endpoint, NOT
+                # framework_in; a per-sub framework_in charge would make the delta
+                # 3 (1 OUT + 2 deliveries), the correct single-charge makes it 1.
+                delta = fb.charged - charged0
+                await _wait_until(lambda: target._sink_calls >= 2, 200)
+                if target._sink_calls != 2:
+                    raise AssertionError(
+                        f"one publish to a 2-sub topic must deliver TWICE; "
+                        f"sink_calls={target._sink_calls}"
+                    )
+                if delta != 1:
+                    raise AssertionError(
+                        f"framework_in must be charged ONCE per publish regardless "
+                        f"of fan-out width; charged delta={delta} (expected 1)"
+                    )
+                if n != 2:
+                    raise AssertionError(
+                        f"publish should schedule 2 matched subs; got {n}"
+                    )
+            finally:
+                try:
+                    await px.unsubscribe_event(su)
+                except Exception:
+                    pass
+        await rec.run_case("ratelimit.framework_in_fanout_once", body, **kw)

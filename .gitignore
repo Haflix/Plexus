@@ -12,8 +12,11 @@ __pycache__/
 # Personal files
 _old/
 _private/
+_keys/
 bugtracker.md
 notes.txt
+.githooks/
+logs/
 
 # Distribution / packaging
 .Python
@@ -51,6 +54,7 @@ htmlcov/
 .nox/
 .coverage
 .coverage.*
+.coverage_*
 .cache
 nosetests.xml
 coverage.xml
@@ -213,3 +217,26 @@ backups/
 
 # Config files — local user copy. Copy config.example.yml to config.yml and edit.
 config.yml
+
+# Out-of-tree plugin repos. Each plugin under plugins/ is its own
+# git repo with its own pyproject.toml and lives independently of
+# this framework repo. PlexusTUI (the dashboard) lives here.
+plugins/
+
+# TUI smoke-harness generated identity (cert.pem / key.pem). The harness
+# auto-creates these on first run via the same `_load_or_generate_identity`
+# path the production NetworkManager uses, so a fresh clone bootstraps
+# cleanly. Tracking would commit private-key material + pin per-machine
+# fingerprints into peer configs.
+_keys_tui_smoke/
+
+# Test-run report dumps (test_application.py DUMP_PATH).
+test_outputs/
+
+# Audit-triage test scripts (~100 files, internal bug-intake verification).
+# Not part of the main test framework — used during framework audit cycles
+# to verify findings against running code. Keep local; plugin authors don't
+# need them.
+plugins_test/audit_pilot/
+plugins_test/audit_2026_06/
+plugins_test/hunt_2026_06/

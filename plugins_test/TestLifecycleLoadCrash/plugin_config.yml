@@ -1,0 +1,5 @@
+description: Static fixture whose on_load raises — loaded on demand by lifecycle.state_machine.failed_load_state_visible
+version: 0.1.0
+remote: False
+arguments:
+endpoints:

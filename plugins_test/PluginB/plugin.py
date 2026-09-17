@@ -1,5 +1,5 @@
-from utils import Plugin
-from decorators import log_errors, handle_errors, async_log_errors, async_handle_errors
+from plexus.utils import Plugin
+from plexus.decorators import log_errors, handle_errors, async_log_errors, async_handle_errors
 import asyncio
 
 class PluginB(Plugin):
@@ -20,8 +20,7 @@ class PluginB(Plugin):
     @async_handle_errors(default_return=0)
     async def calculate_square(self, number):
         """Calculate the square of a number with built-in error handling."""
-        
-        #await asyncio.sleep(1) Simulate some async work (Simulated headache)
+
         result = number ** 2
         self._logger.info(f"Calculated square of {number}: {result}")
         return result

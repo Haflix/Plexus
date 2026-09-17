@@ -1,17 +1,20 @@
 """TestLifecycleSuite — Phase 4.
 
 Exercises plugin lifecycle: load, enable, disable, reload, pop, purge plus
-bug repros B-004 / B-005 / B-006 / B-007 / B-008 / B-009 / B-010 / B-016 /
+bug repros B-004 / B-005 / B-007 / B-008 / B-009 / B-010 / B-016 /
 B-037 / B-043 and the disable-reverse-order regression lock.
+
+B-073: B-006 case removed — its target failure mode
+(``running_loop`` crashing on a poisoned ``self.requests`` entry)
+ceased to exist when Step 4 killed ``running_loop`` and
+``cleanup_requests`` entirely. Done-callback eviction at all 7
+framework Request sites replaced the polling reap; there is no
+maintenance loop left to test for survival.
 
 Args-override merging cases (8) and per-logger level cases (7) from the plan
 are deferred to a follow-up phase — they need fixture-heavy yaml manipulation
 and log-record interception machinery that's out of scope here. They are
 recorded as `skip` with explicit reasons so the suite still enumerates them.
-
-The B-006 case is destructive=True (running_loop dies) and runs LAST. Its
-finally restarts the maintenance loop via core._running_loop_task =
-asyncio.create_task(core.running_loop()) per the plan.
 """
 
 import sys
@@ -22,19 +25,23 @@ import asyncio  # noqa: E402
 import time  # noqa: E402
 from typing import Any, Dict, List, Optional  # noqa: E402
 
-from utils import Plugin  # noqa: E402
-from decorators import async_log_errors, log_errors  # noqa: E402
-from exceptions import RequestException  # noqa: E402
+from plexus.utils import Plugin  # noqa: E402
+from plexus.decorators import async_log_errors, log_errors  # noqa: E402
+from plexus.exceptions import RequestException  # noqa: E402
+from plexus.plugin_state import Phase, State  # noqa: E402  (C-152)
+from plexus.dependencies import DependencySpec  # noqa: E402  (HUNT-075/076)
+from packaging.specifiers import SpecifierSet  # noqa: E402  (HUNT-075/076)
 
 from _test_helpers import CaseRecorder  # noqa: E402
 
 
-SUITE_VERSION = "0.1.0"
+SUITE_VERSION = "0.7.0"
 VICTIM = "TestLifecycleVictim"
 VICTIM2 = "TestLifecycleVictim2"
 VICTIM_PATH = "./plugins_test/TestLifecycleVictim"
 SENTINEL = "TestLifecycleSentinel"
 BROKEN_VERSION = "TestLifecycleBrokenVersion"
+LOAD_CRASH = "TestLifecycleLoadCrash"
 
 
 class TestLifecycleSuite(Plugin):
@@ -42,7 +49,7 @@ class TestLifecycleSuite(Plugin):
 
     @log_errors
     def on_load(self, *args, **kwargs):
-        pass
+        self._lifecycle_b037_fired: bool = False
 
     @async_log_errors
     async def on_enable(self):
@@ -62,7 +69,7 @@ class TestLifecycleSuite(Plugin):
         skip_slow: bool = False,
         allow_destructive: bool = True,
     ) -> Dict[str, Any]:
-        rec = CaseRecorder("TestLifecycleSuite", SUITE_VERSION, self._plugin_core)
+        rec = CaseRecorder("TestLifecycleSuite", SUITE_VERSION, self._plexus)
 
         kw = dict(
             case_ids_filter=case_ids,
@@ -84,7 +91,8 @@ class TestLifecycleSuite(Plugin):
         await self._basic_pop_pending(rec, kw)
         await self._basic_b005_purge(rec, kw)
         await self._basic_b008_concurrent_enable(rec, kw)
-        await self._basic_b037_notify_during_pop(rec, kw)
+        await self._basic_stage_o_ready_gate(rec, kw)
+        await self._basic_b037_event_during_pop(rec, kw)
         await self._basic_b043_pop_failed_reaped(rec, kw)
         await self._basic_b007_missing_version(rec, kw)
         await self._basic_disable_disabled_endpoint(rec, kw)
@@ -92,8 +100,12 @@ class TestLifecycleSuite(Plugin):
         await self._basic_args_overrides_skip(rec, kw)
         await self._basic_logger_levels_skip(rec, kw)
         await self._basic_async_reload_skip(rec, kw)
-        # Destructive case MUST run last
-        await self._basic_b006_running_loop(rec, kw)
+        await self._state_machine_coverage(rec, kw)  # C-152
+        await self._hunt075_076_reload_deps(rec, kw)  # HUNT-075/076 reload dep fix
+        # B-073: B-006 case deleted (tested
+        # _running_loop_task which was killed in Step 4). Done-callback
+        # eviction removes the entire failure mode the case guarded
+        # against (cleanup_requests crash → maintenance loop dead).
 
         return rec.to_dict()
 
@@ -105,16 +117,16 @@ class TestLifecycleSuite(Plugin):
         # Defensive: re-enable VICTIM if a prior case left it disabled, then
         # reset all behavior flags. Direct attribute access works even when
         # the plugin is disabled (configure endpoint would fail then).
-        victim = self._plugin_core.plugins.get(VICTIM)
+        victim = self._plexus.plugins.get(VICTIM)
         if victim is None:
             entry = self._find_yaml_entry(VICTIM)
             if entry:
                 entry["enabled"] = True
                 try:
-                    await self._plugin_core.load_plugin_with_conf(entry)
+                    await self._plexus.load_plugin_with_conf(entry)
                 except Exception:
                     pass
-                victim = self._plugin_core.plugins.get(VICTIM)
+                victim = self._plexus.plugins.get(VICTIM)
         if victim is not None:
             victim._on_enable_raises_after_setup = False
             victim._on_disable_raises = False
@@ -124,12 +136,12 @@ class TestLifecycleSuite(Plugin):
             victim.db_open = True if victim.enabled else False
             if not victim.enabled:
                 try:
-                    await self._plugin_core._enable_plugin(VICTIM)
+                    await self._plexus.enable_plugin(VICTIM)
                 except Exception:
                     pass
 
     async def _reload_victim(self) -> None:
-        await self._plugin_core._reload_plugin(VICTIM)
+        await self._plexus._reload_plugin(VICTIM)
 
     # ====================================================================
     # BASIC load
@@ -137,9 +149,9 @@ class TestLifecycleSuite(Plugin):
 
     async def _basic_load(self, rec: CaseRecorder, kw: Dict) -> None:
         async def body_valid_config(c):
-            if VICTIM not in self._plugin_core.plugins:
+            if VICTIM not in self._plexus.plugins:
                 raise AssertionError(f"{VICTIM} not in core.plugins")
-            plugin = self._plugin_core.plugins[VICTIM]
+            plugin = self._plexus.plugins[VICTIM]
             c.expect(plugin.plugin_name, VICTIM)
             assert plugin.enabled
 
@@ -155,19 +167,19 @@ class TestLifecycleSuite(Plugin):
     async def _basic_enable_disable(self, rec: CaseRecorder, kw: Dict) -> None:
         async def body_enable_success(c):
             await self._ensure_victim_clean()
-            plugin = self._plugin_core.plugins[VICTIM]
+            plugin = self._plexus.plugins[VICTIM]
             if not plugin.enabled:
-                await self._plugin_core._enable_plugin(VICTIM)
+                await self._plexus.enable_plugin(VICTIM)
             assert plugin.enabled
 
         async def body_disable_success(c):
             await self._ensure_victim_clean()
-            plugin = self._plugin_core.plugins[VICTIM]
-            await self._plugin_core._disable_plugin(VICTIM)
+            plugin = self._plexus.plugins[VICTIM]
+            await self._plexus.disable_plugin(VICTIM)
             try:
                 assert not plugin.enabled
             finally:
-                await self._plugin_core._enable_plugin(VICTIM)
+                await self._plexus.enable_plugin(VICTIM)
 
         await rec.run_case(
             "lifecycle.enable.success", body_enable_success,
@@ -191,14 +203,14 @@ class TestLifecycleSuite(Plugin):
                 # on_enable's partial-setup phase.
                 await self.execute(VICTIM, "configure",
                                    {"on_enable_raises_after_setup": True})
-                await self._plugin_core._disable_plugin(VICTIM)
+                await self._plexus.disable_plugin(VICTIM)
 
                 try:
-                    await self._plugin_core._enable_plugin(VICTIM)
+                    await self._plexus.enable_plugin(VICTIM)
                 except Exception:
                     pass  # @async_handle_errors swallows; this is defensive
 
-                plugin = self._plugin_core.plugins[VICTIM]
+                plugin = self._plexus.plugins[VICTIM]
                 if plugin.db_open:
                     c.set_marker("db_was_open_after_failed_enable")
                     raise AssertionError(
@@ -208,22 +220,25 @@ class TestLifecycleSuite(Plugin):
                     )
             finally:
                 # Recovery: directly close partial state, re-enable.
-                plugin = self._plugin_core.plugins.get(VICTIM)
+                plugin = self._plexus.plugins.get(VICTIM)
                 if plugin is not None:
                     plugin.db_open = False
                     plugin._on_enable_raises_after_setup = False
                     if not plugin.enabled:
                         try:
-                            await self._plugin_core._enable_plugin(VICTIM)
+                            await self._plexus.enable_plugin(VICTIM)
                         except Exception:
                             pass
                 await self._ensure_victim_clean()
 
+        # Stage P (PR4): B-004 FIXED. Rollback in
+        # _enable_plugin_under_lock now calls plugin.on_disable to give
+        # the author a chance to undo partial setup from the failed
+        # on_enable. Test promoted to positive regression guard — body
+        # asserts plugin.db_open is False after the failed enable.
         await rec.run_case(
             "lifecycle.B-004.on_enable_raises_no_undo", body,
-            tags=("bug_repro",), bug_ids=("B-004",),
-            expected_status="fail",
-            expected_signature={"marker": "db_was_open_after_failed_enable"},
+            tags=("bug_repro", "regression_guard"), bug_ids=("B-004",),
             hard_timeout_s=20.0,
             **kw,
         )
@@ -235,13 +250,13 @@ class TestLifecycleSuite(Plugin):
     async def _basic_b010(self, rec: CaseRecorder, kw: Dict) -> None:
         async def body(c):
             await self._ensure_victim_clean()
-            old_uuid = self._plugin_core.plugins[VICTIM].plugin_uuid
+            old_uuid = self._plexus.plugins[VICTIM].plugin_uuid
             try:
                 await self.execute(VICTIM, "configure",
                                    {"on_disable_raises": True})
 
                 try:
-                    await self._plugin_core._reload_plugin(VICTIM)
+                    await self._plexus._reload_plugin(VICTIM)
                 except Exception:
                     pass
 
@@ -256,7 +271,7 @@ class TestLifecycleSuite(Plugin):
                 # - plugin instance is the OLD one (load_plugin_with_conf
                 #   never ran because pop raised)
                 # - caller has no signal — _reload_plugin returned None
-                plugin = self._plugin_core.plugins.get(VICTIM)
+                plugin = self._plexus.plugins.get(VICTIM)
                 stuck_state = (
                     plugin is not None
                     and plugin.plugin_uuid == old_uuid  # not reloaded
@@ -272,25 +287,26 @@ class TestLifecycleSuite(Plugin):
                 # Recovery: clear the on_disable_raises flag and force a
                 # clean state so subsequent cases don't inherit the half-
                 # torn-down plugin.
-                plugin = self._plugin_core.plugins.get(VICTIM)
+                plugin = self._plexus.plugins.get(VICTIM)
                 if plugin is not None:
                     plugin._on_disable_raises = False
-                if VICTIM not in self._plugin_core.plugins:
+                if VICTIM not in self._plexus.plugins:
                     entry = self._find_yaml_entry(VICTIM)
                     if entry:
                         entry["enabled"] = True
                         try:
-                            await self._plugin_core.load_plugin_with_conf(entry)
-                            await self._plugin_core._enable_plugin(VICTIM)
+                            await self._plexus.load_plugin_with_conf(entry)
+                            await self._plexus.enable_plugin(VICTIM)
                         except Exception:
                             pass
                 await self._ensure_victim_clean()
 
+        # Stage M (PR4): B-010 verified FIXED-BY-CONSTRUCTION. Body asserts
+        # the architectural property — when on_disable raises during reload,
+        # the framework no longer leaves the plugin partially torn down.
         await rec.run_case(
             "lifecycle.B-010.on_disable_raises", body,
-            tags=("bug_repro",), bug_ids=("B-010",),
-            expected_status="fail",
-            expected_signature={"marker": "plugin_still_loaded_after_disable_raise"},
+            tags=("bug_repro", "regression_guard"), bug_ids=("B-010",),
             hard_timeout_s=20.0,
             **kw,
         )
@@ -307,42 +323,67 @@ class TestLifecycleSuite(Plugin):
             await self.execute(VICTIM, "configure",
                                {"on_disable_hangs_secs": 120.0})
 
+            # Override runtime disable timeout for fast test (production
+            # default 30s; 1s here so the timeout path runs within a few
+            # seconds rather than 30+).
+            core = self._plexus
+            saved_timeout = getattr(core, "plugin_disable_timeout", 30.0)
+            core.plugin_disable_timeout = 1.0
             try:
+                # B-009 regression guard: pre-fix, _reload_plugin's
+                # _disable_plugin call had no on_disable timeout — a
+                # hanging on_disable blocked the lifecycle lock
+                # indefinitely. Fix wraps on_disable in
+                # asyncio.wait_for(timeout=plugin_disable_timeout) in
+                # both _disable_plugin and _pop_plugin_under_lock.
                 await asyncio.wait_for(
-                    self._plugin_core._reload_plugin(VICTIM),
-                    timeout=10.0,
+                    core._reload_plugin(VICTIM),
+                    timeout=5.0,
                 )
-                # Reload completed within 10s — bug fixed (or hang config didn't take)
-                return
             except asyncio.TimeoutError:
-                c.set_marker("outer_wait_for_fired")
-                # Recovery: forcibly clear the hang flag on the (still
-                # reachable) victim instance, then pop it cleanly.
-                victim = self._plugin_core.plugins.get(VICTIM)
+                # Outer guard fired — fix not in place. Recovery + assert.
+                victim = core.plugins.get(VICTIM)
                 if victim is not None:
                     victim._on_disable_hangs_secs = 0.0
-                    victim.enabled = False
                     try:
-                        await self._plugin_core.pop_plugin(VICTIM)
+                        await core.pop_plugin(VICTIM)
                     except Exception:
                         pass
-                # Re-load via yaml entry for subsequent cases
                 entry = self._find_yaml_entry(VICTIM)
                 if entry:
                     entry["enabled"] = True
                     try:
-                        await self._plugin_core.load_plugin_with_conf(entry)
-                        await self._plugin_core._enable_plugin(VICTIM)
+                        await core.load_plugin_with_conf(entry)
+                        await core.enable_plugin(VICTIM)
                     except Exception:
                         pass
-                raise AssertionError("hang_guard fired: outer_wait_for_fired")
+                raise AssertionError(
+                    "B-009 regression: _reload_plugin did not return "
+                    "within 5s despite 1s on_disable timeout"
+                )
+            finally:
+                core.plugin_disable_timeout = saved_timeout
+                # Recover: clear hang flag on whichever instance
+                # survived, ensure VICTIM is loaded + enabled for
+                # subsequent cases.
+                victim = core.plugins.get(VICTIM)
+                if victim is not None:
+                    victim._on_disable_hangs_secs = 0.0
+                if VICTIM not in core.plugins:
+                    entry = self._find_yaml_entry(VICTIM)
+                    if entry:
+                        entry["enabled"] = True
+                        try:
+                            await core.load_plugin_with_conf(entry)
+                            await core.enable_plugin(VICTIM)
+                        except Exception:
+                            pass
+                await self._ensure_victim_clean()
 
         await rec.run_case(
             "lifecycle.B-009.disable_no_timeout", body,
-            tags=("bug_repro",), bug_ids=("B-009",),
-            expected_status="fail",
-            expected_signature={"marker": "outer_wait_for_fired"},
-            hard_timeout_s=25.0,
+            tags=("bug_repro", "regression_guard"), bug_ids=("B-009",),
+            hard_timeout_s=15.0,
             **kw,
         )
 
@@ -353,12 +394,12 @@ class TestLifecycleSuite(Plugin):
     async def _basic_reload(self, rec: CaseRecorder, kw: Dict) -> None:
         async def body(c):
             await self._ensure_victim_clean()
-            assert self._plugin_core.plugins[VICTIM].enabled
-            old_uuid = self._plugin_core.plugins[VICTIM].plugin_uuid
+            assert self._plexus.plugins[VICTIM].enabled
+            old_uuid = self._plexus.plugins[VICTIM].plugin_uuid
 
-            await self._plugin_core._reload_plugin(VICTIM)
+            await self._plexus._reload_plugin(VICTIM)
 
-            new_plugin = self._plugin_core.plugins[VICTIM]
+            new_plugin = self._plexus.plugins[VICTIM]
             assert new_plugin.enabled
             # New instance has a new uuid
             c.expect(new_plugin.plugin_uuid != old_uuid, True)
@@ -382,36 +423,36 @@ class TestLifecycleSuite(Plugin):
             entry["enabled"] = False
 
             try:
-                # _reload_plugin captures previously_enabled, pops, re-loads
-                # (which now returns at the disabled-short-circuit), then
-                # tries to _enable_plugin — KeyError since plugin is gone.
-                # @async_handle_errors swallows; user sees nothing.
-                result = await self._plugin_core._reload_plugin(VICTIM)
-                # If the plugin is now absent and result is None, the bug
-                # silently swallowed the KeyError.
-                still_loaded = VICTIM in self._plugin_core.plugins
-                if not still_loaded:
-                    c.set_marker("silent_keyerror_swallowed")
+                # B-016 regression guard: pre-Stage-O, _reload_plugin's
+                # _enable_plugin call did self.plugins[plugin_name] (raw
+                # subscript) → KeyError → swallowed by @async_handle_errors.
+                # Stage O switched _enable_plugin_under_lock to .get() with
+                # a None-check; the reload path now cleanly honors the new
+                # disabled config — no silent exception swallow.
+                await self._plexus._reload_plugin(VICTIM)
+                # Expected end-state: plugin removed from self.plugins.
+                # _reload_plugin pops first; load_plugin_with_conf then
+                # short-circuits on the new enabled=false config without
+                # re-registering, and _enable_plugin_under_lock early-
+                # returns on .get()=None.
+                if VICTIM in self._plexus.plugins:
                     raise AssertionError(
-                        "B-016: reload with newly-disabled config silently "
-                        "popped the plugin and swallowed the re-enable KeyError"
+                        "B-016 regression: plugin still loaded after reload "
+                        "with newly-disabled config (expected unloaded)"
                     )
-                # If plugin is still loaded, the bug-fixed path was taken
             finally:
                 entry["enabled"] = original_enabled
-                if VICTIM not in self._plugin_core.plugins:
+                if VICTIM not in self._plexus.plugins:
                     try:
-                        await self._plugin_core.load_plugin_with_conf(entry)
-                        await self._plugin_core._enable_plugin(VICTIM)
+                        await self._plexus.load_plugin_with_conf(entry)
+                        await self._plexus.enable_plugin(VICTIM)
                     except Exception:
                         pass
                 await self._ensure_victim_clean()
 
         await rec.run_case(
             "lifecycle.B-016.reload_disabled_in_new_config", body,
-            tags=("bug_repro",), bug_ids=("B-016",),
-            expected_status="fail",
-            expected_signature={"marker": "silent_keyerror_swallowed"},
+            tags=("bug_repro", "regression_guard"), bug_ids=("B-016",),
             hard_timeout_s=15.0,
             **kw,
         )
@@ -429,7 +470,7 @@ class TestLifecycleSuite(Plugin):
             await asyncio.sleep(0.1)  # let request register
 
             try:
-                await self._plugin_core.pop_plugin(VICTIM)
+                await self._plexus.pop_plugin(VICTIM)
                 # The pending task should now error with "unloaded while pending"
                 try:
                     await asyncio.wait_for(task, timeout=5.0)
@@ -448,8 +489,8 @@ class TestLifecycleSuite(Plugin):
                 if entry:
                     entry["enabled"] = True
                     try:
-                        await self._plugin_core.load_plugin_with_conf(entry)
-                        await self._plugin_core._enable_plugin(VICTIM)
+                        await self._plexus.load_plugin_with_conf(entry)
+                        await self._plexus.enable_plugin(VICTIM)
                     except Exception:
                         pass
 
@@ -475,11 +516,11 @@ class TestLifecycleSuite(Plugin):
             # other suites/targets, etc.) and only purges the one plugin
             # whose pending task we want to test against.
             keepers = [
-                name for name in self._plugin_core.plugins.keys()
+                name for name in self._plexus.plugins.keys()
                 if name != VICTIM
             ]
             try:
-                await self._plugin_core.purge_plugins_except(keepers)
+                await self._plexus.purge_plugins_except(keepers)
                 # If purge fails the pending task with "unloaded", bug is
                 # NOT present. If task hangs/timeouts → bug present.
                 try:
@@ -506,16 +547,20 @@ class TestLifecycleSuite(Plugin):
                 if entry:
                     entry["enabled"] = True
                     try:
-                        await self._plugin_core.load_plugin_with_conf(entry)
-                        await self._plugin_core._enable_plugin(VICTIM)
+                        await self._plexus.load_plugin_with_conf(entry)
+                        await self._plexus.enable_plugin(VICTIM)
                     except Exception:
                         pass
 
+        # Stage P (PR4): B-005 FIXED. purge_plugins / purge_plugins_except
+        # now delegate to pop_plugin per-name, which fails pending
+        # requests targeting the popped plugin. Test promoted to
+        # positive regression guard — body asserts the pending task
+        # completes (via RequestException or normal return) within 3s
+        # of purge instead of hanging.
         await rec.run_case(
             "lifecycle.B-005.purge_except_skips_pending", body_purge,
-            tags=("bug_repro",), bug_ids=("B-005",),
-            expected_status="fail",
-            expected_signature={"marker": "task_did_not_get_unloaded_error"},
+            tags=("bug_repro", "regression_guard"), bug_ids=("B-005",),
             hard_timeout_s=20.0,
             **kw,
         )
@@ -530,7 +575,7 @@ class TestLifecycleSuite(Plugin):
         async def body(c):
             await self._ensure_victim_clean()
             # Verify config-order requirement (Victim before Victim2)
-            plugins = self._plugin_core.yaml_config.get("plugins", [])
+            plugins = self._plexus.yaml_config.get("plugins", [])
             try:
                 v_idx = next(i for i, p in enumerate(plugins)
                              if p.get("name") == VICTIM)
@@ -557,18 +602,18 @@ class TestLifecycleSuite(Plugin):
                 })
 
                 # Now disable both, then re-enable concurrently
-                await self._plugin_core._disable_plugin(VICTIM)
-                await self._plugin_core._disable_plugin(VICTIM2)
+                await self._plexus.disable_plugin(VICTIM)
+                await self._plexus.disable_plugin(VICTIM2)
 
                 await asyncio.gather(
-                    self._plugin_core._enable_plugin(VICTIM),
-                    self._plugin_core._enable_plugin(VICTIM2),
+                    self._plexus.enable_plugin(VICTIM),
+                    self._plexus.enable_plugin(VICTIM2),
                     return_exceptions=True,
                 )
 
                 # Read state via direct attribute (configure may not be
                 # available yet if VICTIM is still in mid-enable).
-                victim = self._plugin_core.plugins.get(VICTIM)
+                victim = self._plexus.plugins.get(VICTIM)
                 cross_result = (
                     victim._cross_call_result if victim is not None else None
                 )
@@ -580,8 +625,8 @@ class TestLifecycleSuite(Plugin):
                     )
             finally:
                 # Reset config state directly via attribute access
-                v = self._plugin_core.plugins.get(VICTIM)
-                v2 = self._plugin_core.plugins.get(VICTIM2)
+                v = self._plexus.plugins.get(VICTIM)
+                v2 = self._plexus.plugins.get(VICTIM2)
                 if v is not None:
                     v._cross_call_during_enable = False
                     v._cross_call_result = None
@@ -589,88 +634,87 @@ class TestLifecycleSuite(Plugin):
                     v2._on_enable_delay_secs = 0.0
                 if v is not None and not v.enabled:
                     try:
-                        await self._plugin_core._enable_plugin(VICTIM)
+                        await self._plexus.enable_plugin(VICTIM)
                     except Exception:
                         pass
                 if v2 is not None and not v2.enabled:
                     try:
-                        await self._plugin_core._enable_plugin(VICTIM2)
+                        await self._plexus.enable_plugin(VICTIM2)
                     except Exception:
                         pass
 
         await rec.run_case(
             "lifecycle.B-008.concurrent_enable_race", body,
-            tags=("bug_repro",), bug_ids=("B-008",),
-            expected_status="fail",
-            expected_signature={
-                "marker": "endpoint_not_found_during_concurrent_enable"
-            },
+            tags=("bug_repro", "regression_guard"), bug_ids=("B-008",),
             hard_timeout_s=20.0,
             **kw,
         )
 
     # ====================================================================
-    # BASIC B-037 — notify during pop
+    # BASIC B-037 — publish_event during pop
     # ====================================================================
 
-    async def _basic_b037_notify_during_pop(
+    async def _basic_b037_event_during_pop(
         self, rec: CaseRecorder, kw: Dict,
     ) -> None:
         async def body(c):
             await self._ensure_victim_clean()
-            # Subscribe a code-driven sub on victim that we can detect firing
-            # mid-pop. Use the Victim's own on_enable to register a sub via
-            # core.subscribe — but Victim doesn't have one. Instead, register
-            # one externally and bind it to victim's plugin_uuid.
-            victim_obj = self._plugin_core.plugins[VICTIM]
-            fired_after = {"flag": False}
+            # Subscribe a sub OWNED BY victim_uuid that targets an endpoint on
+            # the suite (lifecycle_observer). Victim-owned means the sub is
+            # cleaned when victim is popped. The endpoint flips a flag we
+            # check after the race.
+            victim_obj = self._plexus.plugins[VICTIM]
+            self._lifecycle_b037_fired = False
 
-            async def h(*args, **kw_):
-                fired_after["flag"] = True
-
-            sub_id = await self._plugin_core.subscribe(
-                "lifecycle/notify_during_pop",
+            sub_id = await self._plexus.subscribe_event(
+                "lifecycle/event_during_pop",
                 victim_obj.plugin_name,
                 victim_obj.plugin_uuid,
-                handler=h,
+                target_plugin=self.plugin_name,
+                target_access_name="lifecycle_observer",
             )
 
             try:
-                # Concurrently pop + notify
+                # Concurrently pop + publish
                 pop_task = asyncio.create_task(
-                    self._plugin_core.pop_plugin(VICTIM)
+                    self._plexus.pop_plugin(VICTIM)
                 )
                 await asyncio.sleep(0.001)
-                await self.notify("lifecycle/notify_during_pop")
+                await self.publish_event("lifecycle_event_during_pop")
                 await pop_task
 
-                if fired_after["flag"]:
+                if self._lifecycle_b037_fired:
                     c.set_marker("handler_ran_after_disable")
                     raise AssertionError(
                         "B-037: handler ran during pop_plugin (race)"
                     )
             finally:
                 try:
-                    await self._plugin_core.unsubscribe(sub_id)
+                    await self._plexus.unsubscribe_event(sub_id)
                 except Exception:
                     pass
                 entry = self._find_yaml_entry(VICTIM)
                 if entry:
                     entry["enabled"] = True
                     try:
-                        await self._plugin_core.load_plugin_with_conf(entry)
-                        await self._plugin_core._enable_plugin(VICTIM)
+                        await self._plexus.load_plugin_with_conf(entry)
+                        await self._plexus.enable_plugin(VICTIM)
                     except Exception:
                         pass
 
+        # Stage M (PR4): B-037 verified FIXED-BY-CONSTRUCTION. Stage D
+        # removed legacy notify; new publish_event fan-out has different
+        # lifecycle semantics — handler cannot fire after _disable_plugin.
         await rec.run_case(
-            "lifecycle.B-037.notify_during_pop", body,
-            tags=("bug_repro",), bug_ids=("B-037",),
-            expected_status="fail",
-            expected_signature={"marker": "handler_ran_after_disable"},
+            "lifecycle.B-037.event_during_pop", body,
+            tags=("bug_repro", "regression_guard"), bug_ids=("B-037",),
             hard_timeout_s=15.0,
             **kw,
         )
+
+    async def lifecycle_observer(self, event) -> None:
+        """B-037 observer endpoint — sets a flag when fired."""
+        self._lifecycle_b037_fired = True
 
     # ====================================================================
     # BASIC B-043 — pop_plugin failed-pending request reaped
@@ -683,7 +727,7 @@ class TestLifecycleSuite(Plugin):
             await self._ensure_victim_clean()
             # Start a long-running call against Victim; capture its req_id;
             # cancel the caller; pop the plugin; assert request entry is reaped.
-            req = await self._plugin_core.create_request(
+            req = await self._plexus.create_request(
                 VICTIM, "victim_hang_endpoint", {"secs": 60.0},
                 "", "any", self.plugin_name, self.plugin_uuid,
             )
@@ -696,14 +740,18 @@ class TestLifecycleSuite(Plugin):
                 await task
             except (asyncio.CancelledError, RequestException):
                 pass
-            await req.set_collected()
+            # B-073: done-callback eviction. Was
+            # ``await req.set_collected()``; migrated to direct sync
+            # pop. The producer's finally in ``_process_request`` will
+            # also pop on completion (idempotent under ``pop(key, None)``).
+            self._plexus.requests.pop(req.id, None)
 
             try:
-                await self._plugin_core.pop_plugin(VICTIM)
+                await self._plexus.pop_plugin(VICTIM)
 
                 deadline = time.perf_counter() + 30.0
                 while time.perf_counter() < deadline:
-                    if req_id not in self._plugin_core.requests:
+                    if req_id not in self._plexus.requests:
                         return
                     await asyncio.sleep(0.5)
                 raise AssertionError(
@@ -714,8 +762,8 @@ class TestLifecycleSuite(Plugin):
                 if entry:
                     entry["enabled"] = True
                     try:
-                        await self._plugin_core.load_plugin_with_conf(entry)
-                        await self._plugin_core._enable_plugin(VICTIM)
+                        await self._plexus.load_plugin_with_conf(entry)
+                        await self._plexus.enable_plugin(VICTIM)
                     except Exception:
                         pass
 
@@ -727,25 +775,61 @@ class TestLifecycleSuite(Plugin):
         )
 
     # ====================================================================
-    # BASIC B-007 — missing version aborts load loop
+    # BASIC B-007 — missing version defaults instead of raising KeyError
     # ====================================================================
 
     async def _basic_b007_missing_version(
         self, rec: CaseRecorder, kw: Dict,
     ) -> None:
         async def body(c):
-            c.skip(
-                "B-007 (missing-version KeyError aborts get_plugins loop) "
-                "cannot be reproduced from inside a running suite: enabling "
-                "TestLifecycleBrokenVersion + Sentinel in test_config.yml "
-                "kills wait_until_ready before any case runs. Repro requires "
-                "a controlled-startup harness (subprocess) — Phase 5 "
-                "scaffold could host this once it lands."
-            )
+            # B-007: a plugin_config.yml with no `version` used to raise
+            # KeyError out of load_plugin_with_conf. Because get_plugins
+            # (core.py:2111) has no per-entry guard and load_plugin_with_conf
+            # re-raises (@async_log_errors, decorators.py:239), that KeyError
+            # aborted the whole boot load loop and every plugin listed after
+            # the offender silently never loaded.
+            #
+            # The fixture is loaded ON DEMAND, and is enabled:false at boot,
+            # ON PURPOSE. Booting it would make a regression FATAL before any
+            # case runs — no test_report.json at all, measured 2026-07-22 —
+            # i.e. a regression that can never surface as a red cell. Loading
+            # it here makes "load_plugin_with_conf does not raise" a normal
+            # falsifiable assertion.
+            #
+            # NOTE the load-loop abort itself is still live for any OTHER
+            # raising plugin (filed as B-093); B-007's fix removed one
+            # trigger, not the failure mode. This case guards the trigger.
+            entry = self._find_yaml_entry(BROKEN_VERSION)
+            if entry is None:
+                raise AssertionError(
+                    f"{BROKEN_VERSION} missing from test_config.yml; the "
+                    f"B-007 regression cannot be evaluated without it"
+                )
+            load_entry = dict(entry)
+            load_entry["enabled"] = True
+            try:
+                # THE assertion. Any raise here is the B-007 failure mode.
+                await self._plexus.load_plugin_with_conf(load_entry)
+
+                broken = self._plexus.plugins.get(BROKEN_VERSION)
+                if broken is None:
+                    raise AssertionError(
+                        f"{BROKEN_VERSION} did not load; a missing version "
+                        f"must warn and default, not drop the plugin"
+                    )
+                # WEAK on its own — Plugin.__init__ already sets
+                # self.version = "0.0.0" (utils.py:1340), so this passes even
+                # if core assigns nothing. Kept only to pin the fallback
+                # VALUE (R4-WW-2 requires a parseable PEP 440 string; the
+                # earlier placeholder literal broke every SpecifierSet check
+                # against it). The falsifiable half is the load above.
+                c.expect(broken.version, "0.0.0")
+            finally:
+                await self._plexus.pop_plugin(BROKEN_VERSION)
 
         await rec.run_case(
-            "lifecycle.B-007.missing_version_aborts_load_loop", body,
-            tags=("bug_repro", "deferred"), bug_ids=("B-007",),
+            "lifecycle.B-007.missing_version_defaults", body,
+            tags=("bug_repro",), bug_ids=("B-007",),
             **kw,
         )
 
@@ -758,12 +842,12 @@ class TestLifecycleSuite(Plugin):
     ) -> None:
         async def body(c):
             await self._ensure_victim_clean()
-            await self._plugin_core._disable_plugin(VICTIM)
+            await self._plexus.disable_plugin(VICTIM)
             try:
                 c.expect_exception(RequestException, match=r"[Ee]ndpoint.*not found")
                 await self.execute(VICTIM, "is_db_open")
             finally:
-                await self._plugin_core._enable_plugin(VICTIM)
+                await self._plexus.enable_plugin(VICTIM)
 
         await rec.run_case(
             "lifecycle.disable.error.disabled_plugin_not_callable", body,
@@ -785,16 +869,16 @@ class TestLifecycleSuite(Plugin):
                 c.skip(f"{VICTIM2} not loaded")
                 return
 
-            v1 = self._plugin_core.plugins[VICTIM]
-            v2 = self._plugin_core.plugins[VICTIM2]
+            v1 = self._plexus.plugins[VICTIM]
+            v2 = self._plexus.plugins[VICTIM2]
             v1.disable_count = 0
             v2.disable_count = 0
 
             # Drive disable in reverse config order: Victim2 first, then Victim
-            # (matches what core.close() does at PluginCore.py:255 .reverse()).
-            await self._plugin_core._disable_plugin(VICTIM2)
+            # (matches what core.close() does at core.py:255 .reverse()).
+            await self._plexus.disable_plugin(VICTIM2)
             t_v2_disabled = time.perf_counter()
-            await self._plugin_core._disable_plugin(VICTIM)
+            await self._plexus.disable_plugin(VICTIM)
             t_v1_disabled = time.perf_counter()
 
             try:
@@ -806,8 +890,8 @@ class TestLifecycleSuite(Plugin):
                         f"v2={t_v2_disabled} v1={t_v1_disabled}"
                     )
             finally:
-                await self._plugin_core._enable_plugin(VICTIM2)
-                await self._plugin_core._enable_plugin(VICTIM)
+                await self._plexus.enable_plugin(VICTIM2)
+                await self._plexus.enable_plugin(VICTIM)
 
         await rec.run_case(
             "lifecycle.contract.disable_reverse_order_via_disable_plugin",
@@ -825,7 +909,7 @@ class TestLifecycleSuite(Plugin):
         skip_reason = (
             "args-override merging cases require fixture-heavy yaml_config "
             "manipulation + reload cycles per case; deferred to a follow-up "
-            "phase. The merge logic at PluginCore._deep_merge_args is "
+            "phase. The merge logic at Plexus._deep_merge_args is "
             "well-documented in commit 5c16050; tests will land alongside "
             "any fix that touches it."
         )
@@ -899,45 +983,465 @@ class TestLifecycleSuite(Plugin):
             tags=("config", "contract", "deferred"), **kw,
         )
 
+    # B-073: ``_basic_b006_running_loop`` deleted.
+    # The B-006 case tested ``running_loop`` survival of a poisoned
+    # ``self.requests`` entry. After Step 4 killed ``running_loop`` +
+    # ``cleanup_requests`` entirely, the failure mode the case guarded
+    # against no longer exists — there is no maintenance loop to crash.
+    # Companion fixture ``inject_bad_request`` on TestLifecycleVictim
+    # also deleted (was the entry-point that this case used to poison
+    # ``self.requests`` from a remote-callable endpoint). TestBugSuite
+    # B-006 skip-stub at lines 1415-1419 + dispatch registration at
+    # 1511-1516 also removed.
+
     # ====================================================================
-    # BASIC B-006 running_loop guard — DESTRUCTIVE, MUST be last
+    # BASIC Stage O — readiness gate (4 cases)
     # ====================================================================
 
-    async def _basic_b006_running_loop(
+    async def _basic_stage_o_ready_gate(
         self, rec: CaseRecorder, kw: Dict,
     ) -> None:
-        async def body(c):
-            old_task = self._plugin_core._running_loop_task
-            req_id = "lifecycle.b006.bad-test-id"
-            self._plugin_core.requests[req_id] = object()
+        """Stage O readiness-gate cases.
 
+        Covers four behaviors:
+          1. gate_fires_for_unready_target: caller's execute() blocks
+             until the target's _lifecycle_ready is set (waits for
+             slow on_enable).
+          2. author_manual_clear_set: caller blocks on the
+             author-controlled `self.ready` event when on_enable spawns
+             a background-task setup.
+          3. cycle_timeout: two plugins waiting on each other surfaces
+             a clear "not ready within Ns" error after the configured
+             timeout instead of hanging forever.
+          4. self_call_skips_gate: a plugin's own on_enable calling
+             into itself bypasses the gate (otherwise it would deadlock
+             against its own _lifecycle_ready).
+        """
+        VICTIM = "TestLifecycleVictim"
+        VICTIM2 = "TestLifecycleVictim2"
+
+        # ---- 1. gate_fires_for_unready_target ----------------------
+        async def body_gate_fires_for_unready_target(c):
+            await self._ensure_victim_clean()
+            v = self._plexus.plugins[VICTIM]
+            v._on_enable_delay_secs = 0.0
+            await self._plexus.disable_plugin(VICTIM)
+            # 3.0s delay (generous margin for Windows scheduler jitter);
+            # threshold 2.0s leaves 1.0s slack for the asyncio.sleep(0.1)
+            # post-create_task stagger and dispatch overhead, so a loaded
+            # CI host that overshoots sleep(0.1) by half a second still
+            # passes — but a regression that bypasses the gate entirely
+            # would return in ~milliseconds and fail.
+            v._on_enable_delay_secs = 3.0
             try:
-                # cleanup_requests runs every 10s; sleep 13s gives one tick
-                # plus a slack buffer for slow Windows scheduler.
-                await asyncio.sleep(13.0)
+                # Start enable; while it sleeps, our execute() must
+                # block on the readiness gate, then succeed.
+                enable_task = asyncio.create_task(
+                    self._plexus.enable_plugin(VICTIM)
+                )
+                await asyncio.sleep(0.1)  # let on_enable start sleeping
+                t0 = asyncio.get_event_loop().time()
+                result = await self.execute(VICTIM, "is_db_open")
+                elapsed = asyncio.get_event_loop().time() - t0
+                await enable_task
 
-                if old_task.done() and old_task.exception() is not None:
-                    c.set_marker("running_loop_died")
+                c.expect(result, True)
+                if elapsed < 2.0:
                     raise AssertionError(
-                        f"running_loop died: {type(old_task.exception()).__name__}: "
-                        f"{old_task.exception()}"
+                        f"Stage O: gate did not block — execute() returned "
+                        f"in {elapsed:.3f}s while on_enable was still "
+                        f"sleeping (expected at least 2.0s)"
                     )
-                # Bug fixed (loop survived) → unexpected_pass
             finally:
-                # Restart the maintenance loop per plan §6 Phase 4 B-006.
-                self._plugin_core.requests.pop(req_id, None)
-                if self._plugin_core._running_loop_task.done():
-                    self._plugin_core._running_loop_task = asyncio.create_task(
-                        self._plugin_core.running_loop()
-                    )
+                v = self._plexus.plugins.get(VICTIM)
+                if v is not None:
+                    v._on_enable_delay_secs = 0.0
+                await self._ensure_victim_clean()
 
         await rec.run_case(
-            "lifecycle.B-006.running_loop_guard", body,
-            tags=("bug_repro", "terminal"), bug_ids=("B-006",),
-            expected_status="fail",
-            expected_signature={"marker": "running_loop_died"},
-            hard_timeout_s=30.0,
-            destructive=True,
+            "lifecycle.ready.gate_fires_for_unready_target",
+            body_gate_fires_for_unready_target,
+            tags=("stage_o", "regression_guard"),
+            hard_timeout_s=15.0,
+            **kw,
+        )
+
+        # ---- 2. author_manual_clear_set ----------------------------
+        async def body_author_manual_clear_set(c):
+            # Caller is the suite plugin. Manually clear the victim's
+            # author-controlled ready flag (simulating an author who
+            # spawns background-task setup and only sets ready after
+            # the task finishes), then schedule a delayed set, then
+            # call execute() and verify the call waited.
+            await self._ensure_victim_clean()
+            v = self._plexus.plugins[VICTIM]
+            v.ready.clear()
+            try:
+                async def _delayed_ready():
+                    await asyncio.sleep(0.8)
+                    v.ready.set()
+
+                bg = asyncio.create_task(_delayed_ready())
+                t0 = asyncio.get_event_loop().time()
+                result = await self.execute(VICTIM, "is_db_open")
+                elapsed = asyncio.get_event_loop().time() - t0
+                await bg
+
+                c.expect(result, True)
+                if elapsed < 0.5:
+                    raise AssertionError(
+                        f"Stage O: author-controlled ready did not block "
+                        f"— execute() returned in {elapsed:.3f}s "
+                        f"(expected ≥ 0.5s)"
+                    )
+            finally:
+                v = self._plexus.plugins.get(VICTIM)
+                if v is not None:
+                    v.ready.set()
+
+        await rec.run_case(
+            "lifecycle.ready.author_manual_clear_set",
+            body_author_manual_clear_set,
+            tags=("stage_o", "regression_guard"),
+            hard_timeout_s=15.0,
+            **kw,
+        )
+
+        # ---- 3. cycle_timeout --------------------------------------
+        async def body_cycle_timeout(c):
+            # Two plugins both with cleared `ready`; neither will set
+            # it. With a short configured timeout, our execute() must
+            # surface the "not ready within Ns" error instead of
+            # hanging.
+            await self._ensure_victim_clean()
+            v = self._plexus.plugins[VICTIM]
+            core = self._plexus
+            saved_timeout = getattr(core, "plugin_ready_timeout", 60.0)
+            core.plugin_ready_timeout = 1.0
+            v.ready.clear()
+            try:
+                t0 = asyncio.get_event_loop().time()
+                try:
+                    await self.execute(VICTIM, "is_db_open")
+                except RequestException as e:
+                    elapsed = asyncio.get_event_loop().time() - t0
+                    if "not ready" not in str(e).lower():
+                        raise AssertionError(
+                            f"Stage O: expected 'not ready' in error, "
+                            f"got: {e!r}"
+                        )
+                    if elapsed > 3.0:
+                        raise AssertionError(
+                            f"Stage O: cycle_timeout took {elapsed:.2f}s "
+                            f"(timeout was 1.0s)"
+                        )
+                    return
+                raise AssertionError(
+                    "Stage O: cycle_timeout did not raise; gate failed "
+                    "to enforce timeout"
+                )
+            finally:
+                v = self._plexus.plugins.get(VICTIM)
+                if v is not None:
+                    v.ready.set()
+                core.plugin_ready_timeout = saved_timeout
+
+        await rec.run_case(
+            "lifecycle.ready.cycle_timeout",
+            body_cycle_timeout,
+            tags=("stage_o", "regression_guard"),
+            hard_timeout_s=10.0,
+            **kw,
+        )
+
+        # ---- 4. self_call_skips_gate -------------------------------
+        async def body_self_call_skips_gate(c):
+            # The suite plugin calls its OWN endpoint
+            # (`lifecycle_observer`, by way of an execute() targeted at
+            # itself). With self.ready cleared, the gate would
+            # otherwise block forever on the caller's own ready event;
+            # the requester==target self-call carve-out (Q23) must
+            # skip the gate so the call returns immediately.
+            saved_fired = self._lifecycle_b037_fired
+            self.ready.clear()
+            try:
+                t0 = asyncio.get_event_loop().time()
+                await self.execute(
+                    self.plugin_name, "lifecycle_observer", (None,)
+                )
+                elapsed = asyncio.get_event_loop().time() - t0
+                if elapsed > 2.0:
+                    raise AssertionError(
+                        f"Stage O: self-call took {elapsed:.2f}s — "
+                        f"gate did not skip for requester == target uuid"
+                    )
+            finally:
+                self.ready.set()
+                self._lifecycle_b037_fired = saved_fired
+
+        await rec.run_case(
+            "lifecycle.ready.self_call_skips_gate",
+            body_self_call_skips_gate,
+            tags=("stage_o", "regression_guard"),
+            hard_timeout_s=10.0,
+            **kw,
+        )
+
+    # ====================================================================
+    # C-152: state-machine coverage. Previously the suite had zero
+    # references to plugin_states / last_errors / FAILED_LOAD / State,
+    # leaving the public state-machine surface untested.  These cases
+    # exercise the observable API: dict membership, state transitions,
+    # error-record population, and enum visibility.
+    # ====================================================================
+
+    async def _state_machine_coverage(self, rec: CaseRecorder, kw: Dict) -> None:
+        async def body_plugin_states_entry_exists(c):
+            await self._ensure_victim_clean()
+            ps = self._plexus.plugin_states.get(VICTIM)
+            if ps is None:
+                raise AssertionError(
+                    f"plugin_states has no entry for {VICTIM!r}"
+                )
+            c.expect(ps.name, VICTIM)
+            assert isinstance(ps.state, State), (
+                f"PluginState.state is not a State enum value: "
+                f"{type(ps.state).__name__}"
+            )
+            assert ps.instance is self._plexus.plugins[VICTIM], (
+                "PluginState.instance not bound to the runtime plugin"
+            )
+
+        async def body_enabled_state_value(c):
+            await self._ensure_victim_clean()
+            ps = self._plexus.plugin_states[VICTIM]
+            if ps.state is not State.ENABLED:
+                raise AssertionError(
+                    f"victim post-_ensure_victim_clean expected "
+                    f"State.ENABLED; got {ps.state}"
+                )
+
+        async def body_disable_transitions_to_inactive(c):
+            await self._ensure_victim_clean()
+            await self._plexus.disable_plugin(VICTIM)
+            try:
+                ps = self._plexus.plugin_states[VICTIM]
+                if ps.state is not State.INACTIVE:
+                    raise AssertionError(
+                        f"after disable, expected State.INACTIVE; "
+                        f"got {ps.state}"
+                    )
+            finally:
+                await self._plexus.enable_plugin(VICTIM)
+
+        async def body_on_enable_raise_records_phase_enable_error(c):
+            await self._ensure_victim_clean()
+            victim = self._plexus.plugins[VICTIM]
+            await self._plexus.disable_plugin(VICTIM)
+            victim._on_enable_raises_after_setup = True
+            try:
+                try:
+                    await self._plexus.enable_plugin(VICTIM)
+                except Exception:
+                    pass  # expected
+                ps = self._plexus.plugin_states[VICTIM]
+                if ps.state is not State.INACTIVE:
+                    raise AssertionError(
+                        f"after on_enable raise, expected rollback to "
+                        f"State.INACTIVE; got {ps.state}"
+                    )
+                err = ps.last_errors.get(Phase.ENABLE)
+                if err is None:
+                    raise AssertionError(
+                        "last_errors[Phase.ENABLE] not populated after "
+                        "on_enable raised"
+                    )
+                # C-146: ErrorRecord no longer retains the live
+                # BaseException — it stores type name + repr + tb
+                # string. Verify the shape and that the type name is
+                # non-empty.
+                if not isinstance(err.exception_type, str) or not err.exception_type:
+                    raise AssertionError(
+                        f"ErrorRecord.exception_type is not a non-empty str: "
+                        f"{err.exception_type!r}"
+                    )
+                if not isinstance(err.exception_repr, str) or not err.exception_repr:
+                    raise AssertionError(
+                        f"ErrorRecord.exception_repr is not a non-empty str: "
+                        f"{err.exception_repr!r}"
+                    )
+                if not err.traceback:
+                    raise AssertionError(
+                        "ErrorRecord.traceback is empty"
+                    )
+            finally:
+                # Use _ensure_victim_clean (rather than a bare
+                # enable_plugin) so cleanup failures don't silently
+                # leave subsequent cases running against a victim
+                # stuck in INACTIVE with stale fixture flags.
+                victim._on_enable_raises_after_setup = False
+                await self._ensure_victim_clean()
+
+        async def body_failed_load_state_visible(c):
+            # Previously pointed at BROKEN_VERSION, which no longer fails to
+            # load at all: B-007 is fixed, so a missing version now warns and
+            # defaults (core.py:2785-2794). The case had been skipping
+            # because that fixture was disabled, so the retarget is not a
+            # coverage loss — nothing was being asserted.
+            #
+            # LOAD_CRASH is loaded on demand rather than at boot so no other
+            # suite has to tolerate a FAILED_LOAD entry for the whole run.
+            entry = self._find_yaml_entry(LOAD_CRASH)
+            if entry is None:
+                raise AssertionError(
+                    f"{LOAD_CRASH} missing from test_config.yml; the "
+                    f"FAILED_LOAD transition cannot be evaluated without it"
+                )
+            # A copy with enabled=True: load_plugin_with_conf returns early on
+            # a disabled entry (core.py:2306), and mutating the shared
+            # yaml_config dict would leave the fixture enabled for any later
+            # reload.
+            load_entry = dict(entry)
+            load_entry["enabled"] = True
+            # pop_plugin does NOT clear last_errors, so a Phase.LOAD record
+            # from an earlier invocation of this suite (a filtered re-run in
+            # the same boot, or the TUI calling run() again) survives in
+            # plugin_states. Without this timestamp the assertions below
+            # would pass on the stale record even if the framework recorded
+            # nothing this time.
+            t0 = time.time()
+            try:
+                load_exc = None
+                try:
+                    await self._plexus.load_plugin_with_conf(load_entry)
+                except Exception as exc:
+                    # Expected: on_load's raise is re-raised after being
+                    # recorded. Kept for the failure messages below — if the
+                    # fixture ever stops loading for an unrelated reason
+                    # (rename, import error, moved directory) the real cause
+                    # must not be swallowed.
+                    load_exc = exc
+
+                # B-099: the failed load imported the fixture module (which
+                # stashes a _plugin_loader_cleanup entry) then raised in on_load.
+                # The purge must have run so the entry does not leak — a later
+                # reload could otherwise rebind stale module code. Pre-fix this
+                # entry survived for the rest of the process.
+                c.expect(
+                    LOAD_CRASH in getattr(
+                        self._plexus, "_plugin_loader_cleanup", {}
+                    ),
+                    False,
+                )
+
+                ps = self._plexus.plugin_states.get(LOAD_CRASH)
+                if ps is None:
+                    raise AssertionError(
+                        f"{LOAD_CRASH} left no plugin_states entry after a "
+                        f"failed load (load raised {load_exc!r})"
+                    )
+                if ps.state is not State.FAILED_LOAD:
+                    raise AssertionError(
+                        f"{LOAD_CRASH} state is {ps.state} after on_load "
+                        f"raised — expected FAILED_LOAD "
+                        f"(load raised {load_exc!r})"
+                    )
+                # FAILED_LOAD means "no instance". core.plugins is the
+                # convenience view; PluginState.instance is what observers of
+                # state_changed actually read, and BUG-015 exists because
+                # those two can disagree — so assert both.
+                c.expect(LOAD_CRASH in self._plexus.plugins, False)
+                c.expect(ps.instance, None)
+
+                err = ps.last_errors.get(Phase.LOAD)
+                if err is None:
+                    raise AssertionError(
+                        f"FAILED_LOAD without Phase.LOAD error record "
+                        f"(load raised {load_exc!r})"
+                    )
+                if err.ts < t0:
+                    raise AssertionError(
+                        f"Phase.LOAD ErrorRecord is stale (ts={err.ts} < "
+                        f"{t0}); nothing was recorded for THIS load"
+                    )
+                # The record must identify the plugin's own exception, not
+                # some wrapper the framework raised on the way out.
+                if not err.exception_type.endswith(
+                        "TestLifecycleLoadCrashError"):
+                    raise AssertionError(
+                        f"Phase.LOAD ErrorRecord names {err.exception_type!r}, "
+                        f"expected the fixture's TestLifecycleLoadCrashError"
+                    )
+                if "deliberate on_load failure" not in err.exception_repr:
+                    raise AssertionError(
+                        f"Phase.LOAD ErrorRecord repr lost the message: "
+                        f"{err.exception_repr!r}"
+                    )
+            finally:
+                # Config still lists the entry, so this leaves UNLOADED
+                # rather than removing it (core.py:3228 config_has_entry).
+                await self._plexus.pop_plugin(LOAD_CRASH)
+
+        async def body_state_enum_values_complete(c):
+            expected = {
+                "UNLOADED", "INACTIVE", "ENABLING", "ENABLED",
+                "DISABLING", "FAILED_LOAD",
+            }
+            actual = {s.name for s in State}
+            c.expect(actual, expected)
+
+        async def body_phase_enum_values_complete(c):
+            expected = {"LOAD", "ENABLE", "DISABLE"}
+            actual = {p.name for p in Phase}
+            c.expect(actual, expected)
+
+        await rec.run_case(
+            "lifecycle.state_machine.plugin_states_entry_exists",
+            body_plugin_states_entry_exists,
+            tags=("basic", "state_machine"),
+            bug_ids=("C-152",),
+            **kw,
+        )
+        await rec.run_case(
+            "lifecycle.state_machine.enabled_state_value",
+            body_enabled_state_value,
+            tags=("basic", "state_machine"),
+            bug_ids=("C-152",),
+            **kw,
+        )
+        await rec.run_case(
+            "lifecycle.state_machine.disable_transitions_to_inactive",
+            body_disable_transitions_to_inactive,
+            tags=("basic", "state_machine"),
+            bug_ids=("C-152",),
+            **kw,
+        )
+        await rec.run_case(
+            "lifecycle.state_machine.on_enable_raise_records_phase_enable_error",
+            body_on_enable_raise_records_phase_enable_error,
+            tags=("basic", "state_machine", "last_errors"),
+            bug_ids=("C-152",),
+            **kw,
+        )
+        await rec.run_case(
+            "lifecycle.state_machine.failed_load_state_visible",
+            body_failed_load_state_visible,
+            tags=("basic", "state_machine", "FAILED_LOAD"),
+            bug_ids=("C-152",),
+            **kw,
+        )
+        await rec.run_case(
+            "lifecycle.state_machine.state_enum_values_complete",
+            body_state_enum_values_complete,
+            tags=("basic", "state_machine", "regression_guard"),
+            bug_ids=("C-152",),
+            **kw,
+        )
+        await rec.run_case(
+            "lifecycle.state_machine.phase_enum_values_complete",
+            body_phase_enum_values_complete,
+            tags=("basic", "state_machine", "regression_guard"),
+            bug_ids=("C-152",),
             **kw,
         )
 
@@ -946,7 +1450,115 @@ class TestLifecycleSuite(Plugin):
     # ====================================================================
 
     def _find_yaml_entry(self, name: str) -> Optional[Dict[str, Any]]:
-        for entry in self._plugin_core.yaml_config.get("plugins", []):
+        for entry in self._plexus.yaml_config.get("plugins", []):
             if entry.get("name") == name:
                 return entry
         return None
+
+    # ====================================================================
+    # HUNT-075 / HUNT-076 — reload dependency ordering (fix 0.79.0)
+    # ====================================================================
+
+    async def _hunt075_076_reload_deps(self, rec: CaseRecorder, kw: Dict) -> None:
+        await self._hunt075_ghost_stamp_guard(rec, kw)
+        await self._hunt076_reload_dep_precheck(rec, kw)
+
+    async def _hunt075_ghost_stamp_guard(self, rec: CaseRecorder, kw: Dict) -> None:
+        async def body(c):
+            px = self._plexus
+            await self._ensure_victim_clean()  # VICTIM ENABLED
+            ps = px.plugin_states.get(VICTIM)
+            c.expect(ps is not None and ps.state == State.ENABLED, True)
+            saved = px._plugin_deps.get(VICTIM)
+            try:
+                # Inject a required dep on a plugin that does not exist ->
+                # _resolve_dependencies puts the live ENABLED VICTIM in
+                # result.failed (missing dep). HUNT-075: the cascade guard must
+                # NOT stamp it FAILED_LOAD (that flips plugin.enabled to False ->
+                # close() skips on_disable -> ghost-enabled resource leak). It
+                # must stay ENABLED (with a deferred warning).
+                px._plugin_deps[VICTIM] = [
+                    DependencySpec(
+                        name="__hunt075_absent__",
+                        version=SpecifierSet(""), optional=False,
+                    )
+                ]
+                await px._resolve_dependencies()
+                ps2 = px.plugin_states.get(VICTIM)
+                if ps2 is None or ps2.state != State.ENABLED:
+                    raise AssertionError(
+                        f"HUNT-075: live ENABLED {VICTIM!r} was stamped "
+                        f"{ps2.state.value if ps2 else None} by dependency "
+                        f"resolution — ghost-enabled leak (must stay ENABLED)."
+                    )
+            finally:
+                if saved is None:
+                    px._plugin_deps.pop(VICTIM, None)
+                else:
+                    px._plugin_deps[VICTIM] = saved
+                await px._resolve_dependencies()  # restore the real graph
+        await rec.run_case("lifecycle.hunt075_ghost_stamp_guard", body, **kw)
+
+    async def _hunt076_reload_dep_precheck(self, rec: CaseRecorder, kw: Dict) -> None:
+        BASE = "TestLifecycleDepBase"
+        CHILD = "TestLifecycleDepChild"
+
+        async def body(c):
+            px = self._plexus
+            # Preconditions: the fixture pair booted ENABLED (CHILD requires BASE
+            # in its manifest; BASE is enabled -> CHILD enabled). Recover CHILD if
+            # a prior run of this case left it FAILED_LOAD.
+            if (px.plugin_states.get(CHILD) is None
+                    or px.plugin_states[CHILD].state != State.ENABLED):
+                try:
+                    await px._reload_plugin(CHILD)
+                except Exception:
+                    pass
+            bps = px.plugin_states.get(BASE)
+            base_was_enabled = bps is not None and bps.state == State.ENABLED
+            cps = px.plugin_states.get(CHILD)
+            if cps is None or cps.state != State.ENABLED:
+                raise AssertionError(
+                    f"precondition: {CHILD!r} must be ENABLED before the test; "
+                    f"got {cps.state.value if cps else None}"
+                )
+            try:
+                # Runtime-disable the required dep BASE (disable does NOT cascade,
+                # so CHILD stays ENABLED). Its config entry is still enabled, so
+                # dependency RESOLUTION still sees BASE as available — only the
+                # enable-time precheck can catch that BASE is not ENABLED now.
+                if base_was_enabled:
+                    await px.disable_plugin(BASE)
+                # Reload CHILD.
+                await px._reload_plugin(CHILD)
+                # HUNT-076: the reload precheck must refuse to re-enable CHILD
+                # against a not-ENABLED required dep -> FAILED_LOAD with a
+                # PluginDependencyError ErrorRecord (boot parity, Option B).
+                ps = px.plugin_states.get(CHILD)
+                if ps is None or ps.state != State.FAILED_LOAD:
+                    raise AssertionError(
+                        f"HUNT-076: reloading {CHILD!r} while required dep {BASE!r} "
+                        f"is not ENABLED must end FAILED_LOAD; got "
+                        f"{ps.state.value if ps else None} (re-enabled against a "
+                        f"down required dependency)."
+                    )
+                err = (ps.last_errors or {}).get(Phase.LOAD)
+                if err is None or "enable-time cascade" not in (
+                    err.exception_repr or ""
+                ):
+                    raise AssertionError(
+                        f"HUNT-076: expected a reload enable-time-cascade "
+                        f"ErrorRecord on {CHILD!r}; got {err!r}"
+                    )
+            finally:
+                # Restore: re-enable BASE, reload CHILD -> should return ENABLED.
+                if base_was_enabled:
+                    try:
+                        await px.enable_plugin(BASE)
+                    except Exception:
+                        pass
+                try:
+                    await px._reload_plugin(CHILD)
+                except Exception:
+                    pass
+        await rec.run_case("lifecycle.hunt076_reload_dep_precheck", body, **kw)

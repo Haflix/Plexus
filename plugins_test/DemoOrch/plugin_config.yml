@@ -1,0 +1,91 @@
+description: "Demo orchestrator: multi-topic subscriber with cross-plugin subscription routing, the 1:1 demo.ask handler, and a streaming endpoint."
+version: 0.3.0
+remote: false
+verbose_notifier: true
+arguments:
+
+subscriptions:
+  on_heartbeat:
+    topic: "demo.timer.heartbeat"
+    target_access_name: handle_heartbeat
+    hosts: "any"
+  on_burst:
+    topic: "demo.timer.burst"
+    target_access_name: handle_burst
+    hosts: "any"
+  on_greeted_via_orch:
+    topic: "demo.greeted"
+    target_access_name: handle_greeted_via_orch
+    hosts: "any"
+  # Cross-plugin sub: orchestrator OWNS this sub but routes dispatches
+  # to DemoSub.handle_ticked. Demonstrates the cross-plugin sub
+  # pattern: the plugin that OWNS the sub and the plugin that HANDLES it differ.
+  cross_to_subhandler:
+    topic: "demo.timer.heartbeat"
+    target_plugin: DemoSub
+    target_access_name: handle_ticked
+    hosts: "any"
+  # 1:1 request_event target. A request_event on demo.ask is routed here
+  # (config-routed: the caller addresses the topic, not this plugin).
+  # Carries the tight endpoint_in rate limit (set in the node's
+  # config.yml) that DemoPub.beat3_flood trips.
+  on_ask:
+    topic: "demo.ask"
+    target_access_name: handle_ask
+    hosts: "any"
+
+endpoints:
+  handle_heartbeat:
+    internal_name: handle_heartbeat
+    remote: false
+    accessible_by_other_plugins: true
+    description: Handler for demo.timer.heartbeat
+    tags: ["demo", "sub", "orch"]
+    arguments:
+      - name: event
+
+  handle_burst:
+    internal_name: handle_burst
+    remote: false
+    accessible_by_other_plugins: true
+    description: Handler for demo.timer.burst
+    tags: ["demo", "sub", "orch"]
+    arguments:
+      - name: event
+
+  handle_greeted_via_orch:
+    internal_name: handle_greeted_via_orch
+    remote: false
+    accessible_by_other_plugins: true
+    description: Handler for demo.greeted (via orchestrator)
+    tags: ["demo", "sub", "orch"]
+    arguments:
+      - name: event
+
+  handle_ask:
+    internal_name: handle_ask
+    remote: false
+    accessible_by_other_plugins: true
+    description: 1:1 request_event handler for demo.ask — returns an answer to the asking peer
+    tags: ["demo", "sub", "orch", "ask"]
+    arguments:
+      - name: event
+
+  stats:
+    internal_name: stats
+    remote: false
+    accessible_by_other_plugins: true
+    description: Returns received-event counts by topic
+    tags: ["demo", "orch"]
+    arguments: []
+
+  count_stream:
+    internal_name: count_stream
+    remote: false
+    accessible_by_other_plugins: true
+    description: Streaming endpoint — yields integers 1..N as a demo
+    tags: ["demo", "orch", "stream"]
+    arguments:
+      - name: n
+        type: int
+        description: Upper bound (default 5)

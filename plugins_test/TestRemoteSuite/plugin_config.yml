@@ -1,8 +1,55 @@
-description: Phase 5 suite — wire-bug repros (B-001/B-018/B-019/B-021/B-024/B-025/B-027/B-028/B-029/B-030/B-032/B-033/B-042) via subprocess peer
-version: 0.1.0
+description: Phase 5 suite — wire-bug repros (B-018/B-019/B-021/B-024/B-025/B-027/B-029/B-030/B-032/B-033) + Stage N (PR4) request_event coverage + wave-1 cross-node gap coverage via subprocess peer
+version: 0.8.2
 remote: False
 arguments:
+events:
+  r_hang:
+    topic: "test/r/hang"
+    hosts: "any"
+  r_huge_stream:
+    topic: "test/r/huge_stream"
+    hosts: "any"
+  # Stage N (PR4) — request_event / request_event_stream coverage
+  r_request_basic:
+    topic: "test/r/req_basic"
+    hosts: "any"
+  r_request_raise:
+    topic: "test/r/req_raise"
+    hosts: "any"
+  r_request_stream_basic:
+    topic: "test/r/req_stream_basic"
+    hosts: "any"
+  r_request_stream_raise:
+    topic: "test/r/req_stream_raise"
+    hosts: "any"
+  r_request_stream_raise_reqexc:
+    topic: "test/r/req_stream_raise_reqexc"
+    hosts: "any"
+  # ── Wave-1 cross-node gap coverage ────────────────────────────────
+  # (TP-04/r_multi + TG-12/r_slow_cancel relocated to the networking_pair
+  # socket harness — advert/directory-propagation dependent, see the skip
+  # reasons in plugin.py.)
+  r_order:                       # TP-16 per-peer publish order
+    topic: "test/r/order"
+    hosts: "any"
+  r_req_stream_empty:            # TP-12 empty stream
+    topic: "test/r/req_stream_empty"
+    hosts: "any"
+  r_req_stream_one:              # TP-12 control (1-item stream)
+    topic: "test/r/req_stream_one"
+    hosts: "any"
+  r_req_stream_hang:             # TG-11 (B-045) stream timeout type
+    topic: "test/r/req_stream_hang"
+    hosts: "any"
 endpoints:
+  r_local_noop:
+    internal_name: r_local_noop
+    tags:
+    remote: False
+    accessible_by_other_plugins: True
+    description: TP-04 (B-019) — harmless local subscriber endpoint for the publish_event per-sub count case
+    arguments:
+      - name: event
   run:
     internal_name: run
     tags:

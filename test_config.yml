@@ -25,20 +25,24 @@ plugins:
     enabled: true
     path: ./plugins_test/TestStreamTarget
 
-  - name: TestNotifierSuite
+  - name: TestEventSuite
     enabled: true
-    path: ./plugins_test/TestNotifierSuite
+    path: ./plugins_test/TestEventSuite
 
-  - name: TestNotifierTarget
+  - name: TestBugSuite
     enabled: true
-    path: ./plugins_test/TestNotifierTarget
+    path: ./plugins_test/TestBugSuite
 
-  # TestNotifierBadActor is loaded on demand by the suite (§5.4 idiom);
-  # config entry must exist so load_plugin_with_conf can find the path,
-  # but enabled=false so it doesn't auto-load at startup.
-  - name: TestNotifierBadActor
+  - name: TestEventTarget
+    enabled: true
+    path: ./plugins_test/TestEventTarget
+
+  # Bad-actor fixture loaded on-demand by TestEventSuite (§5.4 idiom).
+  # Handlers raise / hang / cancel — kept disabled at framework boot so
+  # nothing fires accidentally.
+  - name: TestEventBadActor
     enabled: false
-    path: ./plugins_test/TestNotifierBadActor
+    path: ./plugins_test/TestEventBadActor
 
   - name: TestLifecycleSuite
     enabled: true
@@ -52,26 +56,54 @@ plugins:
     enabled: true
     path: ./plugins_test/TestLifecycleVictim
 
-  # B-007 fixtures (BrokenVersion + Sentinel) are NOT enabled in
-  # test_config.yml because B-007 itself breaks startup — the KeyError from
-  # the missing-version plugin aborts get_plugins's for loop, taking down
-  # the entire test framework before any case runs. The B-007 case in
-  # TestLifecycleSuite c.skip()s with a note that the bug requires a
-  # controlled-startup harness (e.g. a separate subprocess invocation with
-  # only these two plugins) to test.
+  # HUNT-076 fixture pair: DepChild declares a REQUIRED dep on DepBase in its
+  # manifest, so at boot (DepBase ENABLED) DepChild boots ENABLED. The
+  # lifecycle.hunt076_reload_dep_precheck case disables DepBase, reloads
+  # DepChild, and asserts the reload precheck refuses to re-enable it against a
+  # down required dep (FAILED_LOAD). DepBase listed first so it loads before
+  # DepChild's dep resolves.
+  - name: TestLifecycleDepBase
+    enabled: true
+    path: ./plugins_test/TestLifecycleDepBase
+
+  - name: TestLifecycleDepChild
+    enabled: true
+    path: ./plugins_test/TestLifecycleDepChild
+
+  # B-007 fixture: plugin_config.yml with NO version field. Stays
+  # enabled:false and is loaded ON DEMAND by lifecycle.B-007 — see B-093.
+  # If B-007 regressed while this booted, the KeyError would abort the load
+  # loop and kill the run before any case reported, so the regression could
+  # never show up as a red cell. On-demand loading makes it one.
   - name: TestLifecycleBrokenVersion
     enabled: false
     path: ./plugins_test/TestLifecycleBrokenVersion
 
+  # Sentinel was the boot-time half of the old B-007 fixture pair: listed
+  # after BrokenVersion, its absence would show the load loop had aborted.
+  # Unused now that the case loads on demand (an on-demand load never
+  # touches get_plugins's loop, so Sentinel could prove nothing there).
+  # Kept on disk for a future B-093 guard rather than deleted.
   - name: TestLifecycleSentinel
     enabled: false
     path: ./plugins_test/TestLifecycleSentinel
+
+  # enabled:false ON PURPOSE — DO NOT FLIP IT (B-093). Its on_load raises,
+  # and get_plugins (core.py:2111) has no per-entry guard while
+  # load_plugin_with_conf re-raises, so enabling this entry aborts the whole
+  # load loop: every plugin listed BELOW it silently never loads and the run
+  # dies with "FATAL: TestLifecycleLoadCrashError" and no test report.
+  # Measured 2026-07-22: 35 entries lost. lifecycle.state_machine.
+  # failed_load_state_visible loads it on demand instead, then pops it.
+  - name: TestLifecycleLoadCrash
+    enabled: false
+    path: ./plugins_test/TestLifecycleLoadCrash
 
   - name: TestRemoteSuite
     enabled: true
     path: ./plugins_test/TestRemoteSuite
 
-  # TestRemoteTarget / Victim / Spoofer are loaded by the SUBPROCESS only
+  # TestRemoteTarget / Victim are loaded by the SUBPROCESS only
   # (plugins_test/_remote_node/config.subnode.yml). They are listed here so
   # config.example.yml stays discoverable, but enabled:false on the parent
   # so they don't load locally.
@@ -83,14 +115,55 @@ plugins:
     enabled: false
     path: ./plugins_test/TestRemoteVictim
 
-  - name: TestRemoteSpoofer
-    enabled: false
-    path: ./plugins_test/TestRemoteSpoofer
-
   # PR2 config-restructure regression suite (Phase PR2.1)
   - name: TestPR2Suite
     enabled: true
     path: ./plugins_test/TestPR2Suite
+
+  # Commit 2b hot-reload networking regression suite (B-070)
+  - name: TestHotReloadNetworkingSuite
+    enabled: true
+    path: ./plugins_test/TestHotReloadNetworkingSuite
+
+  # Internal event bus + done-callback eviction regression suite (B-073)
+  - name: TestInternalEventBusSuite
+    enabled: true
+    path: ./plugins_test/TestInternalEventBusSuite
+
+  # Phase 2a runtime sub/event toggle API regression suite + kind= field guard
+  - name: TestRuntimeToggleSuite
+    enabled: true
+    path: ./plugins_test/TestRuntimeToggleSuite
+
+  # Rate-limiter Step 2a caller-identity stamping suite + its lifecycle target.
+  - name: TestIdentitySuite
+    enabled: true
+    path: ./plugins_test/TestIdentitySuite
+
+  - name: TestIdentityTarget
+    enabled: true
+    path: ./plugins_test/TestIdentityTarget
+
+  # Rate-limiter Step 2b capability-gate suite + its asserting actor (twice).
+  - name: TestCapabilitySuite
+    enabled: true
+    path: ./plugins_test/TestCapabilitySuite
+
+  - name: TestCapabilityActor
+    enabled: true
+    path: ./plugins_test/TestCapabilityActor
+
+  - name: TestCapabilityActor2          # second identity for the ancestry chain
+    enabled: true
+    path: ./plugins_test/TestCapabilityActor
+
+  - name: TestRateLimitSuite
+    enabled: true
+    path: ./plugins_test/TestRateLimitSuite
+
+  - name: TestRateLimitTarget           # cross-plugin sub/endpoint target
+    enabled: true
+    path: ./plugins_test/TestRateLimitTarget
 
   # PR2 fixture plugins — loaded on-demand by TestPR2Suite (§5.4 idiom).
   # enabled:false so they don't auto-start at test framework boot.
@@ -114,9 +187,101 @@ plugins:
     enabled: false
     path: ./plugins_test/TestPR2MatchFixture
 
+  # Plugin-dependencies feature: unit + integration coverage.
+  # Unit suite runs pure-function tests against plexus.dependencies.
+  - name: TestDepResolutionUnitSuite
+    enabled: true
+    path: ./plugins_test/TestDepResolutionUnitSuite
+
+  # Structured ports of the 2026-06-21 audit-bug regression guards
+  # (networking / events / decorators) -- previously gitignored pytest only.
+  - name: TestAuditPortUnitSuite
+    enabled: true
+    path: ./plugins_test/TestAuditPortUnitSuite
+
+  # In-process minimal-NM guards for the networking advert/liveness layer
+  # (the B-085 "P-cell" family). The real-socket half used to live in
+  # plugins_test/networking_pair/, deleted 2026-07-22 (it drove the retired
+  # push-advert protocol); plugins_test/networking_multinode/ is the surviving
+  # real-socket harness, opt-in behind PLEXUS_PAIR_TEST.
+  - name: TestNetPairUnitSuite
+    enabled: true
+    path: ./plugins_test/TestNetPairUnitSuite
+
+  # White-box netcore mechanism cells (wraps plexus/netcore/_*_selftest.py as
+  # suite cells). All cells run every boot; see the plugin's module docstring.
+  - name: TestNetcoreUnitSuite
+    enabled: true
+    path: ./plugins_test/TestNetcoreUnitSuite
+
+  # Pure-function unit suites ported from the former root-level test_*.py
+  # scripts (one suite, no scattered root tests). Each pairs with an
+  # integration suite (TestCapabilitySuite / TestIdentitySuite / TestRateLimitSuite).
+  - name: TestCapabilityUnitSuite
+    enabled: true
+    path: ./plugins_test/TestCapabilityUnitSuite
+
+  - name: TestIdentityUnitSuite
+    enabled: true
+    path: ./plugins_test/TestIdentityUnitSuite
+
+  - name: TestRateLimitConfigUnitSuite
+    enabled: true
+    path: ./plugins_test/TestRateLimitConfigUnitSuite
+
+  - name: TestRateLimiterUnitSuite
+    enabled: true
+    path: ./plugins_test/TestRateLimiterUnitSuite
+
+  # Integration fixtures: A is v1.0.0 (so B's `>=1.0,<2.0` is exercised),
+  # B required-deps A + plexus. Both expected to enable in order A then B.
+  - name: TestDepResolutionA
+    enabled: true
+    path: ./plugins_test/TestDepResolutionA
+
+  - name: TestDepResolutionB
+    enabled: true
+    path: ./plugins_test/TestDepResolutionB
+
+  # Cycle fixtures: CycleA <-> CycleB required-cycle (both expected
+  # FAILED_LOAD). CycleC is unrelated (still ENABLED).
+  - name: TestDepResolutionCycleA
+    enabled: true
+    path: ./plugins_test/TestDepResolutionCycleA
+
+  - name: TestDepResolutionCycleB
+    enabled: true
+    path: ./plugins_test/TestDepResolutionCycleB
+
+  - name: TestDepResolutionCycleC
+    enabled: true
+    path: ./plugins_test/TestDepResolutionCycleC
+
+  # Enable-time cascade fixtures: Crash deliberately raises in on_enable
+  # (via raise_on_enable arg). CrashDependent required-deps Crash and
+  # should be transitioned to FAILED_LOAD by Hook 5's enable-time precheck.
+  - name: TestDepResolutionCrash
+    enabled: true
+    path: ./plugins_test/TestDepResolutionCrash
+
+  - name: TestDepResolutionCrashDependent
+    enabled: true
+    path: ./plugins_test/TestDepResolutionCrashDependent
+
+  - name: TestDepResolutionSuite
+    enabled: true
+    path: ./plugins_test/TestDepResolutionSuite
+
 
 general:
-    hostname: ""                      # Empty = use system hostname
+    hostname: "aio-test-parent"       # Must match the mTLS cert CN + the
+                                      # networking.hostname below + the name
+                                      # subnode peers pin us as: the C-106
+                                      # anti-spoof drops cross-node messages
+                                      # whose wire author_host (= this
+                                      # general.hostname) != the pinned peer
+                                      # hostname. Empty (system hostname)
+                                      # broke the remote suite.
     plugin_package: plugins_test
     console_log_level: "INFO"         # Quiet for cleaner test output
     file_log_level: "DEBUG"
@@ -130,10 +295,20 @@ general:
 
 
 networking:
-    enabled: true                     # Phase 5 will spawn a localhost subnode on port 2511
-    node_ips: ["127.0.0.1:2511"]
-    port: 2510
+    # PR4 Stage K (B-066): mTLS pinning. test_application.py generates
+    # parent + subnode certs at startup and patches keys_dir + peers
+    # into yaml_config before NetworkManager is constructed. The
+    # subnode subprocess receives its keys + the parent cert via flags
+    # forwarded by TestRemoteSuite._spawn_subnode through env vars.
+    # No fields here for keys_dir / peers — those are runtime-injected
+    # so a stale config can never be honored standalone.
+    enabled: true
+    port: 2510                         # fallback only — test_application.py
+                                       # probes a free port per run and
+                                       # overrides this, so an orphaned node
+                                       # holding the old port cannot block the
+                                       # next run from binding.
+    hostname: aio-test-parent          # explicit so subnode peers entry matches
     discover_nodes: true
     direct_discoverable: true
     auto_discoverable: true
-    secret: "aio_test_secret_local"   # local-only test secret; forwarded to subnode

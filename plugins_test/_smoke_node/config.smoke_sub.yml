@@ -1,0 +1,26 @@
+# Smoke subnode config: loads ONLY TestPR3SmokeSub. Connects to parent on
+# port 2510, listens itself on whatever --port the runner specifies.
+plugins:
+  - name: TestPR3SmokeSub
+    enabled: true
+    path: ./plugins_test/TestPR3SmokeSub
+
+general:
+    hostname: "smoke-subnode"
+    plugin_package: plugins_test
+    console_log_level: "INFO"
+    file_log_level: "DEBUG"
+    asyncio_debug: false
+    logger_levels:
+        asyncio: "MUTE"
+        urllib3: "MUTE"
+
+networking:
+    # PR4 Stage K (B-066): run_node.py --keys-dir / --parent-cert-pem-file
+    # inject keys_dir + peers at runtime. Omitting them here prevents
+    # stale shared-secret entries from being honored.
+    enabled: true
+    port: 0                              # overridden via run_node.py --port
+    discover_nodes: true
+    direct_discoverable: true
+    auto_discoverable: true

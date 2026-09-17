@@ -1,5 +1,5 @@
 description: Phase 4 fixture — controllable lifecycle victim with configurable on_enable / on_disable behaviors
-version: 0.1.0
+version: 0.2.1
 remote: True
 arguments:
   level: "info"
@@ -43,15 +43,6 @@ endpoints:
     description: Awaits asyncio.sleep(secs) — used to hold a pending request open for B-005
     arguments:
       - name: secs
-
-  inject_bad_request:
-    internal_name: inject_bad_request
-    tags:
-    remote: True
-    accessible_by_other_plugins: True
-    description: Insert a bare object() into core.requests under the given id (B-006)
-    arguments:
-      - name: req_id
 
   is_db_open:
     internal_name: is_db_open

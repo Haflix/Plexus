@@ -1,0 +1,49 @@
+# Runnable demo config for the two-plugin copypasta demo.
+# Boot it with:  python copypasta/run_demo.py   (run from the repo root)
+#
+# The three top-level keys plugins / general / networking are REQUIRED.
+# rate_limits and capabilities are OPTIONAL (shown here to demo them).
+
+plugins:
+  # List dependencies BEFORE their dependents (shutdown disables in reverse
+  # order). AveragePlugin depends on SensorPlugin, so SensorPlugin comes first.
+  - name: SensorPlugin
+    enabled: true
+    path: ./copypasta/SensorPlugin
+
+  - name: AveragePlugin
+    enabled: true
+    path: ./copypasta/AveragePlugin
+
+general:
+  hostname: ""                 # empty -> socket.gethostname()
+  plugin_package: copypasta    # base dir for entries without an explicit path
+  console_log_level: INFO      # DEBUG | INFO | WARNING | ERROR | CRITICAL | MUTE
+  file_log_level: WARNING
+
+networking:
+  enabled: false               # local-only demo; no mTLS / peers needed
+
+# ── Rate limits (operator-global; optional) ────────────────────────────
+# Off by default. Plugins may self-declare their own limits in their manifest
+# (SensorPlugin and AveragePlugin both do); anything here in main config OVERRIDES
+# a plugin-declared limit on the same (dimension, key). framework_in and nodes_in
+# are operator-global and can ONLY be set here.
+rate_limits:
+  framework_in: { max: 1000, window: 1 }   # global: 1000 operations/sec, node-wide
+
+  plugins:
+    SensorPlugin:
+      # Override SensorPlugin's self-declared endpoints.read (50/s) with a
+      # tighter operator cap. Main config wins.
+      endpoints:
+        read: { max: 5, window: 1 }        # endpoint_in(SensorPlugin, read): 5/s
+
+# ── Capabilities (impersonation grants; optional) ──────────────────────
+# Off by default and fail-closed. A grant lets one plugin assert a different
+# identity on its calls. Here AveragePlugin may act as SensorPlugin (used by its
+# try_act_as endpoint). Asserting any other identity is denied.
+capabilities:
+  AveragePlugin:
+    impersonation_allowed: [SensorPlugin]
+    # system_caller: true        # (alternative) would let it assert author="system"

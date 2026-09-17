@@ -1,0 +1,27 @@
+# Multinode cooperative harness — PEER2 node (hostname w2c-peer2, the lex-highest).
+# The third node for trio cells (fall-through order, rate fall-through, STAR,
+# vouch). Same plugin set as the peer. port/keys/peers/knobs injected at runtime.
+plugins:
+  - name: NetFixTarget
+    enabled: true
+    path: ./plugins_test/NetFixTarget
+  - name: NetObsProbe
+    enabled: true
+    path: ./plugins_test/NetObsProbe
+  - name: NetCtl
+    enabled: true
+    path: ./plugins_test/NetCtl
+
+general:
+    hostname: "w2c-peer2"
+    plugin_package: plugins_test
+    console_log_level: "WARNING"
+    file_log_level: "DEBUG"
+    asyncio_debug: false
+    logger_levels:
+        asyncio: "MUTE"
+        urllib3: "MUTE"
+
+networking:
+    enabled: true
+    port: 0

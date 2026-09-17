@@ -1,0 +1,15 @@
+description: HUNT-076 fixture — requires TestLifecycleDepBase; used by the reload dep-precheck regression
+version: 1.0.0
+remote: False
+dependencies:
+  TestLifecycleDepBase:
+    version: ">=1.0,<2.0"
+arguments:
+endpoints:
+  ping:
+    internal_name: ping
+    tags:
+    remote: False
+    accessible_by_other_plugins: True
+    description: Returns True — liveness probe
+    arguments:

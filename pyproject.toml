@@ -1,0 +1,69 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "plexus-core"
+dynamic = ["version"]
+description = "Async plugin framework with multi-node mTLS networking and pub/sub event routing."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+    { name = "Haflix", email = "info@haas-flo.de" },
+]
+keywords = [
+    "plugin",
+    "framework",
+    "async",
+    "asyncio",
+    "mtls",
+    "pubsub",
+    "event-bus",
+    "assistant",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Framework :: AsyncIO",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+]
+dependencies = [
+    "PyYAML",
+    "colorama",
+    "cryptography",
+    "msgpack",
+    "packaging",
+]
+
+[project.urls]
+Homepage = "https://github.com/Haflix/Plexus"
+Repository = "https://github.com/Haflix/Plexus"
+Documentation = "https://github.com/Haflix/Plexus/tree/main/docs"
+Issues = "https://github.com/Haflix/Plexus/issues"
+
+[project.optional-dependencies]
+# Faster event loop. Optional; install with `pip install plexus-core[fastloop]`.
+# Picks the right backend per platform — uvloop is POSIX-only, winloop is its
+# Windows port. The entry points call install() before asyncio.run(); a bare
+# checkout without these falls back to the stock asyncio loop.
+fastloop = [
+    "uvloop; platform_system != 'Windows'",
+    "winloop; platform_system == 'Windows'",
+]
+
+[tool.setuptools.dynamic]
+# Single source of truth: the package version is read from
+# plexus/__init__.py __version__. Bumping that constant is all that is
+# needed; the build picks it up, so pyproject never drifts.
+version = { attr = "plexus.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["plexus*"]

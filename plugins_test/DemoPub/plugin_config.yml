@@ -1,0 +1,69 @@
+description: "Demo publisher: 1:N publish_event burst, 1:1 request_event ask, and a flood that trips an endpoint_in rate limit. Carries tagged endpoints for tag-based discovery."
+version: 0.3.0
+remote: false
+verbose_notifier: true
+arguments:
+
+events:
+  greeted:
+    topic: "demo.greeted"
+    hosts: "any"
+  ticked:
+    topic: "demo.ticked"
+    hosts: "any"
+  disabled_demo:
+    topic: "demo.disabled"
+    hosts: "any"
+    enabled: false
+  # 1:1 ask target. request_event on this topic is answered by the local
+  # subscriber DemoOrch.handle_ask. Drives Beat 2 + Beat 3.
+  ask:
+    topic: "demo.ask"
+    hosts: "any"
+
+endpoints:
+  fire_events:
+    internal_name: fire_events
+    remote: false
+    accessible_by_other_plugins: true
+    description: "Publish a small burst of demo events (3 greeted + 2 ticked)"
+    tags: ["demo", "fire"]
+    arguments: []
+
+  beat2_ask:
+    internal_name: beat2_ask
+    remote: false
+    accessible_by_other_plugins: true
+    description: "Beat 2: 1:1 request_event on demo.ask, answered by whichever subscriber matches"
+    tags: ["demo", "beat", "ask"]
+    arguments: []
+
+  beat3_flood:
+    internal_name: beat3_flood
+    remote: false
+    accessible_by_other_plugins: true
+    description: "Beat 3: flood the 1:1 ask endpoint to trip its endpoint_in rate limit"
+    tags: ["demo", "beat", "flood"]
+    arguments:
+      - name: n
+        type: int
+        description: How many request_events to fire back to back (default 20)
+
+  ping:
+    internal_name: ping
+    remote: false
+    accessible_by_other_plugins: true
+    description: Returns pong — used to demo a tagged endpoint
+    tags: ["demo", "ping"]
+    arguments: []
+
+  echo:
+    internal_name: echo
+    remote: false
+    accessible_by_other_plugins: true
+    description: Echoes the supplied message back
+    tags: ["demo"]
+    arguments:
+      - name: message
+        type: str
+        description: The message to echo

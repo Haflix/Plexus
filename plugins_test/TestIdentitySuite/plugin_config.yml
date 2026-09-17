@@ -1,0 +1,88 @@
+description: Caller-identity suite — asserts framework-stamped caller identity at every framework->plugin entry
+version: "0.1.1"
+remote: false
+arguments:
+events:
+  capture_req:
+    topic: "test_identity/capture"
+    hosts: "local"
+  capture_req_sync:
+    topic: "test_identity/capture_sync"
+    hosts: "local"
+subscriptions:
+  capture_sub:
+    topic: "test_identity/capture"
+    target_access_name: on_capture_event
+    hosts: "local"
+  capture_sub_sync:
+    topic: "test_identity/capture_sync"
+    target_access_name: on_capture_event_sync
+    hosts: "local"
+endpoints:
+  run:
+    internal_name: run
+    remote: false
+    accessible_by_other_plugins: true
+    description: Run the identity-suite cases and return a structured suite result dict
+    arguments:
+      - name: category
+        description: 'basic | edge | null (both)'
+      - name: host
+        description: 'local | remote | null (all hosts)'
+      - name: case_ids
+        description: Filter cases within the suite
+      - name: bug_ids
+        description: Filter cases by bug tag
+      - name: skip_slow
+        description: Skip cases tagged 'slow'
+      - name: allow_destructive
+        description: If False, destructive cases are skipped
+  capture_async:
+    internal_name: capture_async
+    remote: false
+    accessible_by_other_plugins: true
+    description: Async endpoint — returns the live caller chain
+  capture_sync:
+    internal_name: capture_sync
+    remote: false
+    accessible_by_other_plugins: true
+    description: Sync endpoint — returns the live caller chain (worker-seed path)
+  capture_async_stream:
+    internal_name: capture_async_stream
+    remote: false
+    accessible_by_other_plugins: true
+    description: Async generator — yields the live caller chain
+  capture_sync_stream:
+    internal_name: capture_sync_stream
+    remote: false
+    accessible_by_other_plugins: true
+    description: Sync generator — yields the live caller chain
+  on_capture_event:
+    internal_name: on_capture_event
+    remote: false
+    accessible_by_other_plugins: true
+    description: Async subscription handler — returns the live caller chain
+    arguments:
+      - name: event
+  on_capture_event_sync:
+    internal_name: on_capture_event_sync
+    remote: false
+    accessible_by_other_plugins: true
+    description: Sync subscription handler — returns the live caller chain
+    arguments:
+      - name: event
+  relay_execute_sync:
+    internal_name: relay_execute_sync
+    remote: false
+    accessible_by_other_plugins: true
+    description: Sync endpoint that calls execute_sync (sync-bridge handoff test)
+  relay_request_event_sync:
+    internal_name: relay_request_event_sync
+    remote: false
+    accessible_by_other_plugins: true
+    description: Sync endpoint that calls request_event_sync (events bridge handoff test)
+  relay_async_request:
+    internal_name: relay_async_request
+    remote: false
+    accessible_by_other_plugins: true
+    description: Async endpoint that fans out via request_event (spawn-isolation test)

@@ -1,0 +1,24 @@
+description: In-process minimal-NM regression guards for the networking advert/liveness layer (the B-085 P-cell family); pass-polarity guards for behavior that is correct today (B-082 advert-slot invariant, N-strikes death mechanics)
+version: 0.7.0
+remote: false
+arguments:
+dependencies:
+endpoints:
+  run:
+    internal_name: run
+    remote: false
+    accessible_by_other_plugins: true
+    description: Run networking-pair unit cases and return a suite result dict
+    arguments:
+      - name: category
+        description: 'networking | null (all)'
+      - name: host
+        description: 'local | remote | null (all hosts)'
+      - name: case_ids
+        description: Filter cases within the suite
+      - name: bug_ids
+        description: Filter cases by bug tag
+      - name: skip_slow
+        description: Skip cases tagged slow
+      - name: allow_destructive
+        description: If False, destructive cases are skipped

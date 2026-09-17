@@ -1,0 +1,100 @@
+description: Capability-gate fixture — makes asserting execute calls to drive the gate
+version: "0.1.4"
+remote: false
+arguments:
+endpoints:
+  echo:
+    internal_name: echo
+    remote: false
+    accessible_by_other_plugins: true
+    description: Victim sink — returns "echo"
+    arguments:
+      - name: value
+  do_assert:
+    internal_name: do_assert
+    remote: false
+    accessible_by_other_plugins: true
+    description: Make an asserting execute call with a claimed author/author_id
+    arguments:
+      - name: target
+      - name: method
+      - name: author
+      - name: author_id
+  try_reassert:
+    internal_name: try_reassert
+    remote: false
+    accessible_by_other_plugins: true
+    description: Under an active assertion, attempt a different one (no-chaining proof)
+    arguments:
+      - name: value
+  relay:
+    internal_name: relay
+    remote: false
+    accessible_by_other_plugins: true
+    description: Forward to an inner execute so the inner target sees this actor as ancestor
+    arguments:
+      - name: spec
+  do_assert_sync:
+    internal_name: do_assert_sync
+    remote: false
+    accessible_by_other_plugins: true
+    description: Make an asserting execute_sync call (sync-path gate proof)
+    arguments:
+      - name: target
+      - name: method
+      - name: author
+      - name: author_id
+  do_assert_stream:
+    internal_name: do_assert_stream
+    remote: false
+    accessible_by_other_plugins: true
+    description: Make an asserting execute_stream call (async-stream gate proof)
+    arguments:
+      - name: target
+      - name: method
+      - name: author
+      - name: author_id
+  do_assert_stream_sync:
+    internal_name: do_assert_stream_sync
+    remote: false
+    accessible_by_other_plugins: true
+    description: Make an asserting execute_stream_sync call (sync-stream gate proof)
+    arguments:
+      - name: target
+      - name: method
+      - name: author
+      - name: author_id
+  do_assert_stream_lazy:
+    internal_name: do_assert_stream_lazy
+    remote: false
+    accessible_by_other_plugins: true
+    description: Prove execute_stream is lazy (gate fires only on iteration)
+    arguments:
+      - name: target
+      - name: method
+      - name: author
+      - name: author_id
+  try_reassert_sync:
+    internal_name: try_reassert_sync
+    remote: false
+    accessible_by_other_plugins: true
+    description: Sync endpoint that re-enters via execute_sync under an active assertion (sync no-chaining proof)
+    arguments:
+      - name: value
+  try_reassert_stream_sync:
+    internal_name: try_reassert_stream_sync
+    remote: false
+    accessible_by_other_plugins: true
+    description: Sync generator that re-enters via execute_sync under an active assertion (sync-stream no-chaining proof)
+    arguments:
+      - name: value
+  do_assert_stream_first:
+    internal_name: do_assert_stream_first
+    remote: false
+    accessible_by_other_plugins: true
+    description: Like do_assert_stream but returns the first yielded chunk (so a sync-gen target reports its nested gate result)
+    arguments:
+      - name: target
+      - name: method
+      - name: author
+      - name: author_id

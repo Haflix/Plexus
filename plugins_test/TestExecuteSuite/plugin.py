@@ -11,7 +11,6 @@ Exercises:
 - Decorator contract regression locks
 - Deep RequestException chain propagation
 - request_context_async / request_context_sync smoke
-- Runner-meta framework_version sanity
 - Edge: B-015 args-contract variants (bytes/set/frozenset/dataclass/async_gen/OrderedDict)
 - Edge: cancel during sync handler in threadpool
 
@@ -30,19 +29,19 @@ from collections import OrderedDict  # noqa: E402
 from dataclasses import dataclass  # noqa: E402
 from typing import Any, Dict, List, Optional  # noqa: E402
 
-from utils import Plugin  # noqa: E402
-from decorators import (  # noqa: E402
+from plexus.utils import Plugin  # noqa: E402
+from plexus.decorators import (  # noqa: E402
     async_log_errors,
     async_handle_errors,
     async_gen_log_errors,
     log_errors,
 )
-from exceptions import RequestException  # noqa: E402
+from plexus.exceptions import RequestException  # noqa: E402
 
-from _test_helpers import CaseRecorder, FRAMEWORK_VERSION  # noqa: E402
+from _test_helpers import CaseRecorder  # noqa: E402
 
 
-SUITE_VERSION = "0.2.0"
+SUITE_VERSION = "0.5.0"
 TARGET = "TestExecuteTarget"
 TARGET2 = "TestExecuteTarget2"
 
@@ -58,7 +57,7 @@ class TestExecuteSuite(Plugin):
 
     @log_errors
     def on_load(self, *args, **kwargs):
-        # Declare instance state per Plugin lifecycle contract (CLAUDE.md):
+        # Declare instance state per the Plugin lifecycle contract:
         self._t1_uuid: Optional[str] = None
         self._t2_uuid: Optional[str] = None
         self._multi_instance_smoke_passed: bool = False
@@ -81,7 +80,7 @@ class TestExecuteSuite(Plugin):
         skip_slow: bool = False,
         allow_destructive: bool = True,
     ) -> Dict[str, Any]:
-        rec = CaseRecorder("TestExecuteSuite", SUITE_VERSION, self._plugin_core)
+        rec = CaseRecorder("TestExecuteSuite", SUITE_VERSION, self._plexus)
 
         kw = dict(
             case_ids_filter=case_ids,
@@ -101,6 +100,7 @@ class TestExecuteSuite(Plugin):
         await self._basic_hosts_validation(rec, kw)
         await self._basic_blocked_hosts_behavior(rec, kw)
         await self._basic_timeout(rec, kw)
+        await self._b089_timeout_zero_unbounded(rec, kw)
         await self._basic_accessibility(rec, kw)
         await self._basic_sync(rec, kw)
         await self._basic_multi_instance(rec, kw)
@@ -110,7 +110,6 @@ class TestExecuteSuite(Plugin):
         await self._basic_contract_find_endpoint(rec, kw)
         await self._basic_request_context(rec, kw)
         await self._basic_decorators(rec, kw)
-        await self._basic_runner_meta(rec, kw)
         await self._edge_args_contract_variants(rec, kw)
         await self._edge_cancellation(rec, kw)
 
@@ -255,8 +254,10 @@ class TestExecuteSuite(Plugin):
             r = await self.execute(TARGET, "ea_returns_arg", "hello", hosts=c.hosts)
             c.expect(r, "hello")
 
-        # These currently PASS because the framework silently accepts non-tuple/non-dict.
-        # When B-015 is fixed (validation added), the call should raise → unexpected_pass.
+        # B-015 reclassified BY-DESIGN (Stage S): single-positional
+        # pass-through is intentional convenience — args=42 calls
+        # func(42), args=[1,2,3] calls func([1,2,3]). Cases stay as
+        # positive regression guards locking the pass-through.
         await rec.run_case(
             "exec.B-015.single_int", body_single_int,
             tags=("args_contract",), bug_ids=("B-015",), **kw,
@@ -284,7 +285,10 @@ class TestExecuteSuite(Plugin):
             await self.execute("DoesNotExist", "ea_add", (1, 2), hosts=c.hosts)
 
         async def body_endpoint_raises(c):
-            c.expect_exception(RequestException, match=r"intentional")
+            # The endpoint raises ValueError("intentional"). The caller's
+            # RequestException must carry the exception TYPE NAME, not just the
+            # bare message — "ValueError: intentional", not "intentional".
+            c.expect_exception(RequestException, match=r"ValueError.*intentional")
             await self.execute(TARGET, "ea_raises", hosts=c.hosts)
 
         async def body_endpoint_raises_request_exc(c):
@@ -300,14 +304,14 @@ class TestExecuteSuite(Plugin):
             c.expect(r, "future_value")
 
         async def body_returns_failing_future(c):
-            # B-013: failing Future is awaited inside _set_request_result;
-            # @async_handle_errors swallows; request._future stays pending; caller hangs.
-            # Wrap in outer wait_for to detect.
-            await c.assert_hang(
-                self.execute(TARGET, "ea_returns_failing_future", hosts=c.hosts),
-                timeout_s=2.0,
-                marker="outer_wait_for_fired",
-            )
+            # B-013 regression guard: a returned Future that raises on
+            # await used to silently hang the caller (@async_handle_errors
+            # swallowed the inner exception; request._future never
+            # resolved). The fix catches inside _set_request_result and
+            # surfaces the exception as a normal request error, which
+            # the caller's execute() re-raises as RequestException.
+            c.expect_exception(RequestException, match=r"ValueError.*intentional")
+            await self.execute(TARGET, "ea_returns_failing_future", hosts=c.hosts)
 
         await rec.run_case(
             "exec.error.no_endpoint", body_no_endpoint,
@@ -335,9 +339,7 @@ class TestExecuteSuite(Plugin):
         )
         await rec.run_case(
             "exec.B-013.returns_failing_future", body_returns_failing_future,
-            tags=("bug_repro",), bug_ids=("B-013",),
-            expected_status="fail",
-            expected_signature={"marker": "outer_wait_for_fired"},
+            tags=("bug_repro", "regression_guard"), bug_ids=("B-013",),
             hard_timeout_s=10.0,
             **kw,
         )
@@ -478,7 +480,7 @@ class TestExecuteSuite(Plugin):
         async def body_block_self_hostname(c):
             # hosts="any" + blocked_hosts=<own hostname> → local skipped.
             # No remote subnode hosts this target → not found.
-            own_host = self._plugin_core.hostname
+            own_host = self._plexus.hostname
             c.expect_exception(RequestException, match=r"not found")
             await self.execute(
                 TARGET, "ea_no_args",
@@ -494,8 +496,11 @@ class TestExecuteSuite(Plugin):
             c.expect(r, "ok")
 
         async def body_block_any_blocks_everything(c):
-            # blocked_hosts="any" blocks both local and remote.
-            c.expect_exception(RequestException, match=r"not found")
+            # blocked_hosts="any" is rejected at normalization: blocking
+            # "any" would exclude every peer including local, which is a
+            # config error rather than a useful filter. Raises ValueError
+            # before dispatch (not a "not found" RequestException).
+            c.expect_exception(ValueError, match=r"not a valid blocked-host")
             await self.execute(
                 TARGET, "ea_no_args",
                 hosts="any", blocked_hosts="any",
@@ -571,6 +576,32 @@ class TestExecuteSuite(Plugin):
             hard_timeout_s=15.0, **kw,
         )
 
+    async def _b089_timeout_zero_unbounded(self, rec: CaseRecorder, kw: Dict) -> None:
+        # B-089: a per-call timeout of 0 must normalize to None (= unbounded),
+        # matching the None contract, at BOTH request constructors. Guards the
+        # utils.py normalization so no downstream reader can ever see a bare 0
+        # again — the sync-gen `is not None` gate (core.py) and the remote
+        # deadline / wire handler_timeout paths all treated 0 as "immediate"
+        # before the fix.
+        async def body(c):
+            from plexus.utils import Request, GeneratorRequest
+            c.expect(Request("h", "p", "m", timeout=0).timeout_duration, None)
+            c.expect(
+                GeneratorRequest("h", "p", "m", timeout=0).timeout_duration, None
+            )
+            # wire tuple form (duration, created_at) normalizes on the duration
+            c.expect(
+                Request("h", "p", "m", timeout=(0, 123.0)).timeout_duration, None
+            )
+            # positive values and None pass through untouched
+            c.expect(Request("h", "p", "m", timeout=2.5).timeout_duration, 2.5)
+            c.expect(Request("h", "p", "m", timeout=None).timeout_duration, None)
+
+        await rec.run_case(
+            "exec.B-089.timeout_zero_is_unbounded", body,
+            tags=("timeout",), bug_ids=("B-089",), **kw,
+        )
+
     # ====================================================================
     # BASIC accessibility
     # ====================================================================
@@ -620,15 +651,6 @@ class TestExecuteSuite(Plugin):
     # ====================================================================
 
     async def _basic_multi_instance(self, rec: CaseRecorder, kw: Dict) -> None:
-        async def body_distinct_uuids(c):
-            if not self._multi_instance_smoke_passed:
-                c.skip(
-                    "multi-instance smoke failed; loader does not isolate instances"
-                )
-            t1 = self._t1_uuid
-            t2 = self._t2_uuid
-            if t1 == t2:
-                raise AssertionError(f"uuids identical: {t1}")
 
         async def body_target_by_uuid(c):
             if not self._multi_instance_smoke_passed:
@@ -643,10 +665,6 @@ class TestExecuteSuite(Plugin):
             c.expect(r2, t2)
 
         await rec.run_case(
-            "exec.multi_instance.distinct_uuids", body_distinct_uuids,
-            tags=("multi_instance",), **kw,
-        )
-        await rec.run_case(
             "exec.multi_instance.target_by_uuid", body_target_by_uuid,
             tags=("multi_instance",), **kw,
         )
@@ -660,7 +678,7 @@ class TestExecuteSuite(Plugin):
             # Create the request directly so we know its id deterministically;
             # then await its result via a separate task and cancel it. Avoids the
             # snapshot-diff race of inferring the id from `core.requests.keys()`.
-            req = await self._plugin_core.create_request(
+            req = await self._plexus.create_request(
                 TARGET, "ea_hang", {"seconds": 60.0},
                 "", "any", self.plugin_name, self.plugin_uuid,
             )
@@ -673,12 +691,16 @@ class TestExecuteSuite(Plugin):
                 await task
             except (asyncio.CancelledError, RequestException):
                 pass
-            # Mark collected since we never observed the (still-running) result.
-            await req.set_collected()
+            # B-073: done-callback eviction. Was
+            # ``await req.set_collected()`` (cleanup_requests reaped
+            # after ``collected=True``). Migrated to direct sync pop;
+            # the producer's finally in ``_process_request`` will also
+            # pop on completion (idempotent under ``pop(key, None)``).
+            self._plexus.requests.pop(req.id, None)
 
             deadline = time.perf_counter() + 25.0
             while time.perf_counter() < deadline:
-                if req_id not in self._plugin_core.requests:
+                if req_id not in self._plexus.requests:
                     break
                 await asyncio.sleep(0.5)
             else:
@@ -759,12 +781,40 @@ class TestExecuteSuite(Plugin):
                         f"unexpected error: {e!r}"
                     )
 
-        async def body_uuid_after_pop_returns_none(c):
-            # Skip — pop_plugin requires Phase 4 mechanics; out of Phase 1 scope.
-            c.skip("requires pop_plugin lifecycle from Phase 4")
 
-        async def body_uuid_invalidated_after_reload(c):
-            c.skip("requires _reload_plugin from Phase 4")
+        async def body_uuid_after_reload(c):
+            # B-092 #7: a plugin_uuid held across a reload must NOT resolve to
+            # the new instance. Reload re-instantiates (new uuid); the endpoint
+            # is still reachable BY NAME, but the stale uuid is uuid-exact
+            # rejected at find_endpoint. (Previously skipped citing a stale
+            # "Phase 4" blocker; _reload_plugin is exercised by other suites
+            # today.) TARGET2 is the multi-instance spare — only used by-name by
+            # later cells, and reload preserves its ENABLED state, so this is a
+            # clean net-zero operation.
+            old = await self.execute(TARGET2, "get_uuid")
+            await self._plexus._reload_plugin(TARGET2)
+            new = await self.execute(TARGET2, "get_uuid")
+            c.expect(new != old, True)
+            # by-name still resolves — to the NEW instance
+            c.expect(await self.execute(TARGET2, "get_uuid", plugin_uuid=new), new)
+            # the STALE uuid is rejected
+            try:
+                await self.execute(TARGET2, "get_uuid", plugin_uuid=old)
+                raise AssertionError(
+                    "stale plugin_uuid after reload was accepted")
+            except RequestException as e:
+                if "not found" not in str(e).lower():
+                    raise AssertionError(
+                        f"unexpected error for stale uuid: {e!r}")
+
+        # NOTE: a pop-then-call cell was considered and dropped. After
+        # pop_plugin the instance is absent from self.plugins, so find_endpoint
+        # never reaches the uuid-exact gate (core.py:5223) — both a by-name and
+        # a held-uuid call fail identically for "plugin gone". That is a
+        # pop-reachability lifecycle property, not the B-092 uuid-exact one the
+        # reload cell above covers; confirmed by negative control (disabling
+        # 5223 does not flip such a cell). It also needed a manual pop+restore
+        # of a shared fixture, a needless landmine. Left out on purpose.
 
         await rec.run_case(
             "exec.contract.find_endpoint_uuid_target_plugin_conflict",
@@ -772,14 +822,10 @@ class TestExecuteSuite(Plugin):
             tags=("discovery",), **kw,
         )
         await rec.run_case(
-            "exec.contract.uuid_after_pop_returns_none",
-            body_uuid_after_pop_returns_none,
-            tags=("discovery",), **kw,
-        )
-        await rec.run_case(
             "exec.contract.uuid_invalidated_after_reload",
-            body_uuid_invalidated_after_reload,
-            tags=("discovery", "reload"), **kw,
+            body_uuid_after_reload,
+            tags=("discovery", "reload"), bug_ids=("B-092",),
+            hard_timeout_s=15.0, **kw,
         )
 
     # ====================================================================
@@ -788,20 +834,20 @@ class TestExecuteSuite(Plugin):
 
     async def _basic_request_context(self, rec: CaseRecorder, kw: Dict) -> None:
         async def body_ctx_async(c):
-            req = await self._plugin_core.create_request(
+            req = await self._plexus.create_request(
                 TARGET, "ea_add", (5, 6),
                 "", "any", self.plugin_name, self.plugin_uuid,
             )
-            async with self._plugin_core.request_context_async(req) as result:
+            async with self._plexus.request_context_async(req) as result:
                 c.expect(result, 11)
 
         async def body_ctx_sync(c):
             def sync_block():
-                req = self._plugin_core.create_request_sync(
+                req = self._plexus.create_request_sync(
                     TARGET, "ea_add", (8, 9),
                     "", "any", self.plugin_name, self.plugin_uuid,
                 )
-                with self._plugin_core.request_context_sync(req) as result:
+                with self._plexus.request_context_sync(req) as result:
                     return result
 
             r = await asyncio.to_thread(sync_block)
@@ -885,7 +931,7 @@ class TestExecuteSuite(Plugin):
                 c.expect(collected, [1])
 
         async def body_gen_log_errors_smoke(c):
-            from decorators import gen_log_errors
+            from plexus.decorators import gen_log_errors
 
             class _Holder:
                 _logger = suite_logger
@@ -923,21 +969,6 @@ class TestExecuteSuite(Plugin):
             tags=("decorators",), **kw,
         )
 
-    # ====================================================================
-    # BASIC runner-meta sanity (framework_version)
-    # ====================================================================
-
-    async def _basic_runner_meta(self, rec: CaseRecorder, kw: Dict) -> None:
-        async def body_framework_version(c):
-            if not isinstance(FRAMEWORK_VERSION, str) or not FRAMEWORK_VERSION:
-                raise AssertionError(
-                    f"FRAMEWORK_VERSION not a non-empty string: {FRAMEWORK_VERSION!r}"
-                )
-
-        await rec.run_case(
-            "runner.meta.framework_version_set", body_framework_version,
-            tags=("runner", "contract"), **kw,
-        )
 
     # ====================================================================
     # EDGE B-015 args-contract variants

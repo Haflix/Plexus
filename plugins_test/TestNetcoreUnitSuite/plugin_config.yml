@@ -1,0 +1,24 @@
+description: In-suite white-box unit cells for the netcore networking rewrite — wraps the per-module netcore self-tests (wire/transport/membership/directory/dispatch) as CaseRecorder cells so the mechanism coverage runs on every boot. Every cell runs, including the real-socket loopback ones; see the plugin module docstring for why the former gate was removed.
+version: 0.3.0
+remote: false
+arguments:
+dependencies:
+endpoints:
+  run:
+    internal_name: run
+    remote: false
+    accessible_by_other_plugins: true
+    description: Run netcore white-box unit cells and return a suite result dict
+    arguments:
+      - name: category
+        description: 'netcore | null (all)'
+      - name: host
+        description: 'local | remote | null (all hosts)'
+      - name: case_ids
+        description: Filter cases within the suite
+      - name: bug_ids
+        description: Filter cases by bug tag
+      - name: skip_slow
+        description: Skip cases tagged slow
+      - name: allow_destructive
+        description: If False, destructive cases are skipped

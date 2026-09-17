@@ -1,0 +1,5 @@
+# Normalise line endings so a file does not flip between CRLF and LF
+# depending on which OS last wrote it. Without this the tree is mixed, and
+# editing a config from the dashboard rewrites the whole file on the other
+# platform.
+* text=auto eol=lf

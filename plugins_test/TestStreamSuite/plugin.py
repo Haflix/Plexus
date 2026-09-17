@@ -10,8 +10,11 @@ Exercises:
 - Stream-level timeout (gen never yields)
 - Request-entry reaped on normal completion
 - Calling execute_stream on a non-generator endpoint
-- B-041 sync-chain-through-stream (deferred — observation-only design TBD)
 - Edge: cancellation between yields
+
+B-041 (sync chain through stream) had a permanently-skipped placeholder
+here; it was deleted 2026-07-22. The bug is marked fixed in the tracker
+but has NO regression guard - see B-041 in _private/bugs/bugs.jsonl.
 """
 
 import sys
@@ -22,14 +25,14 @@ import asyncio  # noqa: E402
 import time  # noqa: E402
 from typing import Any, Dict, List, Optional  # noqa: E402
 
-from utils import Plugin  # noqa: E402
-from decorators import async_log_errors, log_errors  # noqa: E402
-from exceptions import RequestException  # noqa: E402
+from plexus.utils import Plugin  # noqa: E402
+from plexus.decorators import async_log_errors, log_errors  # noqa: E402
+from plexus.exceptions import RequestException  # noqa: E402
 
 from _test_helpers import CaseRecorder  # noqa: E402
 
 
-SUITE_VERSION = "0.1.0"
+SUITE_VERSION = "0.2.0"
 TARGET = "TestStreamTarget"
 EXEC_TARGET = "TestExecuteTarget"  # for the non-generator endpoint test
 
@@ -59,7 +62,7 @@ class TestStreamSuite(Plugin):
         skip_slow: bool = False,
         allow_destructive: bool = True,
     ) -> Dict[str, Any]:
-        rec = CaseRecorder("TestStreamSuite", SUITE_VERSION, self._plugin_core)
+        rec = CaseRecorder("TestStreamSuite", SUITE_VERSION, self._plexus)
 
         kw = dict(
             case_ids_filter=case_ids,
@@ -79,7 +82,6 @@ class TestStreamSuite(Plugin):
         await self._basic_sync_iter(rec, kw)
         await self._basic_timeout(rec, kw)
         await self._basic_contract(rec, kw)
-        await self._basic_b041_skip(rec, kw)
         await self._edge_cancellation_between_yields(rec, kw)
 
         return rec.to_dict()
@@ -91,7 +93,7 @@ class TestStreamSuite(Plugin):
     async def _make_gen_request(self, method: str, args: Any = None):
         """Create a GeneratorRequest directly so the case has access to the
         Request object (for queue.qsize() inspection)."""
-        return await self._plugin_core.create_gen_request(
+        return await self._plexus.create_gen_request(
             TARGET, method, args,
             "", "any", self.plugin_name, self.plugin_uuid,
         )
@@ -168,7 +170,7 @@ class TestStreamSuite(Plugin):
             # raises mid-stream, Request.get_queue_stream breaks silently on the
             # error+EndOfQueue chunk (utils.py:1664-1667). The consumer just
             # sees the stream end after the items that were already pushed — no
-            # exception. PluginCore.execute_stream's `if error: raise` (line
+            # exception. Plexus.execute_stream's `if error: raise` (line
             # 1767) is therefore dead code. Bugtracker entry to be added.
             items = []
             try:
@@ -203,16 +205,11 @@ class TestStreamSuite(Plugin):
                     break
 
             await req.set_collected()
+            await asyncio.sleep(0.1)              # let cancel propagate
             qsize_t1 = req.queue.qsize()
-            await asyncio.sleep(15)
+            await asyncio.sleep(1.0)              # bounded re-check
             qsize_t2 = req.queue.qsize()
-
-            if qsize_t2 > qsize_t1:
-                c.set_marker("producer_still_running")
-                raise AssertionError(
-                    f"producer_still_running: qsize {qsize_t1} -> {qsize_t2}"
-                )
-            # Else: producer stopped → bug fixed → unexpected_pass (review)
+            c.expect(qsize_t2, qsize_t1)          # B-002 fix: producer cancelled, no growth
 
         async def body_consumer_cancel(c):
             req = await self._make_gen_request("ea_gen_infinite", None)
@@ -231,15 +228,11 @@ class TestStreamSuite(Plugin):
                 pass
 
             await req.set_collected()
+            await asyncio.sleep(0.1)              # let cancel propagate
             qsize_t1 = req.queue.qsize()
-            await asyncio.sleep(15)
+            await asyncio.sleep(1.0)              # bounded re-check
             qsize_t2 = req.queue.qsize()
-
-            if qsize_t2 > qsize_t1:
-                c.set_marker("producer_still_running")
-                raise AssertionError(
-                    f"producer_still_running: qsize {qsize_t1} -> {qsize_t2}"
-                )
+            c.expect(qsize_t2, qsize_t1)          # B-002 fix: producer cancelled, no growth
 
         async def body_consumer_break_sync(c):
             # Sync caller drives execute_stream_sync, breaks early, then we
@@ -248,7 +241,7 @@ class TestStreamSuite(Plugin):
             req_holder: Dict[str, Any] = {}
 
             def sync_block():
-                req = self._plugin_core.create_gen_request_sync(
+                req = self._plexus.create_gen_request_sync(
                     TARGET, "ea_gen_infinite", None,
                     "", "any", self.plugin_name, self.plugin_uuid,
                 )
@@ -264,38 +257,25 @@ class TestStreamSuite(Plugin):
             await asyncio.to_thread(sync_block)
             req = req_holder["req"]
             await req.set_collected()
+            await asyncio.sleep(0.1)              # let cancel propagate
             qsize_t1 = req.queue.qsize()
-            await asyncio.sleep(15)
+            await asyncio.sleep(1.0)              # bounded re-check
             qsize_t2 = req.queue.qsize()
-
-            if qsize_t2 > qsize_t1:
-                c.set_marker("producer_still_running")
-                raise AssertionError(
-                    f"producer_still_running: qsize {qsize_t1} -> {qsize_t2}"
-                )
+            c.expect(qsize_t2, qsize_t1)          # B-002 fix: producer cancelled, no growth
 
         await rec.run_case(
             "stream.B-002.consumer_break", body_consumer_break,
-            tags=("bug_repro",), bug_ids=("B-002",),
-            expected_status="fail",
-            expected_signature={"marker": "producer_still_running"},
-            hard_timeout_s=30.0,
+            tags=("bug_repro", "regression_guard"), bug_ids=("B-002",),
             **kw,
         )
         await rec.run_case(
             "stream.B-002.consumer_cancel", body_consumer_cancel,
-            tags=("bug_repro",), bug_ids=("B-002",),
-            expected_status="fail",
-            expected_signature={"marker": "producer_still_running"},
-            hard_timeout_s=30.0,
+            tags=("bug_repro", "regression_guard"), bug_ids=("B-002",),
             **kw,
         )
         await rec.run_case(
             "stream.B-002.consumer_break_sync", body_consumer_break_sync,
-            tags=("bug_repro", "sync"), bug_ids=("B-002",),
-            expected_status="fail",
-            expected_signature={"marker": "producer_still_running"},
-            hard_timeout_s=30.0,
+            tags=("bug_repro", "regression_guard", "sync"), bug_ids=("B-002",),
             **kw,
         )
 
@@ -400,7 +380,7 @@ class TestStreamSuite(Plugin):
 
             deadline = time.perf_counter() + 30.0
             while time.perf_counter() < deadline:
-                if req_id not in self._plugin_core.requests:
+                if req_id not in self._plexus.requests:
                     return
                 await asyncio.sleep(0.5)
             raise AssertionError(
@@ -433,23 +413,6 @@ class TestStreamSuite(Plugin):
             hosts=("local", "remote"), tags=("error", "regression_lock"), **kw,
         )
 
-    # ====================================================================
-    # BASIC B-041 — deferred (skip with reason)
-    # ====================================================================
-
-    async def _basic_b041_skip(self, rec: CaseRecorder, kw: Dict) -> None:
-        async def body_b041(c):
-            c.skip(
-                "B-041 case design TBD: needs concrete sync→stream→sync cycle "
-                "fixture. Direct chain observation duplicates B-039; deadlock "
-                "observation requires saturating the threadpool."
-            )
-
-        await rec.run_case(
-            "stream.B-041.sync_chain_through_stream", body_b041,
-            tags=("bug_repro",), bug_ids=("B-041",),
-            **kw,
-        )
 
     # ====================================================================
     # EDGE cancellation between yields
@@ -482,11 +445,15 @@ class TestStreamSuite(Plugin):
                 pass
             await req.set_collected()
 
-            # Request entry should still be reaped within 30s via the
-            # cleanup_requests created_at fallback (B-043 covers reap window).
+            # GeneratorRequest entry: ``set_collected`` cancels the
+            # producer task (B-002 logic — distinct from Request which
+            # was migrated by the B-073 fix to direct dict
+            # pop). Producer's finally in ``_process_request_stream``
+            # then pops the entry from ``self.requests``. Entry should
+            # leave well within 30s via that path.
             deadline = time.perf_counter() + 30.0
             while time.perf_counter() < deadline:
-                if req_id not in self._plugin_core.requests:
+                if req_id not in self._plexus.requests:
                     return
                 await asyncio.sleep(0.5)
             raise AssertionError(

@@ -1,0 +1,15 @@
+description: Caller-identity fixture — disable/enable target for the lifecycle-exempt identity case
+version: "0.1.1"
+remote: false
+arguments:
+endpoints:
+  get_enable_capture:
+    internal_name: get_enable_capture
+    remote: false
+    accessible_by_other_plugins: true
+    description: Return the caller chain captured inside the last on_enable
+  get_disable_capture:
+    internal_name: get_disable_capture
+    remote: false
+    accessible_by_other_plugins: true
+    description: Return the caller chain captured inside the last on_disable

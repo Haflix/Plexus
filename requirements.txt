@@ -1,0 +1,5 @@
+PyYAML
+colorama
+cryptography
+msgpack
+packaging

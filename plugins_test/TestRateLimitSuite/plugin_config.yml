@@ -1,0 +1,65 @@
+description: Rate-limit charge-set precompute + OUT/IN/inbound-admit + config-load + observability integration suite (Steps 3b/3c/3d/3e/4/5)
+version: "0.14.0"
+remote: false
+arguments:
+events:
+  ev_x:
+    topic: "ratelimit/ev_x"
+    hosts: "local"
+  ev_sub:
+    # Topic matches the xsub subscription below so publishing ev_sub fans out to
+    # xsub -> TestRateLimitTarget.sink (drives the in_publish_skip IN case).
+    topic: "ratelimit/xsub/topic"
+    hosts: "local"
+subscriptions:
+  xsub:
+    topic: "ratelimit/xsub/topic"
+    target_plugin: TestRateLimitTarget
+    target_access_name: sink
+    hosts: "local"
+endpoints:
+  run:
+    internal_name: run
+    remote: false
+    accessible_by_other_plugins: true
+    description: Run the rate-limit charge-set cases and return a structured suite result dict
+    arguments:
+      - name: category
+      - name: host
+      - name: case_ids
+      - name: bug_ids
+      - name: skip_slow
+      - name: allow_destructive
+  ep_a:
+    internal_name: ep_a
+    remote: false
+    accessible_by_other_plugins: true
+    description: Probe endpoint for the endpoint-IN charge-set case
+    arguments:
+      - name: value
+  _rl_drive:
+    internal_name: _rl_drive
+    remote: false
+    accessible_by_other_plugins: true
+    description: One-hop nested execute helper so a real caller frame exists at the OUT admit (plugin_out / self-call cases)
+    arguments:
+      - name: target
+      - name: method
+  _rl_drive_as:
+    internal_name: _rl_drive_as
+    remote: false
+    accessible_by_other_plugins: true
+    description: Like _rl_drive but asserts author/author_id (impersonation attribution e2e case)
+    arguments:
+      - name: target
+      - name: method
+      - name: author
+      - name: author_id
+  ep_stream:
+    internal_name: ep_stream
+    remote: false
+    accessible_by_other_plugins: true
+    stream_weight: 2
+    description: Streaming probe endpoint for the IN stream_weight case (cost-2 open)
+    arguments:
+      - name: value

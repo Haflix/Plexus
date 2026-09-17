@@ -9,9 +9,6 @@ Exercises:
   - Stray top-level arguments: on plugin entry (legacy field warning)
   - Plugin with endpoints: null / absent loads with 0 endpoints
 
-All 15 cases map 1:1 to the test spec in notes.txt section I STEP 6 and
-section H TESTING.
-
 Fixture plugins used (all live in plugins_test/):
   TestPR2Fixture        — dict-form endpoints, no internal_name, no access_name field
   TestPR2ListFixture    — legacy list-form endpoints (should be rejected)
@@ -30,14 +27,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from typing import Any, Dict, List, Optional  # noqa: E402
 
-from utils import Plugin  # noqa: E402
-from decorators import async_log_errors, log_errors  # noqa: E402
-from PluginCore import apply_overrides  # noqa: E402
+from plexus.utils import Plugin  # noqa: E402
+from plexus.decorators import async_log_errors, log_errors  # noqa: E402
+from plexus.core import apply_overrides  # noqa: E402
+from plexus.exceptions import ConfigException  # noqa: E402
 
 from _test_helpers import CaseRecorder  # noqa: E402
 
 
-SUITE_VERSION = "0.1.0"
+SUITE_VERSION = "0.3.0"
 
 # Fixture plugin names (must match test_config.yml entries)
 FIXTURE        = "TestPR2Fixture"
@@ -72,7 +70,7 @@ class TestPR2Suite(Plugin):
         skip_slow: bool = False,
         allow_destructive: bool = True,
     ) -> Dict[str, Any]:
-        rec = CaseRecorder("TestPR2Suite", SUITE_VERSION, self._plugin_core)
+        rec = CaseRecorder("TestPR2Suite", SUITE_VERSION, self._plexus)
 
         kw = dict(
             case_ids_filter=case_ids,
@@ -99,6 +97,7 @@ class TestPR2Suite(Plugin):
         await self._case13_null_endpoints_loads_zero(rec, kw)
         await self._case14_empty_overrides_noop(rec, kw)
         await self._case15_description_override_reflected(rec, kw)
+        await self._case16_duplicate_plugin_name_rejected(rec, kw)
 
         return rec.to_dict()
 
@@ -107,16 +106,21 @@ class TestPR2Suite(Plugin):
     # ====================================================================
 
     def _find_yaml_entry(self, name: str) -> Optional[Dict[str, Any]]:
-        for entry in self._plugin_core.yaml_config.get("plugins", []):
+        for entry in self._plexus.yaml_config.get("plugins", []):
             if entry.get("name") == name:
                 return entry
         return None
 
     async def _ensure_unloaded(self, name: str) -> None:
-        """Pop a fixture if it somehow ended up loaded (cleanup helper)."""
-        if name in self._plugin_core.plugins:
+        """Pop a fixture if it somehow ended up loaded (cleanup helper).
+
+        B-094: a fail-fast config error leaves a FAILED_LOAD plugin_states entry
+        with no live instance, so clear a lingering state entry too, not just a
+        live instance. pop_plugin is a no-op for an already-UNLOADED config entry.
+        """
+        if name in self._plexus.plugins or name in self._plexus.plugin_states:
             try:
-                await self._plugin_core.pop_plugin(name)
+                await self._plexus.pop_plugin(name)
             except Exception:
                 pass
 
@@ -135,8 +139,8 @@ class TestPR2Suite(Plugin):
         entry_copy["enabled"] = True
         if overrides is not None:
             entry_copy["overrides"] = overrides
-        await self._plugin_core.load_plugin_with_conf(entry_copy)
-        return name in self._plugin_core.plugins
+        await self._plexus.load_plugin_with_conf(entry_copy)
+        return name in self._plexus.plugins
 
     # ====================================================================
     # Case 01 — list-form endpoints → load fails with dict-form error
@@ -145,14 +149,11 @@ class TestPR2Suite(Plugin):
     async def _case01_list_form_rejected(self, rec: CaseRecorder, kw: dict) -> None:
         async def body(c):
             await self._ensure_unloaded(LIST_FIXTURE)
-            loaded = await self._load_fixture(LIST_FIXTURE)
-            # The plugin should NOT be present — error_config calls pop_plugin
-            if loaded:
-                c.set_marker("plugin_loaded_despite_list_form")
-                raise AssertionError(
-                    "list-form endpoints should cause load failure "
-                    "but plugin ended up in core.plugins"
-                )
+            # B-094: config-level load failures now fail fast —
+            # load_plugin_with_conf raises ConfigException (previously it logged
+            # + popped silently and the plugin was merely absent).
+            c.expect_exception(ConfigException, match=r"list-form")
+            await self._load_fixture(LIST_FIXTURE)
 
         await rec.run_case(
             "pr2.config.list_form_endpoints_rejected",
@@ -174,7 +175,7 @@ class TestPR2Suite(Plugin):
                     f"{FIXTURE} failed to load (not in core.plugins)"
                 )
             try:
-                await self._plugin_core._enable_plugin(FIXTURE)
+                await self._plexus.enable_plugin(FIXTURE)
                 result = await self.execute(FIXTURE, "ping")
                 c.expect(result, "pong")
             finally:
@@ -200,19 +201,19 @@ class TestPR2Suite(Plugin):
             if not loaded:
                 raise AssertionError(f"{FIXTURE} failed to load")
             try:
-                plugin = self._plugin_core.plugins[FIXTURE]
+                plugin = self._plexus.plugins[FIXTURE]
                 ep = plugin.endpoints.get("ping")
                 if ep is None:
                     raise AssertionError("endpoint 'ping' not found in plugin.endpoints")
                 # internal_name absent in config → defaults to key at call time
-                # (PluginCore._call_endpoint uses ep.get("internal_name") or function_name)
+                # (Plexus._call_endpoint uses ep.get("internal_name") or function_name)
                 if "internal_name" in ep:
                     raise AssertionError(
                         f"expected no internal_name key in stored endpoint dict, "
                         f"got: {ep!r}"
                     )
                 # Verify dispatch actually resolves the key as the method name
-                await self._plugin_core._enable_plugin(FIXTURE)
+                await self._plexus.enable_plugin(FIXTURE)
                 result = await self.execute(FIXTURE, "ping")
                 c.expect(result, "pong")
             finally:
@@ -238,7 +239,7 @@ class TestPR2Suite(Plugin):
             if not loaded:
                 raise AssertionError(f"{FIXTURE} failed to load")
             try:
-                plugin = self._plugin_core.plugins[FIXTURE]
+                plugin = self._plexus.plugins[FIXTURE]
                 # The key 'ping' IS the access_name — no access_name field needed
                 ep = plugin.endpoints.get("ping")
                 if ep is None:
@@ -274,7 +275,7 @@ class TestPR2Suite(Plugin):
             if not loaded:
                 raise AssertionError(f"{MATCH} failed to load")
             try:
-                plugin = self._plugin_core.plugins[MATCH]
+                plugin = self._plexus.plugins[MATCH]
                 # Endpoint must be accessible under the key 'ping'
                 ep = plugin.endpoints.get("ping")
                 if ep is None:
@@ -283,7 +284,7 @@ class TestPR2Suite(Plugin):
                         f"{MATCH} (access_name field == key)"
                     )
                 # Dispatch works
-                await self._plugin_core._enable_plugin(MATCH)
+                await self._plexus.enable_plugin(MATCH)
                 result = await self.execute(MATCH, "ping")
                 c.expect(result, "pong")
             finally:
@@ -309,7 +310,7 @@ class TestPR2Suite(Plugin):
             if not loaded:
                 raise AssertionError(f"{MISMATCH} failed to load")
             try:
-                plugin = self._plugin_core.plugins[MISMATCH]
+                plugin = self._plexus.plugins[MISMATCH]
                 # Endpoint must be accessible under the KEY 'ping', NOT 'wrong_name'
                 ep_by_key = plugin.endpoints.get("ping")
                 if ep_by_key is None:
@@ -324,7 +325,7 @@ class TestPR2Suite(Plugin):
                         "should only be accessible by key 'ping'"
                     )
                 # Dispatch works using the key
-                await self._plugin_core._enable_plugin(MISMATCH)
+                await self._plexus.enable_plugin(MISMATCH)
                 result = await self.execute(MISMATCH, "ping")
                 c.expect(result, "pong")
             finally:
@@ -414,20 +415,57 @@ class TestPR2Suite(Plugin):
                     }
                 }
             }
-            loaded = await self._load_fixture(FIXTURE, overrides=overrides)
-            if loaded:
-                c.set_marker("plugin_loaded_despite_missing_required_fields")
-                await self._ensure_unloaded(FIXTURE)
-                raise AssertionError(
-                    "__replace__ with missing required fields (remote, "
-                    "accessible_by_other_plugins) should cause fail-load (C12) "
-                    "but plugin ended up in core.plugins"
-                )
+            # B-094: fail-fast — __replace__ omitting required fields now raises
+            # ConfigException (C12; was: silent pop, plugin absent).
+            c.expect_exception(ConfigException, match=r"is missing")
+            await self._load_fixture(FIXTURE, overrides=overrides)
 
         await rec.run_case(
             "pr2.apply_overrides.replace_missing_required_fields_error",
             body,
             tags=("pr2", "overrides", "replace"),
+            **kw,
+        )
+
+    # ====================================================================
+    # Case 16 — HUNT-156: check_config_integrity rejects duplicate plugin names
+    # ====================================================================
+
+    async def _case16_duplicate_plugin_name_rejected(
+        self, rec: CaseRecorder, kw: dict
+    ) -> None:
+        async def body(c):
+            from plexus.utils import ConfigUtil
+            general = {
+                "hostname": "h", "plugin_package": "p", "console_log_level": "INFO",
+            }
+            networking = {
+                "enabled": False, "port": 0, "direct_discoverable": False,
+                "auto_discoverable": False, "discover_nodes": [],
+            }
+            # Control: distinct names (same source is fine) must NOT raise.
+            ConfigUtil.check_config_integrity({
+                "plugins": [
+                    {"name": "PR2DupA", "enabled": True, "path": "./a"},
+                    {"name": "PR2DupB", "enabled": True, "path": "./a"},
+                ],
+                "general": general, "networking": networking,
+            })
+            # HUNT-156: two entries sharing a name must raise ConfigException
+            # (was: silent last-wins teardown of the first instance).
+            c.expect_exception(ConfigException, match=r"[Dd]uplicate plugin name")
+            ConfigUtil.check_config_integrity({
+                "plugins": [
+                    {"name": "PR2Dup", "enabled": True, "path": "./a"},
+                    {"name": "PR2Dup", "enabled": True, "path": "./b"},
+                ],
+                "general": general, "networking": networking,
+            })
+
+        await rec.run_case(
+            "pr2.duplicate_plugin_name_rejected",
+            body,
+            tags=("pr2", "config", "hunt156"),
             **kw,
         )
 
@@ -556,8 +594,8 @@ class TestPR2Suite(Plugin):
             entry_copy["enabled"] = True
             entry_copy["arguments"] = {"stray_key": "stray_value"}
 
-            await self._plugin_core.load_plugin_with_conf(entry_copy)
-            loaded = FIXTURE in self._plugin_core.plugins
+            await self._plexus.load_plugin_with_conf(entry_copy)
+            loaded = FIXTURE in self._plexus.plugins
             try:
                 if not loaded:
                     raise AssertionError(
@@ -590,7 +628,7 @@ class TestPR2Suite(Plugin):
                         f"{NULL_FIXTURE} failed to load — plugin with "
                         "endpoints: null should load with 0 endpoints"
                     )
-                plugin = self._plugin_core.plugins[NULL_FIXTURE]
+                plugin = self._plexus.plugins[NULL_FIXTURE]
                 ep_count = len(plugin.endpoints) if hasattr(plugin, "endpoints") else -1
                 c.expect(ep_count, 0)
             finally:
@@ -649,7 +687,7 @@ class TestPR2Suite(Plugin):
             if not loaded:
                 raise AssertionError(f"{FIXTURE} failed to load with description override")
             try:
-                plugin = self._plugin_core.plugins[FIXTURE]
+                plugin = self._plexus.plugins[FIXTURE]
                 c.expect(plugin.description, "overridden description")
             finally:
                 await self._ensure_unloaded(FIXTURE)

@@ -7,5 +7,5 @@ endpoints:
     tags:
     remote: True
     accessible_by_other_plugins: True
-    description: Trivial endpoint; the bug is detected by Sentinel's absence after this plugin breaks the load loop
+    description: Trivial endpoint; the fixture's point is its MISSING version field, not this endpoint
     arguments:

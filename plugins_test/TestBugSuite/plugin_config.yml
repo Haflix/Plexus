@@ -1,0 +1,74 @@
+description: PR3 Stage F bughunt repro suite — one case per open bugtracker entry
+version: "0.8.0"
+remote: false
+arguments:
+events:
+  # B-047 task_list-growth probe event. Topic matched by self-sub
+  # `b047_probe_sub` so each publish_event creates one fan-out task,
+  # exercising the task_list.append code path the bug describes.
+  b047_probe_event:
+    topic: "test_bugsuite/b047/probe"
+    hosts: "local"
+  # B-021 regression: request_event must skip a non-eligible sub that is
+  # EARLIER in insertion order and fall through to an eligible later one.
+  b021_event:
+    topic: "test_bugsuite/b021/leaf"
+    hosts: "local"
+subscriptions:
+  b047_probe_sub:
+    topic: "test_bugsuite/b047/probe"
+    target_access_name: handle_b047_probe
+    hosts: "local"
+  # B-021: two subs on the SAME topic. Declaration order = find_all
+  # insertion order. The FIRST sets blocked_authors=[TestBugSuite] (the
+  # publisher), so it does NOT accept this suite as author and request_event
+  # must SKIP it; the SECOND is eligible and must be the one that answers.
+  b021_blocked_first:
+    topic: "test_bugsuite/b021/leaf"
+    target_access_name: handle_b021_blocked
+    hosts: "local"
+    blocked_authors:
+      - TestBugSuite
+  b021_eligible_second:
+    topic: "test_bugsuite/b021/leaf"
+    target_access_name: handle_b021_eligible
+    hosts: "local"
+endpoints:
+  run:
+    internal_name: run
+    tags:
+    remote: false
+    accessible_by_other_plugins: true
+    description: Run the bug-repro suite and return a structured suite result dict
+    arguments:
+      - name: category
+        description: 'legacy_removed | addressed_in_pr3 | active | deferred | already_covered | null (all)'
+      - name: host
+        description: 'local | remote | null'
+      - name: case_ids
+        description: Filter cases within the suite
+      - name: bug_ids
+        description: Filter cases by bug tag
+      - name: skip_slow
+      - name: allow_destructive
+  handle_b047_probe:
+    internal_name: handle_b047_probe
+    remote: false
+    accessible_by_other_plugins: true
+    description: No-op subscriber used by B-047 task_list growth repro
+    arguments:
+      - name: event
+  handle_b021_blocked:
+    internal_name: handle_b021_blocked
+    remote: false
+    accessible_by_other_plugins: true
+    description: B-021 non-eligible subscriber (blocks the publisher); must be skipped
+    arguments:
+      - name: event
+  handle_b021_eligible:
+    internal_name: handle_b021_eligible
+    remote: false
+    accessible_by_other_plugins: true
+    description: B-021 eligible fall-through subscriber
+    arguments:
+      - name: event

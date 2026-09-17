@@ -1,0 +1,29 @@
+description: Multinode cooperative cell driver — runs on the driver node, drives the cooperative socket cells via the four primitives + NetObsProbe/NetCtl, writes a CaseRecorder result file (group/cell selected by env)
+version: 0.3.0
+remote: False
+arguments:
+subscriptions:
+events:
+  ev_probe:
+    topic: fix/probe
+  ev_fanout:
+    topic: fix/fanout
+  ev_nosub:
+    topic: fix/nosub
+  ev_leafonly:
+    topic: fix/leafonly
+  ev_toggle:
+    topic: fix/toggle
+  ev_remoteonly:
+    topic: w2/remoteonly
+  ev_who:
+    topic: fix/who
+  ev_nomatch:
+    topic: fix/nosub_anywhere
+  # B-092 sender-side host-gate cell. A DEDICATED topic with no standing
+  # NetFixTarget sub (unlike fix/fanout), so the only sub on it is the one the
+  # cell adds via ctl_sub_add — the scheduled count + fanout_log then reflect
+  # the sender predicate's decision alone, uncontaminated.
+  ev_b092:
+    topic: fix/b092
+endpoints:

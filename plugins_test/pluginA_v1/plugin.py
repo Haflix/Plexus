@@ -1,5 +1,5 @@
-from utils import Plugin
-from decorators import (
+from plexus.utils import Plugin
+from plexus.decorators import (
     log_errors,
     handle_errors,
     async_log_errors,
@@ -40,7 +40,7 @@ class PluginA(Plugin):
         result = await self.execute("PluginB", "calculate_square", argument)
         for i in range(25):
             await asyncio.sleep(0.5)
-            yield result  # we live in a society
+            yield result
         yield "ended stream test"
 
     @async_log_errors
@@ -48,5 +48,5 @@ class PluginA(Plugin):
         result = await self.execute("PluginB", "calculate_square", argument)
         for i in range(25):
             await asyncio.sleep(0.5)
-            self._logger.info(f"Background stream: {i}")  # we live in a society
+            self._logger.info(f"Background stream: {i}")
         self._logger.info("ended background stream")

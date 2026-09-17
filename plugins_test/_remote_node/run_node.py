@@ -1,4 +1,4 @@
-"""Headless PluginCore subprocess for Phase 5 remote tests.
+"""Headless Plexus subprocess for Phase 5 remote tests.
 
 Used by TestRemoteSuite to bring up a peer node on localhost. The subprocess
 loads only the TestRemote* fixtures and writes a ready-file once
@@ -23,22 +23,46 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from PluginCore import PluginCore  # noqa: E402
+from plexus.core import Plexus  # noqa: E402
+from plugins_test._runner_cli import build_runner_parser  # noqa: E402
 
 
 async def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--config", required=True)
-    ap.add_argument("--port", type=int, required=True)
-    ap.add_argument("--ready-file", required=True)
+    # C-181: shared CLI parser. Legacy --parent-* aliases preserved
+    # so this runner's existing test harness keeps working.
+    ap = build_runner_parser(
+        description="TestRemoteSuite remote-node subprocess (Phase 5).",
+    )
     args = ap.parse_args()
 
-    pc = PluginCore(args.config)
+    pc = Plexus(args.config)
 
     # Override port BEFORE wait_until_ready: NetworkManager is constructed
-    # there and reads pc.networking_port (the INSTANCE attribute), not yaml.
+    # there via ``_build_network_manager``, which reads
+    # ``yaml_config["networking"]["port"]`` (NOT the ``pc.networking_port``
+    # instance attribute). The instance
+    # attribute write below is kept for parity with code paths that
+    # still read ``self.networking_*`` (e.g. apply_configvalues' own
+    # state); the yaml write is the load-bearing one for construction.
     pc.networking_port = args.port
-    pc.yaml_config.setdefault("networking", {})["port"] = args.port
+    nw_cfg = pc.yaml_config.setdefault("networking", {})
+    nw_cfg["port"] = args.port
+
+    if args.keys_dir is not None:
+        nw_cfg["keys_dir"] = args.keys_dir
+    # C-181: --peer-* is canonical; --parent-* legacy aliases write to
+    # the same args.peer_* attrs via dest=.
+    if args.peer_cert_pem_file is not None:
+        peer_cert_pem = Path(args.peer_cert_pem_file).read_text(encoding="utf-8")
+        nw_cfg["peers"] = [
+            {
+                "hostname": args.peer_hostname,
+                "address": f"{args.peer_ip}:{args.peer_port}",
+                "cert_pem": peer_cert_pem,
+                "system_caller": False,
+            },
+        ]
+        nw_cfg.pop("node_ips", None)
 
     await pc.wait_until_ready()
 

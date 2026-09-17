@@ -1,13 +1,57 @@
-# Plugin Templates for AIO Assistant Core
+# Plugin Templates & Demo for Plexus (AIO Assistant Core)
 
-This folder contains templates and examples for creating plugins in the AIO Assistant Core system.
+This folder is both a **copy-paste template** for new plugins and a **small
+runnable demo** of the framework. Two plugins talk to each other: `SensorPlugin`
+emits readings and `AveragePlugin` averages them, exercising most of the
+framework surface (events, inter-plugin calls, rate limiting, capabilities, the
+sync bridge, dependencies, tags).
 
 ## Contents
 
-- **AveragePlugin/**: A complete example plugin demonstrating all core features
-  - `plugin.py`: Plugin implementation with examples of different method types
-  - `plugin_config.yml`: Configuration file with full endpoint documentation
-- **config_structures.txt**: Documentation of config.yml and plugin_config.yml structures
+- **SensorPlugin/** — a demo data source (a fake sensor).
+  - `plugin.py`, `plugin_config.yml` — publishes a `reading` event, exposes
+    `read` / `read_stream`, self-declares rate limits, tags an endpoint.
+- **AveragePlugin/** — a demo aggregator/orchestrator (the comprehensive
+  template to copy).
+  - `plugin.py`, `plugin_config.yml` — subscribes to readings, exposes sync +
+    async + generator endpoints, calls SensorPlugin, asserts an identity
+    (capabilities), discovers endpoints by tag, declares a dependency.
+- **demo_config.yml** — a runnable main config wiring both plugins (with
+  `rate_limits:` and `capabilities:` examples; networking off). Named
+  `demo_config.yml` rather than `config.yml` only because the repo's `.gitignore`
+  excludes `config.yml` (the local user copy); it is an ordinary main config.
+- **run_demo.py** — boots `demo_config.yml` and drives a short scripted scenario.
+- **config_structures.txt** — terse cheat-sheet of the full config.yml /
+  plugin_config.yml schema.
+
+## Run the demo
+
+From the repo root:
+
+```bash
+python copypasta/run_demo.py
+```
+
+You will see the two plugins boot, SensorPlugin's readings flow into
+AveragePlugin's running average, an on-demand `execute()` call, a capability
+assertion (allowed for the granted identity, denied otherwise), and the rate
+limiter rejecting once a bucket runs dry. Read `run_demo.py` top-to-bottom as a
+worked example of driving Plexus from outside a plugin.
+
+## What the demo shows (and where to look)
+
+| Feature | Where |
+| --- | --- |
+| Lifecycle + the `self.ready` gate | `AveragePlugin.on_enable` |
+| Publish an event (`events:` block) | `SensorPlugin.emit_reading` |
+| Subscribe to an event (`subscriptions:`) | `AveragePlugin.handle_reading` |
+| Sync method / sync generator | `AveragePlugin.average` / `recorded_values` |
+| Async streaming endpoint | `SensorPlugin.read_stream` |
+| Call another plugin (`execute`) | `AveragePlugin.pull_reading` |
+| Capabilities (assert an identity) | `AveragePlugin.try_act_as` + `demo_config.yml` — see [docs/capabilities.md](../docs/capabilities.md) |
+| Rate limiting (self-declared + operator override) | both manifests' `rate_limits:` + `demo_config.yml` — see [docs/rate_limiting.md](../docs/rate_limiting.md) |
+| Endpoint discovery by tag | `AveragePlugin.discover_sensors` |
+| Dependencies | `AveragePlugin` manifest `dependencies:` |
 
 ## Quick Start: Creating a New Plugin
 
@@ -88,46 +132,56 @@ async for item in self.execute_stream("PluginName", "stream_method", args, hosts
     print(item)
 ```
 
-### Topic-Based Communication (Notifier System)
+### Topic-Based Communication (Event System)
 
-Use topics to decouple plugins — the caller doesn't need to know which plugin handles the request.
+Use topics to decouple plugins — the caller doesn't need to know which plugin handles the request. Publishers declare named events in `plugin_config.yml`; subscribers declare topic patterns plus a target endpoint that receives an `Event` object.
 
 ```python
-# Fire-and-forget (one-to-many) — all subscribers are called
-count = await self.notify("sensor/temperature", {"value": 22.5})
+# Fire-and-forget (one-to-many) — all subscribers receive the Event
+count = await self.publish_event("sensor_temp", payload={"value": 22.5})
 
-# Request-by-topic (one-to-one with response) — first matching handler
-result = await self.request_topic("ai/chat", {"message": "hello"})
+# Request-by-event (one-to-one with response) — first matching handler
+result = await self.request_event("ai_chat", payload={"message": "hello"})
 
-# Streaming request-by-topic
-async for chunk in self.request_topic_stream("ai/stream", args):
+# Streaming request-by-event
+async for chunk in self.request_event_stream("ai_stream", payload=args):
     print(chunk)
 
 # Sync variants available too:
-self.notify_sync("sensor/temperature", {"value": 22.5})
-result = self.request_topic_sync("ai/chat", {"message": "hello"})
+self.publish_event_sync("sensor_temp", payload={"value": 22.5})
+result = self.request_event_sync("ai_chat", payload={"message": "hello"})
 ```
 
 **Subscribing to topics — two ways:**
 
-1. **Config-driven** (in plugin_config.yml):
+1. **Config-driven** (in `plugin_config.yml`):
 ```yaml
+subscriptions:
+  handle_chat_sub:
+    topic: "ai/chat"
+    target_access_name: handle_chat
+    hosts: "any"
 endpoints:
-  - internal_name: _handle_chat
-    access_name: handle_chat
-    topic: "ai/chat"            # auto-subscribed on plugin load
+  handle_chat:
+    internal_name: handle_chat
     remote: True
     accessible_by_other_plugins: True
+    arguments:
+      - name: event
 ```
 
 2. **Code-driven** (at runtime, typically in `on_enable`):
 ```python
 async def on_enable(self):
-    self._sub_id = await self.subscribe("events/*", self._on_event)
+    self._sub_id = await self.subscribe(
+        "events/*", target_access_name="my_event_handler"
+    )
 
 async def on_disable(self):
     await self.unsubscribe(self._sub_id)
 ```
+
+The handler endpoint receives an `Event` object: `event.topic`, `event.payload`, `event.author`, `event.author_host`.
 
 **Topics** use `/` as separator. Single-level wildcard `*` matches one segment:
 - `sensor/*/temperature` matches `sensor/bathroom/temperature`
@@ -136,9 +190,11 @@ async def on_disable(self):
 ### Accessing Plugin Properties
 
 - **`self._logger`**: Logger instance for your plugin
-- **`self._plugin_core`**: Reference to the PluginCore instance
 - **`self.plugin_name`**: Your plugin's name
-- **`self.enabled`**: Whether the plugin is currently enabled
+- **`self.plugin_uuid`**: Stable UUID for this plugin instance (changes on reload)
+- **`self.enabled`**: Whether the plugin is currently enabled (read-only since v0.26.0 — use `plx.enable_plugin` / `plx.disable_plugin` instead)
+- **`self.ready`**: `asyncio.Event` you can `clear()` in `on_enable` and `set()` after async setup finishes — gates cross-plugin calls into this plugin
+- **`self._plexus`**: Reference to the Plexus instance. Escape hatch for advanced cases (e.g. toggling another plugin's event). Most APIs you'd reach through `self._plexus` already have first-class `self.*` wrappers — prefer those
 
 ## Configuration Files
 
@@ -149,11 +205,13 @@ description: str                 # What your plugin does
 version: str                     # Semantic version (e.g., "1.0.0")
 remote: boolean                  # Allow remote access
 arguments:                       # Optional: Load-time arguments
-endpoints:
-  - internal_name: method_name   # Method in your class
-    access_name: method_name     # Name others use to call it
-    topic: "some/topic"          # Optional: Subscribe to a notifier topic
-    tags: []                     # Optional categorization tags
+prefix: str                      # Optional: Topic template prefix. Default: plugin_name.
+verbose_notifier: boolean        # Optional: Verbose event-system logging. Default: false.
+
+endpoints:                       # Dict keyed by access_name (NOT a list)
+  method_name:                   # Outer key = access_name (what callers use)
+    internal_name: method_name   # Optional: Python method on the class. Defaults to outer key.
+    tags: []                     # Optional: For find_endpoints_by_tag
     remote: boolean              # Allow remote calls
     accessible_by_other_plugins: boolean
     description: str             # What the method does
@@ -161,6 +219,18 @@ endpoints:
       - name: param_name
         type: str                # int, str, dict, list, any, bool, float
         description: str
+
+subscriptions:                   # Dict keyed by declared_id. Replaces the
+                                 # legacy per-endpoint `topic:` field.
+  my_sub:
+    topic: "some/topic"          # Topic pattern (supports `*` wildcard per segment)
+    target_access_name: method_name  # Endpoint that receives the Event
+
+events:                          # Dict keyed by event_id — declares what
+                                 # this plugin publishes.
+  my_event:
+    topic: "{prefix}/something"
+    hosts: "any"                 # Default "local"; use "any" for cross-node delivery
 ```
 
 ### config.yml Plugin Entry
@@ -170,9 +240,20 @@ plugins:
   - name: YourPluginName          # Must match class name
     enabled: true                 # Load on startup
     path: ./path/to/plugin        # Optional: explicit path
-    arguments:                    # Optional: Pass data to plugin
-      key: value
+    overrides:                    # Optional: deep-merge into the plugin's
+                                  # own plugin_config.yml at load time.
+      arguments:                  # Forwarded to on_load.
+        key: value
+      verbose_notifier: true
+      endpoints:
+        method_name:
+          remote: true
 ```
+
+Note: A top-level `arguments:` on the plugin entry (rather than inside
+`overrides:`) is ignored with a renamed-key warning. `arguments:`
+belongs either in the plugin's own `plugin_config.yml` or in an
+`overrides:` block.
 
 ## Examples
 
@@ -218,7 +299,7 @@ async def call_other(self):
 
 ## Tags
 
-Tags are arbitrary strings you can assign to endpoints for categorization. Other plugins can use `find_endpoints_by_tag(tag)` on the PluginCore to discover endpoints with a specific tag. This is useful for building systems where plugins need to dynamically discover each other's capabilities.
+Tags are arbitrary strings you can assign to endpoints for categorization. Other plugins can use `find_endpoints_by_tag(tag)` on the Plexus to discover endpoints with a specific tag. This is useful for building systems where plugins need to dynamically discover each other's capabilities.
 
 The AI system uses mode-based tags to discover tools at runtime:
 - `AI-minimum` — Available in all modes (device control, weather)
