@@ -42,6 +42,14 @@ dependencies = [
     "packaging",
 ]
 
+[project.urls]
+Homepage = "https://github.com/Haflix/Plexus"
+Repository = "https://github.com/Haflix/Plexus"
+# Points at `unstable` deliberately: it is the branch carrying the current
+# framework and the docs/ tree. See the branch note in the README.
+Documentation = "https://github.com/Haflix/Plexus/tree/unstable/docs"
+Issues = "https://github.com/Haflix/Plexus/issues"
+
 [project.optional-dependencies]
 # Faster event loop. Optional; install with `pip install plexus-core[fastloop]`.
 # Picks the right backend per platform — uvloop is POSIX-only, winloop is its
