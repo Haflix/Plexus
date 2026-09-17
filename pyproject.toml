@@ -45,9 +45,7 @@ dependencies = [
 [project.urls]
 Homepage = "https://github.com/Haflix/Plexus"
 Repository = "https://github.com/Haflix/Plexus"
-# Points at `unstable` deliberately: it is the branch carrying the current
-# framework and the docs/ tree. See the branch note in the README.
-Documentation = "https://github.com/Haflix/Plexus/tree/unstable/docs"
+Documentation = "https://github.com/Haflix/Plexus/tree/main/docs"
 Issues = "https://github.com/Haflix/Plexus/issues"
 
 [project.optional-dependencies]
