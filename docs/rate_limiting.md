@@ -33,10 +33,11 @@ Two properties matter:
   once (for example an endpoint call charges both its per-endpoint and its
   per-plugin bucket). The limiter checks them all first and only deducts if every
   bucket can pay. If any one is empty, nothing is deducted and that bucket is
-  reported as the binding limit. A reject never half-drains the others — with one
-  exception: on the inbound peer path `nodes_in` and `framework_in` are charged by
-  two separate admits, so a `framework_in` reject leaves the peer's `nodes_in`
-  token already deducted (tracked as B-108).
+  reported as the binding limit. A reject never half-drains the others *within one
+  admit*. The inbound peer path is deliberately not one admit: `nodes_in` is charged
+  first, as an ATTEMPTS counter, and stands even when a later step rejects — whether
+  that later step is the anti-spoof check, the live-roster re-check, or `framework_in`.
+  So a peer that fails any of those three still spends a `nodes_in` token, by design.
 
 ---
 

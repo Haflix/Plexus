@@ -157,9 +157,10 @@ Override semantics:
 
 - **Plugin-level scalars** (`description`, `remote`, `version`,
   `prefix`, `verbose_notifier`) — value-replace.
-- **`endpoints:`** — STRICT. Unknown sub-keys under an endpoint
-  override are fail-load errors. Protects against typos that would
-  silently change nothing. Driven by the module-level
+- **`endpoints:`** — STRICT at the *name* level only. An unknown endpoint
+  NAME is a fail-load error; keys *inside* a known endpoint body are
+  merged leniently and an unknown one is added, not rejected (see the
+  worked example below). Driven by the module-level
   `_STRICT_OVERRIDE_SECTIONS = frozenset({"endpoints"})` in
   `plexus/helpers/config.py`.
 - **`arguments:`**, **`events:`**, **`subscriptions:`** — LENIENT.
