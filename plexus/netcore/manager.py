@@ -88,7 +88,7 @@ class NetworkManager:
             raise RuntimeError(
                 "networking.node_ips: is a REMOVED schema, replaced by networking.peers:. "
                 "Migrate each node to a peers: entry (hostname / address / "
-                "cert_file|cert_pem). See docs/networking.md and docs/configuration.md."
+                "cert_pem). See docs/networking.md and docs/configuration.md."
             )
         self._config_dir = Path(config_dir) if config_dir else Path(".")
 

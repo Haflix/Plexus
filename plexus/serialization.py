@@ -317,8 +317,8 @@ def generate_keypair(keys_dir: str, hostname: str) -> Tuple[Path, Path, str, str
 
     Fingerprint is `sha256:<hex>` of the SubjectPublicKeyInfo DER.
     cert_pem_text is the PEM string suitable for pasting into another
-    node's peers[].cert_pem field (or written to a file referenced by
-    cert_file).
+    node's peers[].cert_pem field, which is the only supported form --
+    there is no per-peer cert_file option.
 
     Cert validity is 100 years. BasicConstraints(ca=True) is set as a
     critical extension because OpenSSL requires this when the cert is

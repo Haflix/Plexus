@@ -1,6 +1,6 @@
 # Rate Limiting
 
-*Last updated for Plexus 0.81.0*
+*Last updated for Plexus 0.81.1*
 
 Plexus has a built-in, multi-dimensional token-bucket rate limiter. It is
 **opt-in and off by default**: a node with no `rate_limits:` configured pays
@@ -90,12 +90,12 @@ its own endpoint) charges both its `plugin_out` at OUT and its `plugin_in` at IN
 
 **Remote operations** add Nodes-IN. When a call arrives from a remote peer, the
 inbound networking handler charges `nodes_in(peer)` once; the global
-`framework_in` is charged once per remote operation on every path except a remote
-`request_event_stream`, which is charged twice — once at `authorize_inbound` and
-again on the re-entry's OUT admit (tracked as B-107). Otherwise it is charged via the
-handler's re-entry into the local dispatch for execute, or directly in the event
-handlers). Per-peer flooding is reported as the `nodes_in` dimension rather than
-the global cap.
+`framework_in` is charged once per remote operation — via the handler's re-entry
+into the local dispatch for execute, or directly in the event handlers. The one
+exception is a remote `request_event_stream`, which is charged twice: once at
+`authorize_inbound` and again on its re-entry's OUT admit (tracked as B-107).
+Per-peer flooding is reported as the `nodes_in` dimension rather than the global
+cap.
 
 ### Who is charged
 

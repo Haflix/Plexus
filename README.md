@@ -1,6 +1,6 @@
 # Plexus
 
-*Last updated for Plexus 0.81.0*
+*Last updated for Plexus 0.81.1*
 
 An async Python plugin framework with multi-node mTLS networking and pub/sub
 event routing. PyPI package: [`plexus-core`](https://pypi.org/project/plexus-core/).
@@ -86,8 +86,10 @@ cp config.example.yml config.yml
 
 ## Quickstart
 
-A plugin lives in its own folder containing exactly two files: `plugin.py`
-(the class) and `plugin_config.yml` (declarative metadata).
+A plugin lives in its own folder containing two required files: `plugin.py`
+(the class) and `plugin_config.yml` (declarative metadata). It may ship further
+modules or sub-packages alongside them; the loader puts the plugin directory on
+`sys.path` so `plugin.py` can import them.
 
 Here is a minimal plugin showing the moving parts: lifecycle hooks, a regular
 endpoint, a streaming endpoint, a cross-plugin call, and a topic-subscribed

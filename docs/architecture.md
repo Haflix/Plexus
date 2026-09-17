@@ -1,6 +1,6 @@
 # Architecture
 
-*Last updated for Plexus 0.81.0*
+*Last updated for Plexus 0.81.1*
 
 This document describes the runtime shape of a Plexus process: how Plexus loads plugins, how the lifecycle hooks fire, what guarantees the framework gives during hot-swap and shutdown, and how the three-tier discipline organises the plugins themselves.
 

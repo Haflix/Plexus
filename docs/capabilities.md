@@ -1,6 +1,6 @@
 # Capabilities and Caller Identity
 
-*Last updated for Plexus 0.81.0*
+*Last updated for Plexus 0.81.1*
 
 Every call in Plexus carries a **caller identity**: the framework knows which
 plugin initiated each operation and the chain of plugins it passed through.

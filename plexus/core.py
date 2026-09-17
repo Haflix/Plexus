@@ -6205,11 +6205,14 @@ class Plexus(EventMixin):
         window are silent (the ``Bucket.rejected`` counter carries the volume);
         the next reject after the window emits a one-line summary of what was
         suppressed, then a fresh WARNING. Self-contained so it is callable from
-        every reject path -- the message sites (via ``_rl_reject_message``, which
-        passes ``loc`` pre-resolved and the binding ``cost``) AND the silent
-        fire-and-forget peer-publish drop in the networking layer (which passes
-        no ``loc``). Never raises on the reject path (a logging fault must not
-        mask a throttle).
+        every reject path, but since the netcore rewrite the only live caller is
+        ``_rl_reject_message`` (which passes ``loc`` pre-resolved and the binding
+        ``cost``). The networking layer no longer routes rejects here: an inbound
+        peer reject is reported by netcore as ``_core/net/reject`` and never
+        reaches this logger, so ``nodes_in`` never appears on the
+        ``_core/ratelimit/rejected`` feed and produces no [RATELIMIT] WARNING
+        (B-106). Never raises on the reject path (a logging fault must not mask a
+        throttle).
 
         The SAME first-per-window gate drives the ``_core/ratelimit/rejected``
         internal-bus emit (Section 13, the observability seam mirroring the
@@ -6299,9 +6302,18 @@ class Plexus(EventMixin):
 
     def _rl_admit_inbound(self, peer, include_framework, now=None):
         """Networking inbound admit (Step 3e): per-remote-peer Nodes-IN, plus (for
-        the event handlers) Framework-IN, as ONE atomic admit. Returns the first
-        dry bucket (the handler rejects per its own convention) or None when
-        admitted / nothing configured.
+        the event handlers) Framework-IN. Returns the first dry bucket (the
+        handler rejects per its own convention) or None when admitted / nothing
+        configured.
+
+        NOTE the combined ``include_framework=True`` mode -- both dimensions in
+        ONE all-or-nothing admit -- has no production caller. The netcore seam
+        (``_RateSeam.charge_nodes_in`` / ``charge_framework_in``) calls this
+        TWICE with disjoint bucket sets, so Nodes-IN is already committed before
+        Framework-IN is peeked. That is deliberate: dispatch charges Nodes-IN
+        first as an ATTEMPTS counter that stands even when a later step rejects,
+        anti-spoof and roster re-check alike, not just Framework-IN. The combined
+        path is exercised only by TestRateLimitSuite (B-108).
 
         Nodes-IN is the one DYNAMIC-key dimension: the per-peer bucket is lazily
         get-or-created on first contact from the `_rate_limit_nodes_in_config`
@@ -6318,7 +6330,10 @@ class Plexus(EventMixin):
 
         Execute handlers pass `include_framework=False` (Framework-IN is charged
         by their re-entry into `plexus.execute` / `plexus.execute_stream`);
-        charging it here too would double-charge. Event handlers pass True.
+        charging it here too would double-charge. Event handlers pass True -- but
+        note a remote `request_event_stream` ALSO re-charges Framework-IN on its
+        own re-entry (`_create_gen_request_gated` -> `_rl_admit_out`), so that
+        one path is currently charged twice (B-107).
         """
         buckets = []
         cfg = self._rate_limit_nodes_in_config
