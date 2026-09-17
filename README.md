@@ -2,8 +2,9 @@
 
 *Last updated for Plexus 0.81.1*
 
-An async Python plugin framework with multi-node mTLS networking and pub/sub
-event routing. PyPI package: [`plexus-core`](https://pypi.org/project/plexus-core/).
+An async Python plugin framework for systems that span devices: hot-swap plugins at
+runtime, run them across machines over pinned mTLS, and let a model discover and call
+them by tag. PyPI package: [`plexus-core`](https://pypi.org/project/plexus-core/).
 
 `Plexus` loads small, single-responsibility Python classes — *plugins* — from
 disk, drives a deterministic `on_load` / `on_enable` / `on_disable` lifecycle,
@@ -18,10 +19,34 @@ protocol (`NetworkManager`), so the same `execute` / `publish_event` /
 `request_event` calls transparently fan out to peer machines whose plugins
 are flagged `remote: true`.
 
-A typical deployment in conversational AI, data-pipeline, or event-driven
-domains wires together base plugins (a Discord bot, a Postgres adapter, an
-LLM adapter, a TTS pipeline) with orchestrator plugins that hold the
-business logic — each one a class plus a YAML manifest.
+![The Plexus TUI showing live plugin states and hot-swap controls](https://raw.githubusercontent.com/Haflix/Plexus/main/docs/img/tui-plugins.png)
+
+<sub>A running node seen through [PlexusTUI](https://github.com/Haflix/PlexusTUI), a
+separate plugin. Plugins carry live lifecycle states, and Enable / Disable / Reload
+act on them without stopping the process.</sub>
+
+## What it was built for
+
+Plexus is general-purpose, and a good deal of it has nothing to do with AI. But it
+was built to carry a home assistant that spans devices and lets a model act through
+it, and that origin explains the parts that look unusual for a plugin framework:
+
+- **Tag-based discovery**, so an orchestrator can ask *what can I call right now?*
+  instead of hardcoding plugin names. This is how a model gets handed a toolset.
+- **A capability model** governing which identity a plugin may claim — which starts
+  to matter the moment something acts on your behalf.
+- **A rate limiter** across seven dimensions, because a model can trigger a great
+  many calls very quickly.
+- **Hot-swap**, so a capability can be added, replaced or removed without
+  restarting the assistant around it.
+- **Pinned mTLS between nodes**, because "across devices" means across a network.
+
+None of it is mandatory. A plugin system that never sees a model uses the same
+lifecycle, the same three call styles, and simply ignores the rest.
+
+A typical deployment wires base plugins (a Discord bot, a Postgres adapter, an LLM
+adapter, a TTS pipeline) to orchestrator plugins holding the business logic — each
+one a class plus a YAML manifest.
 
 ---
 
@@ -45,8 +70,12 @@ business logic — each one a class plus a YAML manifest.
 - **Sync and async surfaces.** Every cross-plugin call has both an `async`
   form and a sync form that bridges to the loop, so plugins written against
   blocking libraries do not have to twist themselves into coroutines.
-- **Strict but small.** Around fifteen public methods on the Plugin base
-  class; everything else is YAML.
+- **Tag-based endpoint discovery.** `find_endpoints_by_tag("ai_tool")` returns
+  every matching endpoint across the cluster, so an orchestrator can build a
+  model's toolset at runtime rather than hardcoding it.
+- **Strict but small.** Around fifteen primitives on the `Plugin` base class,
+  plus the three lifecycle hooks and a sync form for most of them; everything
+  else is YAML.
 
 ---
 
@@ -244,6 +273,70 @@ endpoints, more events, more subscriptions.
 
 ---
 
+## Handing endpoints to a model
+
+Discovery is by tag, and the tag is applied by the *deployment*, not the plugin.
+So a plugin stays generic and the host decides what a model is allowed to see.
+
+A base plugin declares an ordinary endpoint, knowing nothing about AI:
+
+```yaml
+# plugins/Lights/plugin_config.yml
+endpoints:
+  set_brightness:
+    internal_name: set_brightness
+    remote: true
+    accessible_by_other_plugins: true
+    description: Set a lamp's brightness from 0 to 100.
+    arguments:
+      - name: lamp
+        type: str
+      - name: level
+        type: int
+```
+
+The host marks it as model-callable in `config.yml`, without touching the plugin:
+
+```yaml
+plugins:
+  - name: Lights
+    enabled: true
+    path: ./plugins/Lights
+    overrides:
+      endpoints:
+        set_brightness:
+          tags: ["ai_tool"]
+```
+
+An orchestrator then asks what exists and builds the model's toolset from it:
+
+```python
+tools = await self._plexus.find_endpoints_by_tag("ai_tool")
+
+for t in tools:
+    # t["access_name"], t["plugin_name"], t["description"], t["arguments"]
+    # are enough to build a tool/function schema for a model.
+    ...
+
+# When the model picks one, call it:
+result = await self.execute(tool["plugin_name"], tool["access_name"], args=...)
+```
+
+Discovery spans the cluster, so an endpoint on another machine appears in the same
+list, with its `hosts` and `instances` filled in. Two things are worth knowing:
+
+- **Re-query at use time.** A remote node's tag view is at most one heartbeat
+  stale, so build the toolset when you need it rather than caching it in
+  `on_enable`. See [docs/networking.md](docs/networking.md).
+- **`find_endpoints_by_tag` is a `Plexus` method**, reached through
+  `self._plexus`. That is the documented route for the introspection group — see
+  [docs/api_reference.md](docs/api_reference.md).
+
+Nothing here is AI-specific machinery. It is tag discovery plus an ordinary
+`execute`; the `ai_tool` tag is a convention, not a framework feature.
+
+---
+
 ## Documentation
 
 | File | Audience | Focus |
@@ -256,6 +349,16 @@ endpoints, more events, more subscriptions.
 | [docs/configuration.md](docs/configuration.md) | operators | full `config.yml` reference and per-plugin overrides |
 | [docs/rate_limiting.md](docs/rate_limiting.md) | operators | the token-bucket rate limiter: dimensions, `rate_limits:` config, observability |
 | [docs/capabilities.md](docs/capabilities.md) | operators | caller identity + the `capabilities:` impersonation / system-caller grant model |
+
+---
+
+## Built on Plexus
+
+- [**PlexusTUI**](https://github.com/Haflix/PlexusTUI) — a live terminal dashboard
+  for a running node: plugin states, subscriptions, the event stream, and the
+  rate-limiter tabs.
+- [**DiscordPlexusBot**](https://github.com/Haflix/DiscordPlexusBot) — a tier-1
+  base plugin wrapping the Discord bot client.
 
 ---
 
