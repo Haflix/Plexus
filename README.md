@@ -360,6 +360,9 @@ Nothing here is AI-specific machinery. It is tag discovery plus an ordinary
 - [**DiscordPlexusBot**](https://github.com/Haflix/DiscordPlexusBot) — a tier-1
   base plugin wrapping the Discord bot client.
 
+Plugins tag their repository [`plexus-plugin`](https://github.com/topics/plexus-plugin),
+so that topic is the index rather than a hand-maintained list here that goes stale.
+
 ---
 
 ## Status
