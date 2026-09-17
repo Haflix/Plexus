@@ -21,7 +21,7 @@ multi-node operation, see [networking.md](./networking.md).
 Each limit is a **token bucket**: it holds up to `max` tokens and refills
 continuously at `max / window` tokens per second (so `max: 100, window: 1` is
 "100 per second", `max: 60, window: 60` is "60 per minute"). An operation spends
-one token (a stream open can spend more, see [stream_weight](#stream-weight)). A
+one token (a stream open can spend more, see [stream_weight](#stream_weight)). A
 bucket with enough tokens admits the call and deducts them; an empty bucket
 rejects.
 

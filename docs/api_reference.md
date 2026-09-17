@@ -33,7 +33,7 @@ Argument types use Python conventions; `Any` means no constraint. For tutorials 
 - [The `Event` object](#the-event-object)
 - [Exceptions](#exceptions)
 - [Argument-shape contract (canonical)](#argument-shape-contract-canonical)
-- [Plexus methods](#plexus-methods-for-tooling-harnesses-cli-authors)
+- [Plexus methods](#plexus-methods)
 - [Quick reference card](#quick-reference-card)
 
 ---
@@ -412,9 +412,20 @@ Subscriber handlers (publish_event / request_event) bypass this rule: they alway
 
 ---
 
-## Plexus methods (for tooling, harnesses, CLI authors)
+## Plexus methods
 
-The methods below are on `Plexus` itself. Plugin authors use the `Plugin` wrappers above; tooling that drives the framework from outside uses these. All examples assume `plx: Plexus`.
+The methods below are on `Plexus` itself. Where a `Plugin` wrapper exists, plugin authors
+should use it — the wrappers exist to fill in the calling plugin's own identity, which these
+raw methods do not do for you.
+
+Not every `Plexus` method has a wrapper, and that is by design rather than an oversight: a
+method that takes no plugin identity has nothing for a wrapper to fill in. [Introspection](#introspection)
+is the clearest case, and plugin code does legitimately reach those through `self._plexus` —
+`find_endpoints_by_tag` in particular is the normal way an orchestrator discovers the endpoints
+it may call (see the `ai_tool` pattern and the staleness note in
+[networking.md](./networking.md)).
+
+All examples below assume `plx: Plexus`.
 
 ### Lifecycle
 
